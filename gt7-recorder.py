@@ -782,6 +782,8 @@ class Recorder:
         self._off_track_since = 0.0
         # 上一帧的赛道判定（用于只在状态变化时打日志）
         self._was_on_track = False
+        # 回收站清理计时（主循环每小时查一次，超期文件删除）
+        self._last_trash_check = 0.0
         # —— 每圈油耗（会话级）——
         # GT7 不直接报油耗，用「圈首油量 - 圈末油量」差分估计。
         # lap_fuel: [[第几圈, 该圈油耗百分比], ...]
@@ -1020,6 +1022,11 @@ class Recorder:
             #    ⚠️ 必须放在主循环按墙上时钟检查，不能放在 _handle_sample 里：
             #       菜单里重复帧会被去重拦截，帧内的检查根本不会执行。
             self._check_off_track(time.time())
+
+            # 回收站清理：每小时检查一次 _trash 里超期的已删除场次
+            if time.time() - self._last_trash_check >= 3600:
+                self._last_trash_check = time.time()
+                self._cleanup_trash()
 
             # 掉线检测：超过阈值无包则认为会话结束
             if self.session and now_is_set(last_active):
@@ -1387,6 +1394,45 @@ class Recorder:
             # 状态文件写失败不该影响采集，静默跳过
             pass
 
+    def _cleanup_trash(self, now: float | None = None) -> int:
+        """清理回收站：删除 data/_trash/ 里超过保留期的场次文件。
+
+        ⚠️ _trash 里的文件已经是「用户删除」状态，这里只是延迟真删。
+        保留期 --trash-retention-days（默认 30 天，0 = 永不清理）。
+        返回删除的文件数。
+        """
+        now = time.time() if now is None else now
+        # 保留期优先读 data/settings.json（历史场次页可调，改完即生效），
+        # 没有该文件或值非法时回退到命令行参数。
+        retention = self.args.trash_retention_days
+        try:
+            sf = Path(self.args.output) / "settings.json"
+            v = json.loads(sf.read_text(encoding="utf-8")).get("trash_retention_days")
+            if isinstance(v, (int, float)) and 0 <= v <= 3650:
+                retention = float(v)
+        except Exception:
+            pass
+        if retention <= 0:
+            return 0
+        trash = Path(self.args.output) / "_trash"
+        if not trash.is_dir():
+            return 0
+        cutoff = now - retention * 86400
+        removed = 0
+        for f in sorted(trash.glob("*.jsonl")):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            self.log(
+                f"回收站清理：删除 {removed} 个超过 {retention:.0f} 天的已删除场次",
+                force=True,
+            )
+        return removed
+
     def _check_off_track(self, now: float) -> None:
         """场次边界检查：离开赛道持续 off_track_timeout 秒 → 结束本场。
 
@@ -1480,6 +1526,12 @@ def main() -> int:
         help="多少秒收不到包就结束场次，默认 300。"
              "⚠️ 不要设太短：玩家暂停游戏看菜单时遥测仍在发，"
              "只有真正退出赛道才会断流",
+    )
+    p.add_argument(
+        "--trash-retention-days", type=float, default=30.0,
+        help="回收站（data/_trash/）里的已删除场次保留多少天，默认 30。"
+             "每天自动清理一次超期文件；设 0 = 永不自动清理。"
+             "注意 _trash 里的场次已是「删除」状态，这里只是延迟真删。",
     )
     p.add_argument(
         "--off-track-timeout", type=float, default=15.0,

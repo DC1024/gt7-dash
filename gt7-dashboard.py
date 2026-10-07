@@ -286,6 +286,20 @@ def compare_session(path: Path) -> dict[str, Any]:
 # 场次元数据（收藏 / 自定义名称）存 data/sessions_meta.json：
 # jsonl 是不可变的原始数据，用户的标注必须放在边车文件里，
 # 删除/改名都只动这个文件（删除例外：jsonl 移入 _trash 可找回）。
+def load_settings(history_dir: Path) -> dict[str, Any]:
+    """全局设置（data/settings.json）。"""
+    fp = history_dir / "settings.json"
+    try:
+        return json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(history_dir: Path, settings: dict[str, Any]) -> None:
+    fp = history_dir / "settings.json"
+    fp.write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def load_session_meta(history_dir: Path) -> dict[str, Any]:
     fp = history_dir / "sessions_meta.json"
     try:
@@ -495,7 +509,9 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | GET | `/api/v1/sessions/<文件名>/download` | 下载原始 jsonl（attachment） |
 | POST | `/api/v1/sessions/<文件名>/favorite` | 收藏/取消收藏，body `{"value": true}` |
 | POST | `/api/v1/sessions/<文件名>/rename` | 改名，body `{"value": "新名称"}` |
-| POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，可找回） |
+| POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，保留期后自动清除） |
+| GET | `/api/v1/settings` | 回收站保留期与现状 |
+| POST | `/api/v1/settings/trash-retention` | 设置回收站保留天数，body `{"value": 30}`（0=永不清理） |
 | GET | `/api/v1/docs` | 本文档 |
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
@@ -656,6 +672,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _do_post_impl(self) -> None:
         parsed = urlparse(self.path)
+        # —— 全局设置：POST /api/v1/settings/trash-retention {"value": 天数} ——
+        if parsed.path == "/api/v1/settings/trash-retention":
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except Exception:
+                body = {}
+            try:
+                v = float(body.get("value"))
+            except (TypeError, ValueError):
+                self._send_json({"error": "value 必须是数字（天数，0=永不清理）"},
+                                400, cors=True)
+                return
+            if not (0 <= v <= 3650):
+                self._send_json({"error": "天数需在 0~3650 之间"}, 400, cors=True)
+                return
+            s = load_settings(hist)
+            s["trash_retention_days"] = v
+            save_settings(hist, s)
+            self._send_json({"ok": True, "trash_retention_days": v,
+                             "hint": "已生效，下次清理（每小时检查一次）按新保留期执行"},
+                            cors=True)
+            return
+
         seg = parsed.path.split("/")
         # /api/v1/sessions/<name>/<action>
         if (len(seg) != 6 or seg[1:4] != ["api", "v1", "sessions"]
@@ -845,6 +886,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         **analyze_session(target)}
                 self._send_json(data, cors=True)
 
+            elif path == "/api/v1/settings":
+                hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
+                s = load_settings(hist)
+                trash = hist / "_trash"
+                tfiles = list(trash.glob("*.jsonl")) if trash.is_dir() else []
+                tsize = 0
+                try:
+                    tsize = sum(f.stat().st_size for f in tfiles)
+                except OSError:
+                    pass
+                self._send_json({
+                    "meta": {"api_version": 1},
+                    "trash_retention_days": s.get("trash_retention_days", 30),
+                    "trash_files": len(tfiles),
+                    "trash_size_mb": round(tsize / 1048576, 1),
+                }, cors=True)
+
             elif path == "/api/v1/docs":
                 self._send_text(API_DOCS_MD, cors=True)
 
@@ -946,6 +1004,30 @@ function sessRen(file) {
   if (!n.trim()) { alert('名称不能为空'); return; }
   sessPost(file, 'rename', n.trim());
 }
+function loadTrashSettings() {
+  fetch('/api/v1/settings').then(r => r.json()).then(function (d) {
+    document.getElementById('trashInfo').textContent =
+      '回收站现有 ' + d.trash_files + ' 个文件（' + d.trash_size_mb + ' MB）'
+      + ' · 当前保留 ' + d.trash_retention_days + ' 天';
+    document.getElementById('retDays').value = d.trash_retention_days;
+  });
+}
+function saveRetention() {
+  var v = parseFloat(document.getElementById('retDays').value);
+  if (isNaN(v) || v < 0 || v > 3650) {
+    alert('天数需在 0~3650 之间（0 = 永不清理）'); return;
+  }
+  fetch('/api/v1/settings/trash-retention', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({value: v})
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    document.getElementById('retMsg').textContent =
+      d.ok ? '已保存，' + d.hint : (d.error || '保存失败');
+    loadTrashSettings();
+  }).catch(function (e) { alert('请求失败：' + e); });
+}
+loadTrashSettings();
 function filterFav(only) {
   document.querySelectorAll('tr[data-fav]').forEach(function (tr) {
     tr.style.display = (!only || tr.dataset.fav === '1') ? '' : 'none';
@@ -1149,6 +1231,27 @@ def build_sessions_page(hist: Path) -> str:
         <th style="text-align:right">操作</th></tr>
     {''.join(rows)}
   </table>
+</div>
+
+<div class="card">
+  <h2>回收站</h2>
+  <p style="font-size:12.5px;color:var(--muted)">
+    删除的场次先移入 <b>data/_trash/</b>，超过保留期后由服务自动真删
+    （每小时检查一次）。设 <b>0</b> = 永不自动清理。</p>
+  <div id="trashInfo" style="font-size:13px;margin:10px 0">加载中…</div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <label style="font-size:13px">保留天数：
+      <input type="number" id="retDays" min="0" max="3650" step="1"
+        style="width:76px;padding:6px 8px;border:1px solid var(--line);
+               border-radius:7px;background:var(--card);color:inherit;
+               font-family:inherit">
+    </label>
+    <button onclick="saveRetention()"
+      style="border:1px solid var(--line);background:var(--card);color:inherit;
+             padding:7px 14px;border-radius:7px;cursor:pointer;
+             font-family:inherit;font-size:13px">保存</button>
+    <span id="retMsg" style="font-size:12px;color:var(--muted)"></span>
+  </div>
 </div>""" + _SESSIONS_PAGE_JS
     return _page_shell("历史场次", body)
 

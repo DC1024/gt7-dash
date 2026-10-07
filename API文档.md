@@ -18,7 +18,9 @@
 | GET | `/api/v1/sessions/<文件名>/download` | 下载原始 jsonl（attachment） |
 | POST | `/api/v1/sessions/<文件名>/favorite` | 收藏/取消收藏，body `{"value": true}` |
 | POST | `/api/v1/sessions/<文件名>/rename` | 改名，body `{"value": "新名称"}` |
-| POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，可找回） |
+| POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，保留期后自动清除） |
+| GET | `/api/v1/settings` | 回收站保留期与现状 |
+| POST | `/api/v1/settings/trash-retention` | 设置回收站保留天数，body `{"value": 30}`（0=永不清理） |
 | GET | `/api/v1/docs` | 本文档 |
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
