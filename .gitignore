@@ -1,0 +1,14 @@
+# 运行数据与个人文件不入库
+data/
+*.jsonl
+.workbuddy/
+__pycache__/
+*.pyc
+# 本地临时文件
+_*
+*.log
+
+# 内部方案文档与打包产物
+GT7_POV*.md
+赛车视频*.md
+gt7-probe/

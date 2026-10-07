@@ -1,0 +1,56 @@
+# GT7 Dash —— Docker Compose 部署
+# ================================================================
+# 两个服务：
+#   gt7-recorder   接收 GT7 UDP 遥测，解密落盘 + 写状态文件
+#   gt7-dashboard  Web 仪表盘 + 公开 API（默认端口 8787）
+#
+# 启动：docker compose up -d
+# 打开：http://<本机IP>:8787
+#
+# ⚠️ 两个服务都必须 network_mode: host —— GT7 用 UDP 广播发遥测，
+#    bridge 网络收不到宿主机网段的广播。
+
+services:
+  gt7-recorder:
+    image: ghcr.io/dc1024/gt7-dash:latest
+    container_name: gt7-recorder
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      TZ: Asia/Shanghai
+    command:
+      - python
+      - gt7-recorder.py
+      - --output
+      - /data
+      - --status-file
+      - /data/status.json
+      # --ps5 auto   ← 默认自动发现 PS5；网络环境复杂时可锁定 IP：
+      # --ps5 192.168.x.x
+      - --verbose
+
+  gt7-dashboard:
+    image: ghcr.io/dc1024/gt7-dash:latest
+    container_name: gt7-dashboard
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - gt7-recorder
+    volumes:
+      # 需要写权限：场次管理（收藏/改名/删除）要写 sessions_meta.json
+      - ./data:/data
+    environment:
+      TZ: Asia/Shanghai
+    command:
+      - python
+      - gt7-dashboard.py
+      - --port
+      - "8787"
+      - --bind
+      - 0.0.0.0
+      - --history
+      - /data
+      - --status
+      - /data/status.json

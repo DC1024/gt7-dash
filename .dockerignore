@@ -1,0 +1,10 @@
+data/
+.workbuddy/
+.github/
+site/
+__pycache__/
+*.pyc
+_*
+*.md
+*.log
+.git
