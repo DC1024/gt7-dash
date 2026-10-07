@@ -170,6 +170,7 @@ class TelemetrySample:
     last_lap_ms: int | None = None
     gas_level: float = 0.0
     gas_capacity: float = 0.0
+    car_code: int = 0
     turbo_boost: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
@@ -211,6 +212,7 @@ class TelemetrySample:
             "last_lap_ms": self.last_lap_ms,
             "gas_level": round(self.gas_level, 2),
             "gas_capacity": round(self.gas_capacity, 2),
+            "car_code": self.car_code,
             "turbo_boost": round(self.turbo_boost, 3),
         }
 
@@ -685,6 +687,7 @@ class Decoder:
                 last_lap_ms=last_lap if last_lap != 0xFFFFFFFF else None,
                 gas_level=f32(0x44) if n >= 0x48 else 0.0,
                 gas_capacity=f32(0x48) if n >= 0x4C else 0.0,
+                car_code=u32(0x124) if n >= 0x128 else 0,
                 turbo_boost=f32(0x50) if n >= 0x54 else 0.0,
             )
 
@@ -779,6 +782,11 @@ class Recorder:
         self._off_track_since = 0.0
         # 上一帧的赛道判定（用于只在状态变化时打日志）
         self._was_on_track = False
+        # —— 每圈油耗（会话级）——
+        # GT7 不直接报油耗，用「圈首油量 - 圈末油量」差分估计。
+        # lap_fuel: [[第几圈, 该圈油耗百分比], ...]
+        self.lap_fuel: list[list] = []
+        self._fuel_mark: float | None = None   # 圈首油量标记
         # —— 每圈成绩（会话级）——
         # GT7 只报「最快圈 / 上一圈」两个字段，没有完整历史；
         # 想显示每圈列表就得自己攒：lastLapTime 值变化 = 刚跑完一圈。
@@ -1165,7 +1173,12 @@ class Recorder:
             self._path_last_t = 0.0
             self._gg_last_t = 0.0
             self.lap_times.clear()
-            self._last_lap_ms_seen = 0
+            self.lap_fuel.clear()
+            # 🔴 _last_lap_ms_seen 要初始化为**当前值**而不是 0：
+            #    否则录制启动帧自己就会触发一次「冲线」（0 → 有值），
+            #    lap_fuel 第一条恒为 0.0 的假圈。
+            self._last_lap_ms_seen = sample.last_lap_ms
+            self._fuel_mark = sample.gas_level   # 圈首油量从本场第一帧记起
             self._prev_lap = -1
             self.session.recording_started = True
             self.session.started_at = now      # 用开跑时刻作为场次起点
@@ -1186,6 +1199,15 @@ class Recorder:
         # 不用圈号判断（不同模式下起点不一致），用「值变化」最稳：
         # GT7 对同一个 lastLapTime 会连续上报几百帧，必须去重。
         if sample.last_lap_ms and sample.last_lap_ms != self._last_lap_ms_seen:
+            # 🔴 油耗只在冲线时结算：_fuel_mark 是上一冲线时刻的油量，
+            #    差值 = 这一圈的消耗。若放在每帧执行，标记每帧被刷新，
+            #    差值永远只剩一帧的油耗（≈0），且 lap_fuel 会被灌满垃圾。
+            if self._fuel_mark is not None:
+                self.lap_fuel.append([len(self.lap_times) + 1,
+                                      round(self._fuel_mark - sample.gas_level, 2)])
+                if len(self.lap_fuel) > 60:
+                    self.lap_fuel = self.lap_fuel[-60:]
+            self._fuel_mark = sample.gas_level
             self._last_lap_ms_seen = sample.last_lap_ms
             self.lap_times.append([len(self.lap_times) + 1, sample.last_lap_ms])
             if len(self.lap_times) > 60:      # 防止超长耐力赛撑爆状态文件
@@ -1322,6 +1344,7 @@ class Recorder:
                 "recv_by_port": dict(self._recv_by_port),
                 # 每圈成绩 [[第几圈, 毫秒], ...]（会话级，仪表盘画列表用）
                 "lap_times": list(self.lap_times),
+                "lap_fuel": list(self.lap_fuel),
                 # 本场极速（会话级累计，不随历史缓冲滚动而变）
                 # 仪表盘原先显示的「极速」是从 600 帧窗口算的，
                 # 窗口一滚走数值就变了 —— 会让人以为读数不对。

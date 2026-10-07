@@ -101,7 +101,10 @@ class TelemetryHub:
         # 赛道轨迹 [[x,z,G], ...] 与 G-G 散点 [[横向,纵向], ...]
         self._path: list = []
         self._gg: list = []
+        # 车名表（data/cars.csv，helper/download_cars_csv.py 下载）
+        self._car_names: dict[str, str] | None = None
         self._lap_times: list = []
+        self._lap_fuel: list = []
         self._status_path = status_path
         self._last_mtime = 0.0
 
@@ -164,6 +167,8 @@ class TelemetryHub:
                     self._gg = payload["gg"]
                 if "lap_times" in payload:
                     self._lap_times = payload["lap_times"]
+                if "lap_fuel" in payload:
+                    self._lap_fuel = payload["lap_fuel"]
                 self._recording = bool(payload.get("recording"))
                 self._source_ips = payload.get("source_ips", [])
                 self._ps5_filter = payload.get("ps5_filter", "auto")
@@ -174,6 +179,25 @@ class TelemetryHub:
         except (OSError, json.JSONDecodeError, ValueError, KeyError):
             with self._lock:
                 self._connected = False
+
+    def _car_name_of(self, latest: dict | None) -> str:
+        """carCode → 车名。表来自 helper/download_cars_csv.py 下载的社区 CSV。"""
+        if not latest:
+            return ""
+        code = latest.get("car_code") or 0
+        if code <= 0:
+            return ""
+        if self._car_names is None:
+            self._car_names = {}
+            fp = self._status_path.parent / "cars.csv"
+            try:
+                for line in fp.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+                    seg = line.split(",")
+                    if len(seg) >= 2 and seg[0].strip().isdigit():
+                        self._car_names[seg[0].strip()] = seg[1].strip()
+            except Exception:
+                pass    # 没有 CSV 就显示 CAR-ID-xxx
+        return self._car_names.get(str(code), f"CAR-ID-{code}")
 
     def snapshot(self, max_frames: int = 300) -> dict[str, Any]:
         """仪表盘页面拉取。"""
@@ -195,6 +219,8 @@ class TelemetryHub:
                 "path": self._path,
                 "gg": self._gg,
                 "lap_times": self._lap_times,
+                "lap_fuel": self._lap_fuel,
+                "car_name": self._car_name_of(latest),
                 "session_duration": round(time.time() - self._session_start, 1)
                 if self._session_start
                 else 0,
@@ -235,6 +261,27 @@ HUB: TelemetryHub
 # ---------------------------------------------------------------------------
 # 历史场次
 # ---------------------------------------------------------------------------
+
+def compare_session(path: Path) -> dict[str, Any]:
+    """读场次 jsonl → 圈间对比分析（gt7analysis 纯函数库）。
+
+    失败永远返回 {"error": ...} 而不是抛出——对比是增值功能，
+    不能因为它挂掉影响详情页主体。
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").strip().split("\n")
+        frames = [json.loads(x) for x in lines[1:] if x.strip()
+                  and '"lap"' in x]
+        import gt7analysis
+        r = gt7analysis.analyze_compare(frames)
+        # 赛车线抽稀：每 6 点取 1，控制页面体积（7200 帧 → ~1200 点）
+        for seg in r.get("race_line", {}).get("segments", []):
+            seg["pts"] = seg["pts"][::6]
+        return r
+    except Exception as e:
+        return {"error": str(e)}
+
+
 
 # 场次元数据（收藏 / 自定义名称）存 data/sessions_meta.json：
 # jsonl 是不可变的原始数据，用户的标注必须放在边车文件里，
@@ -387,10 +434,13 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
             "max_speed_kph": snap.get("session_max_speed", 0.0),
             "completed_laps": lts[-1][0] if lts else 0,
             "lap_times": lts,           # [[第几圈, 毫秒], ...]
+            "lap_fuel": snap.get("lap_fuel", []),   # [[第几圈, 油耗%], ...]
         },
         "car": {
             "speed_kph": L.get("speed_kph", 0.0),
             "rpm": L.get("rpm", 0.0),
+            "car_code": L.get("car_code", 0),
+            "car_name": snap.get("car_name", ""),
             "gear": L.get("gear", 0),
             "suggested_gear": L.get("suggested_gear", 0),
             "throttle": L.get("throttle", 0.0),          # 0~1
@@ -909,6 +959,138 @@ function sessDel(file) {
 """
 
 
+_COMPARE_TMPL = """
+<style>
+.cmp-svg { width:100%; height:190px; display:block; background:rgba(128,128,128,.06);
+  border-radius:8px; }
+#raceLineCv { width:100%; max-width:760px; display:block; margin:0 auto;
+  border-radius:8px; background:rgba(128,128,128,.06); }
+.pv-table td, .pv-table th { padding:5px 9px; font-size:12.5px; }
+</style>
+<div class="card">
+  <h2>圈间对比分析 <span id="cmpMeta" style="float:right;font-weight:400"></span></h2>
+  <p style="font-size:12px;color:var(--muted);margin-bottom:6px">
+    曲线 = 最新圈相对参考圈的逐距离时间差：<b style="color:var(--bad)">正（上）= 丢时间</b>，
+    <b style="color:var(--ok)">负（下）= 更快</b>。参考圈默认取最快圈。</p>
+  <svg id="diffSvg" class="cmp-svg" viewBox="0 0 720 180" preserveAspectRatio="none"></svg>
+</div>
+<div class="card">
+  <h2>参考圈赛车线（第 <span id="rlLap">-</span> 圈）</h2>
+  <canvas id="raceLineCv" width="760" height="440"></canvas>
+  <div class="legend" style="justify-content:center;margin-top:6px">
+    <span><i style="background:#198754"></i>油门</span>
+    <span><i style="background:#dc3545"></i>刹车</span>
+    <span><i style="background:#0d6efd"></i>滑行</span>
+  </div>
+</div>
+<div class="card">
+  <h2>速度峰值 / 谷值（参考圈 vs 最新圈）</h2>
+  <table class="pv-table">
+    <thead><tr><th>距离 (m)</th><th>类型</th>
+      <th style="text-align:right">参考圈</th>
+      <th style="text-align:right">最新圈</th></tr></thead>
+    <tbody id="pvBody"></tbody>
+  </table>
+  <p class="dim" style="font-size:11.5px;margin-top:8px">
+    峰谷按速度平滑后检测（幅度 ≥ 12 km/h）。同距离两圈速度差即为该弯的得失。</p>
+</div>
+<script>
+const CMP = __DATA__;
+(function () {
+  if (!CMP || CMP.error || !CMP.laps_analyzed) {
+    const m = document.getElementById('cmpMeta');
+    if (m) m.textContent = '圈数据不足，无法对比（至少跑完一圈的 30 帧）';
+    return;
+  }
+  document.getElementById('cmpMeta').textContent =
+    '参考圈：第 ' + CMP.ref_lap + ' 圈 · 对比：第 ' + CMP.cur_lap
+    + ' 圈 · 共分析 ' + CMP.laps_analyzed + ' 圈';
+  document.getElementById('rlLap').textContent = CMP.ref_lap;
+
+  // —— 时间差曲线 ——
+  const d = CMP.time_diff, svg = document.getElementById('diffSvg');
+  if (d.grid && d.grid.length > 1) {
+    const W = 720, H = 180, P = 10;
+    const amax = Math.max(50, ...d.diff_ms.map(v => Math.abs(v)));
+    const x = i => P + (W - 2 * P) * i / (d.grid.length - 1);
+    const y = v => H / 2 - (H / 2 - P) * v / amax;
+    let html = '<line x1="' + P + '" y1="' + H/2 + '" x2="' + (W-P) + '" y2="'
+      + H/2 + '" stroke="rgba(128,128,128,.5)" stroke-dasharray="4 4"/>';
+    for (let i = 1; i < d.diff_ms.length; i++) {
+      const v = (d.diff_ms[i] + d.diff_ms[i-1]) / 2;
+      html += '<line x1="' + x(i-1).toFixed(1) + '" y1="' + y(d.diff_ms[i-1]).toFixed(1)
+        + '" x2="' + x(i).toFixed(1) + '" y2="' + y(d.diff_ms[i]).toFixed(1)
+        + '" stroke="' + (v >= 0 ? '#dc3545' : '#198754')
+        + '" stroke-width="1.6"/>';
+    }
+    html += '<text x="' + (P+4) + '" y="16" fill="#dc3545" font-size="10">+' + amax
+      + 'ms</text><text x="' + (P+4) + '" y="' + (H-6) + '" fill="#198754" font-size="10">-'
+      + amax + 'ms</text>';
+    svg.innerHTML = html;
+  }
+
+  // —— 三色赛车线 ——
+  const cv = document.getElementById('raceLineCv'), ctx = cv.getContext('2d');
+  const segs = (CMP.race_line || {}).segments || [];
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const cmap = {brake:'#dc3545', throttle:'#198754', coast:'#0d6efd'};
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  segs.forEach(s => s.pts.forEach(p => {
+    if (p[0] == null) return;
+    if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+    if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1];
+  }));
+  if (x1 > x0 && z1 > z0) {
+    const PAD = 24;
+    const sc = Math.min((cv.width - 2*PAD) / (x1 - x0), (cv.height - 2*PAD) / (z1 - z0));
+    const ox = (cv.width - (x1 - x0) * sc) / 2 - x0 * sc;
+    const oy = (cv.height - (z1 - z0) * sc) / 2 - z0 * sc;
+    const px = v => ox + v * sc, py = v => cv.height - (oy + v * sc);
+    ctx.lineCap = 'round'; ctx.lineWidth = 3;
+    segs.forEach(s => {
+      ctx.strokeStyle = cmap[s.color] || '#888';
+      ctx.beginPath();
+      let started = false;
+      s.pts.forEach(p => {
+        if (p[0] == null) return;
+        if (!started) { ctx.moveTo(px(p[0]), py(p[1])); started = true; }
+        else ctx.lineTo(px(p[0]), py(p[1]));
+      });
+      ctx.stroke();
+    });
+  }
+
+  // —— 峰谷对比表（按最近距离配对，容差 30m）——
+  const ref = CMP.peaks_ref || [], cur = CMP.peaks_cur || [];
+  const rows = [];
+  ref.forEach(rv => {
+    let bestC = null, bestD = 1e9;
+    cur.forEach(cv2 => {
+      const dd = Math.abs(cv2.distance - rv.distance);
+      if (dd < bestD) { bestD = dd; bestC = cv2; }
+    });
+    if (bestD <= 30) { rows.push([rv, bestC]); }
+    else rows.push([rv, null]);
+  });
+  cur.forEach(cv2 => {
+    if (!ref.some(rv => Math.abs(rv.distance - cv2.distance) <= 30))
+      rows.push([null, cv2]);
+  });
+  rows.sort((a, b) => (a[0] || a[1]).distance - (b[0] || b[1]).distance);
+  const kindTxt = k => k === 'peak' ? '峰 ↑' : '谷 ↓';
+  const kc = k => k === 'peak' ? 'var(--ok)' : 'var(--bad)';
+  document.getElementById('pvBody').innerHTML = rows.map(([rv, cv3]) => {
+    const dd = rv ? rv.distance : (cv3 ? cv3.distance : '-');
+    return '<tr><td>' + dd + '</td>'
+      + '<td style="color:' + kc((rv || cv3).kind) + '">' + kindTxt((rv || cv3).kind) + '</td>'
+      + '<td class="num">' + (rv ? rv.speed_kph : '—') + '</td>'
+      + '<td class="num">' + (cv3 ? cv3.speed_kph : '—') + '</td></tr>';
+  }).join('') || '<tr><td colspan="4">无</td></tr>';
+})();
+</script>
+"""
+
+
 def build_sessions_page(hist: Path) -> str:
     """历史场次列表页。空状态要说清为什么空、以及怎么让它有数据。"""
     sessions = list_sessions(hist)
@@ -974,6 +1156,11 @@ def build_sessions_page(hist: Path) -> str:
 def build_session_page(path: Path, stats: dict) -> str:
     """单场次详情：把离线统计展示成人能读的页面。"""
     import html as _html
+    try:
+        cmp_data = compare_session(path)
+    except Exception:
+        cmp_data = {}
+    cmp_json = json.dumps(cmp_data, ensure_ascii=False).replace("</", "<\\/")
 
     if "error" in stats:
         return _page_shell("场次详情", f'<div class="card"><h2>解析失败</h2>{stats["error"]}</div>')
@@ -1025,7 +1212,8 @@ def build_session_page(path: Path, stats: dict) -> str:
       {''.join(lap_rows)}</table>''' if lap_rows else
      '<p style="font-size:13px;color:var(--muted)">未能识别出完整的圈（可能只跑了几秒）</p>'}
 </div>"""
-    return _page_shell(f"场次 · {_html.escape(str(hdr.get('circuit') or 'unknown'))}", body)
+    return _page_shell(f"场次 · {_html.escape(str(hdr.get('circuit') or 'unknown'))}",
+                       body + _COMPARE_TMPL.replace('__DATA__', cmp_json))
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -1238,6 +1426,7 @@ th { color:var(--muted); font-weight:500; }
   <span class="stat">最佳 <b id="best">-</b></span>
   <span class="stat">采样 <b id="hz">-</b></span>
   <span class="stat">包格式 <b id="layout">-</b></span>
+  <span class="stat" id="carWrap" style="display:none">车 <b id="carname">-</b></span>
   <span class="nav">
     <a href="/sessions">历史场次</a>
     <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)">术语说明</a>
@@ -1526,6 +1715,8 @@ th { color:var(--muted); font-weight:500; }
         <div class="track"><div class="fill turbo" id="fTurbo" style="width:0"></div></div>
         <output id="oTurbo">0.00</output></div>
       <div class="laplist" id="lapList"></div>
+      <div id="fuelStrategy" style="margin-top:9px;font-size:12.5px;
+        color:var(--muted)"></div>
     </div>
 
     <div class="card" id="c-gball">
@@ -1616,6 +1807,8 @@ function render(s) {
   $('hz').textContent = s.frames;
   const lay = s.layouts || {};
   $('layout').textContent = Object.keys(lay).map(k => k + ':' + lay[k]).join(' ');
+  if (s.car_name) { $('carname').textContent = s.car_name;
+    $('carWrap').style.display = ''; }
 
   if (s.warning) {
     const w = $('warn'); w.style.display = 'block';
@@ -1708,6 +1901,28 @@ function render(s) {
   const turbo = (typeof L.turbo_boost === 'number') ? L.turbo_boost : 0;
   $('fTurbo').style.width = Math.min(turbo / 3 * 100, 100) + '%';
   $('oTurbo').textContent = turbo.toFixed(2);
+
+  // —— 油量策略：均耗 vs 剩余圈数 → 建议燃油地图方向 ——
+  const lf = s.lap_fuel || [];
+  const fs2 = $('fuelStrategy');
+  if (lf.length >= 1 && L.gas_capacity > 0 && L.lap != null
+      && L.laps_in_race > 0 && L.laps_in_race >= L.lap) {
+    const used = lf.reduce((a, x) => a + Math.max(0, x[1]), 0);
+    const avg = used / lf.length;                       // %油箱 / 圈
+    const remain = L.laps_in_race - L.lap + 1;          // 含当前圈
+    const projected = avg * remain;
+    const margin = L.gas_level - projected;             // 百分点（油箱占比）
+    let advice;
+    if (margin < -2) advice = '<span style="color:var(--bad)">⚠️ 油量不足 → 调稀燃油地图（省油优先）</span>';
+    else if (margin > 12) advice = '<span style="color:var(--ok)">✅ 油量富余 → 可调浓燃油地图（动力优先）</span>';
+    else advice = '👌 油量刚好 → 维持当前燃油地图';
+    fs2.innerHTML = '油量策略：剩 ' + remain + ' 圈 · 均耗 ' + avg.toFixed(1)
+      + '%/圈 · 预计需 ' + projected.toFixed(0) + '% · 余量 '
+      + (margin >= 0 ? '+' : '') + margin.toFixed(0) + 'pt — ' + advice;
+  } else if (lf.length >= 1) {
+    fs2.textContent = '已跑 ' + lf.length + ' 圈 · 均耗 '
+      + (lf.reduce((a, x) => a + Math.max(0, x[1]), 0) / lf.length).toFixed(1) + '%/圈';
+  }
 
   // —— 每圈圈速列表（新圈在上，最快圈标绿★）——
   const lt = s.lap_times || [];
