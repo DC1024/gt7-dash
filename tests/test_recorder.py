@@ -91,7 +91,7 @@ class TestGeoAccumulation:
         assert p1 > 20
         feed(r, dec, menu_frames(1200, t + 5))
         r._check_off_track(t + 25)
-        assert len(r._path) == p1, "场次结束后轨迹应保留（跑完的地图不能消失）"
+        assert len(r._path) == p1, "场次结束后轨迹应保留（跑完的轨迹图不能消失）"
 
     def test_path_reset_on_new_session(self, rec, dec, make_recorder):
         r = make_recorder(off_track_timeout=15.0)

@@ -589,7 +589,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 ### `track`
 | 字段 | 说明 |
 |---|---|
-| `path` | `[[x, z, 该点G值], ...]` 约 10Hz 采样的整车轨迹（画地图用） |
+| `path` | `[[x, z, 该点G值], ...]` 约 10Hz 采样的整车轨迹（画行车轨迹用） |
 | `gg_samples` | `[[横向g, 纵向g], ...]` 约 16Hz 采样的 G-G 散点 |
 
 ### `history[]`（每帧一条）
@@ -1587,7 +1587,7 @@ th { color:var(--muted); font-weight:500; }
            数据中断 2 秒后自动回正。</p>
       </section>
       <section>
-        <h4>G-G 图（抓地力包络）</h4>
+        <h4>G-G 图（抓地力圆）</h4>
         <p>把整场比赛中<b>每一帧</b>的（横向 G，纵向 G）打成散点。
            散点铺开的外边界近似等于轮胎能提供的合力极限——
            也就是常说的「抓地力圆」。</p>
@@ -1610,7 +1610,7 @@ th { color:var(--muted); font-weight:500; }
            分别对应左弯和右弯，正常跑一圈应该两边都有点。</p>
       </section>
       <section>
-        <h4>赛道地图的着色</h4>
+        <h4>行车轨迹的着色</h4>
         <p>轨迹按<b>每一点的 G 力大小</b>上色：
            <span class="k blue">蓝</span>=低速/直道 ·
            <span class="k green">绿</span>=中等 ·
@@ -1872,7 +1872,7 @@ th { color:var(--muted); font-weight:500; }
     </div>
 
     <div class="card" id="c-gg">
-      <h2>G-G 图（抓地力包络）</h2>
+      <h2>G-G 图（抓地力圆）</h2>
       <canvas id="gg" width="680" height="620"
         style="width:100%;max-width:380px;aspect-ratio:680/620;display:block;margin:0 auto"></canvas>
       <div class="legend" style="justify-content:center;margin-top:8px">
@@ -1881,7 +1881,7 @@ th { color:var(--muted); font-weight:500; }
     </div>
 
     <div class="card span2" id="c-map">
-    <h2>赛道地图 <span id="mapinfo" style="float:right;font-weight:400"></span></h2>
+    <h2>行车轨迹 <span id="mapinfo" style="float:right;font-weight:400"></span></h2>
     <canvas id="map" width="760" height="420"
       style="width:100%;max-width:760px;display:block;margin:0 auto"></canvas>
     <div class="legend" style="justify-content:center;margin-top:6px">
@@ -2252,7 +2252,7 @@ function gColor(g) {
   return 'rgb(' + (r | 0) + ',' + (gr | 0) + ',' + (b | 0) + ')';
 }
 
-// ---------- 赛道地图（按 G 力着色）----------
+// ---------- 行车轨迹（按 G 力着色）----------
 function drawMap(path) {
   const cv = $('map'); if (!cv) return;
   const ctx = cv.getContext('2d');
@@ -2308,9 +2308,9 @@ function drawMap(path) {
     Math.max.apply(null, path.map(p => p[2] || 0)).toFixed(1) + 'g';
 }
 
-// ---------- G-G 散点图（抓地力包络）----------
+// ---------- G-G 散点图（抓地力圆）----------
 // 保留原样：把整场比赛的 (横向G, 纵向G) 打成散点，
-// 用来看这辆车/这条赛道把轮胎用到什么程度（抓地力包络）。
+// 用来看这辆车/这条赛道把轮胎用到什么程度（抓地力圆）。
 function drawGG(gg) {
   const cv = $('gg'); if (!cv) return;
   const ctx = cv.getContext('2d');
@@ -2364,7 +2364,7 @@ function drawGG(gg) {
 
 // ---------- G 力球（实时摇晃，仿 SU7 那种）----------
 // 与上面的散点图互补：
-//   · 散点图 = 整场的「抓地力包络」（慢变量，看极限用到多少）
+//   · 散点图 = 整场的「抓地力圆」（慢变量，看极限用到多少）
 //   · G 力球 = 当前这一刻的 G（快变量，跟着方向盘和踏板实时晃）
 const GG_MAX = 3;
 let ggBall = { x: 0, y: 0 };      // 平滑后的球位（单位 g）
@@ -2509,7 +2509,7 @@ ggLoop();                 // 启动 G 力球动画（自带 requestAnimationFram
 const LAYOUT_KEY = 'gt7_layouts_v2';   // v2：默认布局重排过，废弃旧存档
 const CARD_TITLES = {
   'c-rpm':'转速与速度', 'c-pedal':'踏板与 G 力', 'c-lap':'圈速与油量',
-  'c-gball':'G 力球', 'c-gg':'G-G 图', 'c-map':'赛道地图',
+  'c-gball':'G 力球', 'c-gg':'G-G 图', 'c-map':'行车轨迹',
   'c-chart':'实时曲线', 'c-wheel':'四轮状态',
   'c-engine':'引擎健康', 'c-race':'比赛信息',
 };
