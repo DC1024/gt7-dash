@@ -1050,7 +1050,15 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 }
 .bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap;
   background:var(--card); border:1px solid var(--line); border-radius:10px;
-  padding:10px 16px; margin-bottom:10px; }
+  padding:10px 16px; margin-bottom:10px;
+  position:sticky; top:12px; z-index:10;
+  backdrop-filter:blur(10px);
+  box-shadow:0 4px 18px rgba(0,0,0,.06); }
+/* 顶栏导航：胶囊式，hover 染主题色（深浅色主题通用） */
+.bar .nav { margin-left:auto; display:flex; gap:4px; }
+.bar .nav a { color:var(--muted); text-decoration:none; font-size:13px;
+  padding:5px 12px; border-radius:7px; transition:.12s; }
+.bar .nav a:hover { color:var(--accent); background:rgba(13,110,253,.1); }
 .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); }
 .dot.on { background:var(--ok); box-shadow:0 0 0 3px rgba(25,135,84,.2); }
 .dot.off { background:var(--bad); }
@@ -1147,7 +1155,9 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   color:var(--accent); }
 /* ---------- 布局系统：卡片可拖拽 / 显隐 / 多布局 ---------- */
 .cgrid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-.cgrid .card { margin-bottom:0; min-width:0; overflow:hidden; }
+.cgrid .card { margin-bottom:0; min-width:0; overflow:hidden;
+  transition:border-color .15s, box-shadow .15s; }
+.cgrid .card:hover { border-color:rgba(13,110,253,.45); }
 .cgrid .card.span2 { grid-column:1 / -1; }
 .cgrid .card.editmode { outline:2px dashed var(--accent); outline-offset:2px; }
 .cgrid .card.editmode > h2 { cursor:move; }
@@ -1221,8 +1231,6 @@ th { color:var(--muted); font-weight:500; }
 <body>
 
 <div class="bar">
-  <a href="#" id="apiLink" onclick="event.preventDefault(); toggleApiPanel(true)"
-     style="color:var(--accent);text-decoration:none;font-size:13.5px;font-weight:600">API</a>
   <span class="dot wait" id="dot"></span>
   <span class="stat" id="status">连接中…</span>
   <span class="stat">圈 <b id="lap">-</b></span>
@@ -1230,12 +1238,11 @@ th { color:var(--muted); font-weight:500; }
   <span class="stat">最佳 <b id="best">-</b></span>
   <span class="stat">采样 <b id="hz">-</b></span>
   <span class="stat">包格式 <b id="layout">-</b></span>
-  <span class="stat" style="margin-left:auto;display:flex;gap:14px">
-    <a href="/sessions" style="color:var(--accent)">历史场次</a>
-    <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)"
-       style="color:var(--accent)">术语说明</a>
-    <a href="#" id="layoutLink" onclick="event.preventDefault(); toggleLayoutPanel(true)"
-       style="color:var(--accent)">布局</a>
+  <span class="nav">
+    <a href="/sessions">历史场次</a>
+    <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)">术语说明</a>
+    <a href="#" id="layoutLink" onclick="event.preventDefault(); toggleLayoutPanel(true)">布局</a>
+    <a href="#" id="apiLink" onclick="event.preventDefault(); toggleApiPanel(true)">API</a>
   </span>
 </div>
 
