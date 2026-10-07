@@ -3,7 +3,7 @@
 给第三方程序读取**已解密、已解析**的 GT7 遥测数据。
 所有接口均为 GET，返回 UTF-8 JSON；全部带 CORS 头，浏览器端可直接调用。
 
-- Base URL: `http://192.168.43.18:8787`
+- Base URL: `http://localhost:8787`（局域网内其他机器用 `http://<服务器IP>:8787`）
 - 数据源：GT7 官方 UDP 遥测（33740 端口，Salsa20 本地解密），60 帧/秒
 - 本文档也可通过 `GET /api/v1/docs` 获取（text/markdown）
 
@@ -15,6 +15,7 @@
 | GET | `/api/v1/laps` | 当前场次的每圈成绩与最快圈 |
 | GET | `/api/v1/sessions` | 历史场次文件列表 |
 | GET | `/api/v1/sessions/<文件名>` | 指定场次的统计摘要 |
+| GET | `/api/v1/sessions/<文件名>/download` | 下载原始 jsonl（attachment） |
 | POST | `/api/v1/sessions/<文件名>/favorite` | 收藏/取消收藏，body `{"value": true}` |
 | POST | `/api/v1/sessions/<文件名>/rename` | 改名，body `{"value": "新名称"}` |
 | POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，可找回） |
@@ -89,14 +90,14 @@
 
 ```bash
 # 实时数据（最近 60 帧）
-curl "http://192.168.43.18:8787/api/v1/live?frames=60"
+curl "http://localhost:8787/api/v1/live?frames=60"
 
 # 只要圈速
-curl "http://192.168.43.18:8787/api/v1/laps"
+curl "http://localhost:8787/api/v1/laps"
 
 # 历史场次列表，然后取某场的统计
-curl "http://192.168.43.18:8787/api/v1/sessions"
-curl "http://192.168.43.18:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jsonl"
+curl "http://localhost:8787/api/v1/sessions"
+curl "http://localhost:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jsonl"
 ```
 
 ## 稳定性说明

@@ -430,7 +430,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 给第三方程序读取**已解密、已解析**的 GT7 遥测数据。
 所有接口均为 GET，返回 UTF-8 JSON；全部带 CORS 头，浏览器端可直接调用。
 
-- Base URL: `http://192.168.43.18:8787`
+- Base URL: `http://localhost:8787`（局域网内其他机器用 `http://<服务器IP>:8787`）
 - 数据源：GT7 官方 UDP 遥测（33740 端口，Salsa20 本地解密），60 帧/秒
 - 本文档也可通过 `GET /api/v1/docs` 获取（text/markdown）
 
@@ -442,6 +442,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | GET | `/api/v1/laps` | 当前场次的每圈成绩与最快圈 |
 | GET | `/api/v1/sessions` | 历史场次文件列表 |
 | GET | `/api/v1/sessions/<文件名>` | 指定场次的统计摘要 |
+| GET | `/api/v1/sessions/<文件名>/download` | 下载原始 jsonl（attachment） |
 | POST | `/api/v1/sessions/<文件名>/favorite` | 收藏/取消收藏，body `{"value": true}` |
 | POST | `/api/v1/sessions/<文件名>/rename` | 改名，body `{"value": "新名称"}` |
 | POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，可找回） |
@@ -516,14 +517,14 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 
 ```bash
 # 实时数据（最近 60 帧）
-curl "http://192.168.43.18:8787/api/v1/live?frames=60"
+curl "http://localhost:8787/api/v1/live?frames=60"
 
 # 只要圈速
-curl "http://192.168.43.18:8787/api/v1/laps"
+curl "http://localhost:8787/api/v1/laps"
 
 # 历史场次列表，然后取某场的统计
-curl "http://192.168.43.18:8787/api/v1/sessions"
-curl "http://192.168.43.18:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jsonl"
+curl "http://localhost:8787/api/v1/sessions"
+curl "http://localhost:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jsonl"
 ```
 
 ## 稳定性说明
@@ -754,6 +755,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                  "data_dir": str(hist),
                                  "sessions": list_sessions(hist)}, cors=True)
 
+            elif path.startswith("/api/v1/sessions/") and path.endswith("/download"):
+                # /api/v1/sessions/<名>/download —— 流式下发原始 jsonl
+                seg = path.split("/")
+                name = Path(seg[4]).name if len(seg) == 6 else ""
+                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+                target = (hist / name).resolve()
+                if (not str(target).startswith(str(hist)) or not target.exists()
+                        or target.suffix != ".jsonl"):
+                    self._send_json({"error": "session not found", "file": name},
+                                    404, cors=True)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{name}"')
+                self.send_header("Content-Length", str(target.stat().st_size))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with open(target, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                return
+
             elif path.startswith("/api/v1/sessions/"):
                 # /api/v1/sessions/<文件名> —— 防目录穿越：只取文件名部分
                 name = Path(path.rsplit("/", 1)[-1]).name
@@ -869,6 +896,11 @@ function sessRen(file) {
   if (!n.trim()) { alert('名称不能为空'); return; }
   sessPost(file, 'rename', n.trim());
 }
+function filterFav(only) {
+  document.querySelectorAll('tr[data-fav]').forEach(function (tr) {
+    tr.style.display = (!only || tr.dataset.fav === '1') ? '' : 'none';
+  });
+}
 function sessDel(file) {
   if (!confirm('确定删除这场数据？\\n（文件移入服务器 data/_trash/，可找回）')) return;
   sessPost(file, 'delete', null);
@@ -905,7 +937,7 @@ def build_sessions_page(hist: Path) -> str:
         disp_attr = disp.replace('"', "&quot;")
         star = ' <span style="color:#d4a017">★</span>' if s["favorite"] else ""
         rows.append(
-            f"""<tr>
+            f"""<tr data-fav="{'1' if s['favorite'] else '0'}">
       <td><b><a href="/session?file={s['file']}"
          style="color:var(--accent)">{disp}</a></b>{star}</td>
       <td>{s['modified']}</td>
@@ -917,13 +949,18 @@ def build_sessions_page(hist: Path) -> str:
           onclick="sessRen('{s['file']}')">✎</button>
         <button class="sbtn" title="删除"
           onclick="sessDel('{s['file']}')">🗑</button>
+        <button class="sbtn" title="下载原始数据"
+          onclick="location.href='/api/v1/sessions/{s['file']}/download'">⬇</button>
       </td>
     </tr>"""
         )
 
     body = f"""
 <div class="card">
-  <h2>共 {len(sessions)} 个场次</h2>
+  <h2>共 {len(sessions)} 个场次
+    <label style="float:right;font-weight:400;font-size:12px;cursor:pointer">
+      <input type="checkbox" id="favOnly" onchange="filterFav(this.checked)"> 只看收藏 ★
+    </label></h2>
   <table>
     <tr><th>场次</th><th>采集时间</th>
         <th style="text-align:right">大小</th>
@@ -1077,10 +1114,20 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   color:var(--text); margin-top:2px; }
 
 /* ---------- 术语说明：右侧滑入面板 ---------- */
-.gloss-wrap { position:fixed; inset:0; z-index:50; display:none; }
+.apilist { list-style:none; }
+.apilist li { padding:7px 0; border-bottom:1px solid var(--line); font-size:12.5px; }
+.apilist li:last-child { border-bottom:none; }
+.apilist b { font-family:var(--mono); color:var(--accent); font-size:12px; }
+.codebox { background:rgba(128,128,128,.12); border-radius:7px; padding:9px 11px;
+  font-family:var(--mono); font-size:12px; overflow-x:auto; word-break:break-all; }
+/* 🔴 层级必须拆开：遮罩(55) < 编辑中的卡片(60) < 面板(70)。
+   上一版把整个 wrap 设 z-index:50，卡片抬到 60 后连面板一起被压住——
+   布局面板自己反而点不到了（DC 实测截图）。
+   所以 wrap 只做显隐容器，遮罩和面板各自 fixed + 独立 z-index。 */
+.gloss-wrap { display:none; }
 .gloss-wrap.open { display:block; }
-.gloss-mask { position:absolute; inset:0; background:rgba(0,0,0,.38); }
-.gloss { position:absolute; top:0; right:0; height:100%;
+.gloss-mask { position:fixed; inset:0; background:rgba(0,0,0,.38); z-index:55; }
+.gloss { position:fixed; top:0; right:0; height:100%; z-index:70;
   width:min(440px, 94vw); background:var(--card);
   border-left:1px solid var(--line); box-shadow:-10px 0 34px rgba(0,0,0,.22);
   display:flex; flex-direction:column; animation:glossIn .22s ease-out; }
@@ -1174,6 +1221,8 @@ th { color:var(--muted); font-weight:500; }
 <body>
 
 <div class="bar">
+  <a href="#" id="apiLink" onclick="event.preventDefault(); toggleApiPanel(true)"
+     style="color:var(--accent);text-decoration:none;font-size:13.5px;font-weight:600">API</a>
   <span class="dot wait" id="dot"></span>
   <span class="stat" id="status">连接中…</span>
   <span class="stat">圈 <b id="lap">-</b></span>
@@ -1320,6 +1369,49 @@ th { color:var(--muted); font-weight:500; }
         <p>全部数值来自 PS5 通过 UDP 广播的 GT7 官方遥测
            （Salsa20 加密，本地解密后解析），
            不经过任何第三方服务，也不会上传到云端。</p>
+      </section>
+    </div>
+  </aside>
+</div>
+
+<!-- API 快速参考（点「API」弹出） -->
+<div id="apiWrap" class="gloss-wrap">
+  <div class="gloss-mask" onclick="toggleApiPanel(false)"></div>
+  <aside class="gloss" role="dialog" aria-label="API 说明">
+    <header>
+      <h3>数据 API</h3>
+      <button onclick="toggleApiPanel(false)" aria-label="关闭">✕</button>
+    </header>
+    <div class="gloss-body">
+      <section>
+        <h4>Base URL</h4>
+        <p class="codebox">http://localhost:8787</p>
+        <p class="dim">均为 GET（场次管理为 POST），返回 UTF-8 JSON，带 CORS——
+           网页/脚本/直播覆盖层可直接消费，解密已在本地完成。</p>
+      </section>
+      <section>
+        <h4>常用端点</h4>
+        <ul class="apilist">
+          <li><b>GET /api/v1/live?frames=N</b><br>
+              <span class="dim">实时遥测：最新帧 + N 帧历史 + 轨迹 + G-G 散点</span></li>
+          <li><b>GET /api/v1/laps</b><br>
+              <span class="dim">每圈圈速与最快圈</span></li>
+          <li><b>GET /api/v1/sessions</b><br>
+              <span class="dim">历史场次列表（含收藏 / 自定义名）</span></li>
+          <li><b>GET /api/v1/sessions/&lt;文件名&gt;</b><br>
+              <span class="dim">单场统计摘要</span></li>
+          <li><b>GET /api/v1/sessions/&lt;文件名&gt;/download</b><br>
+              <span class="dim">下载原始 jsonl 数据文件</span></li>
+          <li><b>POST /api/v1/sessions/&lt;文件名&gt;/{favorite,rename,delete}</b><br>
+              <span class="dim">场次管理：收藏 / 改名 / 删除</span></li>
+        </ul>
+      </section>
+      <section>
+        <h4>示例</h4>
+        <p class="codebox">curl "http://localhost:8787/api/v1/live?frames=60"</p>
+        <p class="dim">完整字段与单位说明：
+           <a href="/api/v1/docs" target="_blank" style="color:var(--accent)">/api/v1/docs</a>
+           （text/markdown）</p>
       </section>
     </div>
   </aside>
@@ -1950,13 +2042,16 @@ function ggLoop() {
 // 🔴 这个函数之前**压根没定义**，但关闭按钮和遮罩都在调用它 ——
 //    点「术语说明」只会跳到页面顶部（href="#"），面板永远打不开，
 //    就算强行打开，关闭按钮也会抛 ReferenceError。
+function toggleApiPanel(open) {
+  $('apiWrap').classList.toggle('open', !!open);
+}
 function toggleGlossary(open) {
   const w = $('glossWrap');
   if (w) w.classList.toggle('open', !!open);
 }
 // ESC 关闭
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') toggleGlossary(false);
+  if (e.key === 'Escape') { toggleGlossary(false); toggleApiPanel(false); }
 });
 
 function poll() {
@@ -2170,7 +2265,7 @@ def main() -> int:
     print("GT7 遥测 Web 仪表盘", flush=True)
     print(f"  访问地址: http://{args.bind}:{args.port}", flush=True)
     if args.bind == "0.0.0.0":
-        print(f"  局域网访问: http://192.168.43.18:{args.port}", flush=True)
+        print(f"  局域网访问: http://<本机IP>:{args.port}", flush=True)
     print(f"  状态文件: {status_path}", flush=True)
     print(f"  历史场次: {hist}", flush=True)
     if not status_path.exists():
