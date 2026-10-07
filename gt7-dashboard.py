@@ -1072,8 +1072,158 @@ class DashboardHandler(BaseHTTPRequestHandler):
 # 前端页面（内嵌，保持单文件）
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 主题与外观（主仪表盘 / 历史场次页共用同一份，避免两处变量漂移）
+# ---------------------------------------------------------------------------
+# 为什么单独抽出来：历史页本来各写一份 :root，改主题要动两处，很容易漏。
+# 现在主页面用占位符替换（保持 raw 字符串，省掉对整页做 f-string 转义），
+# 历史页因为是 f-string，直接插值即可。
+#
+# 新增主题的必要步骤（两处都要登记，缺一个就只是「选了没反应」）：
+#   1. 在这里加一段 [data-theme="xxx"]，变量必须给全；
+#   2. 到前端 THEMES 列表里登记同名条目（面板色卡靠它渲染）。
+THEME_CSS = r"""
+:root {
+  --bg:#f5f6f7; --card:#fff; --line:#e3e5e8; --text:#1c1e21;
+  --muted:#6b7280; --accent:#0d6efd; --accent-rgb:13,110,253;
+  --ok:#198754; --warn:#fd7e14; --bad:#dc3545;
+  --mono:ui-monospace,'SF Mono',Consolas,monospace;
+  /* canvas 用色：canvas 不参与 CSS 继承，JS 读这些变量再传给 ctx */
+  --cv-bowl:rgba(0,0,0,.028); --cv-ring:rgba(0,0,0,.075);
+  --cv-edge:rgba(0,0,0,.18);  --cv-axis:rgba(0,0,0,.12);
+  --cv-text:rgba(0,0,0,.5);   --cv-shadow:rgba(0,0,0,.22);
+  --cv-grid:rgba(128,128,128,.18);
+  /* 排版密度与读数缩放：个性化面板调的就是这几个 */
+  --pad-body:12px; --gap-grid:10px; --pad-card:12px 14px; --gap-card:12px;
+  --num-scale:1;
+}
+:root[data-density="compact"] {
+  --pad-body:8px; --gap-grid:7px; --pad-card:8px 10px; --gap-card:8px;
+}
+:root[data-density="cozy"] {
+  --pad-body:18px; --gap-grid:14px; --pad-card:16px 18px; --gap-card:16px;
+}
+/* —— 深色（跟随系统时的深色分支，也是「深色」预设本体） —— */
+:root[data-theme="dark"] {
+  --bg:#16181c; --card:#1e2126; --line:#2c3038; --text:#e8eaed;
+  --muted:#9aa0a6; --accent:#2b7fff; --accent-rgb:43,127,255;
+  --ok:#3fb950; --warn:#fd9843; --bad:#f85149;
+  --cv-bowl:rgba(255,255,255,.04); --cv-ring:rgba(255,255,255,.10);
+  --cv-edge:rgba(255,255,255,.26); --cv-axis:rgba(255,255,255,.16);
+  --cv-text:rgba(255,255,255,.55); --cv-shadow:rgba(0,0,0,.55);
+  --cv-grid:rgba(255,255,255,.14);
+}
+/* —— OLED 赛道黑：纯黑底 + 青柠高对比。夜间/副屏不刺眼，OLED 还省电 —— */
+:root[data-theme="oled"] {
+  --bg:#000; --card:#0a0b0d; --line:#1b1e22; --text:#eaf6f6;
+  --muted:#7c8b91; --accent:#00e0c6; --accent-rgb:0,224,198;
+  --ok:#2fe08a; --warn:#ffb020; --bad:#ff4d5e;
+  --cv-bowl:rgba(255,255,255,.03); --cv-ring:rgba(255,255,255,.09);
+  --cv-edge:rgba(0,224,198,.35);  --cv-axis:rgba(255,255,255,.14);
+  --cv-text:rgba(234,246,246,.6); --cv-shadow:rgba(0,224,198,.35);
+  --cv-grid:rgba(255,255,255,.12);
+}
+/* —— 米黄护眼：暖色纸质底，长时间看数据/复盘不刺眼 —— */
+:root[data-theme="sepia"] {
+  --bg:#f2e9d7; --card:#fdf8ec; --line:#e2d6bd; --text:#3b3128;
+  --muted:#8a7a63; --accent:#b45309; --accent-rgb:180,83,9;
+  --ok:#4a7a4f; --warn:#b26a12; --bad:#a83232;
+  --cv-bowl:rgba(75,49,40,.04); --cv-ring:rgba(75,49,40,.09);
+  --cv-edge:rgba(75,49,40,.2);  --cv-axis:rgba(75,49,40,.13);
+  --cv-text:rgba(59,49,40,.6);  --cv-shadow:rgba(59,49,40,.2);
+  --cv-grid:rgba(75,49,40,.12);
+}
+/* —— GT 竞速：碳纤黑 + GT 红，偏热血赛道向 —— */
+:root[data-theme="racing"] {
+  --bg:#0d0d0f; --card:#16161a; --line:#2b2b33; --text:#f4f4f6;
+  --muted:#9a9aa6; --accent:#e10600; --accent-rgb:225,6,0;
+  --ok:#21c25e; --warn:#ffb020; --bad:#ff6b6b;
+  --cv-bowl:rgba(255,255,255,.035); --cv-ring:rgba(255,255,255,.10);
+  --cv-edge:rgba(255,255,255,.24); --cv-axis:rgba(255,255,255,.15);
+  --cv-text:rgba(244,244,246,.58); --cv-shadow:rgba(0,0,0,.6);
+  --cv-grid:rgba(255,255,255,.13);
+}
+/* —— 冰川蓝：冷调浅色，清爽轻量向 —— */
+:root[data-theme="glacier"] {
+  --bg:#eaf2fb; --card:#fff; --line:#d2e3f3; --text:#10202f;
+  --muted:#56718a; --accent:#0a84ff; --accent-rgb:10,132,255;
+  --ok:#0f9b6c; --warn:#c2760a; --bad:#d92d20;
+  --cv-bowl:rgba(16,32,47,.035); --cv-ring:rgba(16,32,47,.08);
+  --cv-edge:rgba(16,32,47,.18); --cv-axis:rgba(16,32,47,.12);
+  --cv-text:rgba(16,32,47,.55); --cv-shadow:rgba(16,32,47,.18);
+  --cv-grid:rgba(16,32,47,.12);
+}
+/* —— HUD 荧光：黑底 + 荧光绿，赛博/HUD 观感 —— */
+:root[data-theme="hud"] {
+  --bg:#04100a; --card:#08180f; --line:#153a26; --text:#d9ffe9;
+  --muted:#6fae8c; --accent:#39ff14; --accent-rgb:57,255,20;
+  --ok:#2bff88; --warn:#ffe600; --bad:#ff2b5e;
+  --cv-bowl:rgba(57,255,20,.05); --cv-ring:rgba(57,255,20,.14);
+  --cv-edge:rgba(57,255,20,.4);  --cv-axis:rgba(57,255,20,.2);
+  --cv-text:rgba(217,255,233,.6); --cv-shadow:rgba(57,255,20,.35);
+  --cv-grid:rgba(57,255,20,.12);
+}
+/* —— 午夜紫：暗紫渐变感的长夜复盘向 —— */
+:root[data-theme="midnight"] {
+  --bg:#0c0a18; --card:#15122a; --line:#2b2450; --text:#eae6ff;
+  --muted:#9c93c9; --accent:#9b6bff; --accent-rgb:155,107,255;
+  --ok:#34d399; --warn:#fbbf24; --bad:#fb7185;
+  --cv-bowl:rgba(234,230,255,.045); --cv-ring:rgba(234,230,255,.11);
+  --cv-edge:rgba(234,230,255,.26); --cv-axis:rgba(234,230,255,.16);
+  --cv-text:rgba(234,230,255,.6); --cv-shadow:rgba(0,0,0,.6);
+  --cv-grid:rgba(234,230,255,.12);
+}
+/* 「跟随系统」跟随 prefers-color-scheme；其余预设不受系统切换影响。
+   🔴 必须带 [data-theme="auto"]：如果像旧版那样裸写 @media + :root，
+      用户显式选了浅色也会被系统深色覆盖——「选了没反应」就是这个坑。 */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    --bg:#16181c; --card:#1e2126; --line:#2c3038; --text:#e8eaed;
+    --muted:#9aa0a6; --accent:#2b7fff; --accent-rgb:43,127,255;
+    --ok:#3fb950; --warn:#fd9843; --bad:#f85149;
+    --cv-bowl:rgba(255,255,255,.04); --cv-ring:rgba(255,255,255,.10);
+    --cv-edge:rgba(255,255,255,.26); --cv-axis:rgba(255,255,255,.16);
+    --cv-text:rgba(255,255,255,.55); --cv-shadow:rgba(0,0,0,.55);
+    --cv-grid:rgba(255,255,255,.14);
+  }
+}
+"""
+
+# 首屏防闪：在 <head> 里同步执行，先于 body 绘制把主题落到 <html> 上。
+# 这段刻意保持「无依赖、无 try 之外的控制流」——它是页面上最先跑的代码，
+# 一旦抛错整个首屏就白屏了。真正的偏好读写在页面底部 prefs 模块里。
+THEME_BOOT_JS = r"""
+(function () {
+  try {
+    var p = JSON.parse(localStorage.getItem('gt7_prefs_v1') || '{}');
+    var d = document.documentElement;
+    d.setAttribute('data-theme', p.theme || 'auto');
+    d.setAttribute('data-density', p.density || 'normal');
+    if (p.fontScale) {
+      d.style.setProperty('--num-scale', (+p.fontScale / 100) || 1);
+    }
+    if (p.accent) {
+      d.style.setProperty('--accent', p.accent);
+      var h = p.accent.replace('#', '');
+      if (h.length === 3) {
+        h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+      }
+      var n = parseInt(h, 16);
+      if (!isNaN(n)) {
+        d.style.setProperty('--accent-rgb',
+          ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255));
+      }
+    }
+  } catch (e) { /* 隐私模式读不到 localStorage：用默认主题照常渲染 */ }
+})();
+"""
+
+
 def build_page() -> str:
-    return HTML_PAGE
+    # 用占位符替换而不是 f-string：整页 CSS/JS 里花括号上千个，
+    # 转义一遍只会让人再也不敢改样式。
+    return HTML_PAGE.replace("/*THEME_CSS*/", THEME_CSS) \
+                    .replace("/*THEME_BOOT_JS*/", THEME_BOOT_JS)
 
 
 def _page_shell(title: str, body: str) -> str:
@@ -1082,19 +1232,11 @@ def _page_shell(title: str, body: str) -> str:
 <html lang="zh-CN"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<script>{THEME_BOOT_JS}</script>
 <title>{title}</title>
 <style>
 * {{ box-sizing:border-box; margin:0; padding:0; }}
-:root {{
-  --bg:#f5f6f7; --card:#fff; --line:#e3e5e8; --text:#1c1e21;
-  --muted:#6b7280; --accent:#0d6efd; --ok:#198754; --warn:#fd7e14;
-  --mono:ui-monospace,'SF Mono',Consolas,monospace;
-}}
-@media (prefers-color-scheme:dark) {{
-  :root {{ --bg:#16181c; --card:#1e2126; --line:#2c3038; --text:#e8eaed;
-           --muted:#9aa0a6; }}
-  body {{ background:var(--bg); }}
-}}
+{THEME_CSS}
 body {{ font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   background:var(--bg); color:var(--text); padding:16px; }}
 .top {{ display:flex; align-items:center; gap:12px; margin-bottom:14px; }}
@@ -1249,9 +1391,9 @@ _COMPARE_TMPL = """
   </h2>
   <canvas id="raceLineCv" width="760" height="440"></canvas>
   <div class="legend" style="justify-content:center;margin-top:6px">
-    <span><i style="background:#198754"></i>油门</span>
-    <span><i style="background:#dc3545"></i>刹车</span>
-    <span><i style="background:#0d6efd"></i>滑行</span>
+    <span><i style="background:var(--ok)"></i>油门</span>
+    <span><i style="background:var(--bad)"></i>刹车</span>
+    <span><i style="background:var(--accent)"></i>滑行</span>
   </div>
   <p class="dim" style="font-size:11.5px;margin-top:8px">
     可自选要看第几圈的赛车线。默认取最快圈；切换会刷新本页并把整页分析
@@ -1336,7 +1478,10 @@ const CMP = __DATA__;
   const cv = document.getElementById('raceLineCv'), ctx = cv.getContext('2d');
   const segs = (CMP.race_line || {}).segments || [];
   ctx.clearRect(0, 0, cv.width, cv.height);
-  const cmap = {brake:'#dc3545', throttle:'#198754', coast:'#0d6efd'};
+  // 取当前主题的实际颜色：canvas 不继承 CSS 变量，只能手动读一次
+  const cvar = n => getComputedStyle(document.documentElement)
+    .getPropertyValue(n).trim() || '#888';
+  const cmap = {brake: cvar('--bad'), throttle: cvar('--ok'), coast: cvar('--accent')};
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   segs.forEach(s => s.pts.forEach(p => {
     if (p[0] == null) return;
@@ -1552,32 +1697,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<script>/*THEME_BOOT_JS*/</script>
 <title>GT7 遥测仪表盘</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-  --bg:#f5f6f7; --card:#fff; --line:#e3e5e8; --text:#1c1e21;
-  --muted:#6b7280; --accent:#0d6efd; --ok:#198754; --warn:#fd7e14;
-  --bad:#dc3545; --mono:ui-monospace,'SF Mono',Consolas,monospace;
-}
+/*THEME_CSS*/
 body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
-  background:var(--bad-soft,#f5f6f7); color:var(--text); padding:12px; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg:#16181c; --card:#1e2126; --line:#2c3038; --text:#e8eaed;
-          --muted:#9aa0a6; }
-  body { background:var(--bg); }
-}
+  background:var(--bg); color:var(--text); padding:var(--pad-body); }
 .bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap;
   background:var(--card); border:1px solid var(--line); border-radius:10px;
-  padding:10px 16px; margin-bottom:10px;
-  position:sticky; top:12px; z-index:10;
+  padding:10px 16px; margin-bottom:var(--gap-grid);
+  position:sticky; top:var(--pad-body); z-index:10;
   backdrop-filter:blur(10px);
   box-shadow:0 4px 18px rgba(0,0,0,.06); }
 /* 顶栏导航：胶囊式，hover 染主题色（深浅色主题通用） */
 .bar .nav { margin-left:auto; display:flex; gap:4px; }
 .bar .nav a { color:var(--muted); text-decoration:none; font-size:13px;
   padding:5px 12px; border-radius:7px; transition:.12s; }
-.bar .nav a:hover { color:var(--accent); background:rgba(13,110,253,.1); }
+.bar .nav a:hover { color:var(--accent); background:rgba(var(--accent-rgb),.12); }
 .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); }
 .dot.on { background:var(--ok); box-shadow:0 0 0 3px rgba(25,135,84,.2); }
 .dot.off { background:var(--bad); }
@@ -1586,23 +1723,28 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .stat { font-size:13px; color:var(--muted); }
 .stat b { color:var(--text); font-variant-numeric:tabular-nums;
   font-family:var(--mono); font-weight:600; margin-left:4px; }
-.grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:var(--gap-grid); }
 @media(max-width:820px){ .grid{grid-template-columns:1fr} }
 /* 三栏行：圈速 | G力球 | G-G散点。用 auto-fit 让它窄屏自动换行 */
 .grid3 { grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
 .card { background:var(--card); border:1px solid var(--line);
-  border-radius:10px; padding:12px 14px; }
+  border-radius:10px; padding:var(--pad-card); }
 .card h2 { font-size:12px; font-weight:500; color:var(--muted);
   text-transform:uppercase; letter-spacing:.6px; margin-bottom:10px; }
 .dials { display:flex; align-items:center; justify-content:space-around; }
 .gauge { position:relative; width:132px; height:132px; }
 .gauge svg { transform:rotate(135deg); }
+/* SVG 的 presentation attribute 里不能用 var()，转速环的上色只能走 CSS */
+.gauge .bg-ring { stroke:var(--cv-ring); }
+#rpmArc { stroke:var(--accent); transition:stroke .15s; }
 .gauge-val { position:absolute; inset:0; display:flex;
   flex-direction:column; align-items:center; justify-content:center; }
-.gauge-val b { font-size:22px; font-family:var(--mono); }
+/* 读数字号统一挂 --num-scale（个性化面板的「读数缩放」只改这一个变量），
+   避免面板去逐个重写这里的 font-size。 */
+.gauge-val b { font-size:calc(22px * var(--num-scale)); font-family:var(--mono); }
 .gauge-val span { font-size:11px; color:var(--muted); }
 .speed { text-align:center; }
-.speed b { font-size:34px; font-family:var(--mono); }
+.speed b { font-size:calc(34px * var(--num-scale)); font-family:var(--mono); }
 .speed span { display:block; font-size:11px; color:var(--muted); }
 .bar-row { display:flex; align-items:center; gap:8px; margin-bottom:7px;
   font-size:12px; }
@@ -1613,7 +1755,7 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .fill.t { background:var(--ok); } .fill.b { background:var(--bad); }
 .fill.lat { background:var(--accent); } .fill.lon { background:var(--warn); }
 /* 油量：低于 20% 变红提示（比赛最后阶段要留意） */
-.fill.fuel { background:linear-gradient(90deg,#0d6efd,#6610f2); }
+.fill.fuel { background:linear-gradient(90deg,var(--accent),rgba(var(--accent-rgb),.55)); }
 .fill.fuel.low { background:var(--bad); }
 .fill.turbo { background:#20c997; }
 .shiftlamp { display:flex; gap:5px; justify-content:center; margin:9px 0 2px; }
@@ -1634,7 +1776,7 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .laps { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
 .laps > div { background:rgba(128,128,128,.1); border-radius:8px; padding:8px 10px; }
 .laps span { display:block; font-size:11px; color:var(--muted); }
-.laps b { font-size:15px; font-family:var(--mono); }
+.laps b { font-size:calc(15px * var(--num-scale)); font-family:var(--mono); }
 /* 每圈圈速列表（新圈在上，最快圈绿色★） */
 .laplist { margin-top:10px; max-height:172px; overflow-y:auto; }
 .laprow { display:flex; justify-content:space-between; align-items:center;
@@ -1651,7 +1793,7 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .ggreadout { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
 .ggreadout span { background:rgba(128,128,128,.1); border-radius:8px;
   padding:6px 4px; text-align:center; font-size:11px; color:var(--muted); }
-.ggreadout b { display:block; font-size:15px; font-family:var(--mono);
+.ggreadout b { display:block; font-size:calc(15px * var(--num-scale)); font-family:var(--mono);
   color:var(--text); margin-top:2px; }
 
 /* ---------- 术语说明：右侧滑入面板 ---------- */
@@ -1687,10 +1829,10 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .gloss-body h4 { font-size:13px; font-weight:600; margin:0 0 7px;
   color:var(--accent); }
 /* ---------- 布局系统：卡片可拖拽 / 显隐 / 多布局 ---------- */
-.cgrid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.cgrid { display:grid; grid-template-columns:1fr 1fr; gap:var(--gap-card); }
 .cgrid .card { margin-bottom:0; min-width:0; overflow:hidden;
   transition:border-color .15s, box-shadow .15s; }
-.cgrid .card:hover { border-color:rgba(13,110,253,.45); }
+.cgrid .card:hover { border-color:rgba(var(--accent-rgb),.45); }
 .cgrid .card.span2 { grid-column:1 / -1; }
 .cgrid .card.editmode { outline:2px dashed var(--accent); outline-offset:2px; }
 .cgrid .card.editmode > h2 { cursor:move; }
@@ -1719,6 +1861,31 @@ body.layout-editing .cgrid .card.editmode {
 #layoutSel, #layoutName { width:100%; padding:8px 10px; margin-top:6px;
   border:1px solid var(--line); border-radius:7px;
   background:var(--card); color:inherit; font-family:inherit; font-size:13px; }
+/* ---------- 个性化设置面板 ---------- */
+.themepick { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:4px; }
+.tbox { display:flex; flex-direction:column; gap:5px; cursor:pointer;
+  border:1px solid var(--line); border-radius:9px; padding:7px 9px;
+  background:var(--card); color:var(--text);
+  font-family:inherit; font-size:12px; text-align:left; transition:.12s; }
+.tbox:hover { border-color:rgba(var(--accent-rgb),.55); }
+.tbox.on { outline:2px solid var(--accent); outline-offset:1px; }
+.tbox .sw { display:flex; gap:3px; }
+.tbox .sw i { width:15px; height:15px; border-radius:5px;
+  border:1px solid rgba(128,128,128,.35); }
+.tbox b { font-size:12px; font-weight:600; }
+.tbox span { font-size:10.5px; color:var(--muted); line-height:1.4; }
+.accentpick { display:flex; flex-wrap:wrap; gap:7px; align-items:center; }
+.accentpick button { width:24px; height:24px; border-radius:50%; padding:0;
+  border:2px solid transparent; cursor:pointer; transition:.12s; }
+.accentpick button.on { border-color:var(--text); transform:scale(1.08); }
+input[type="range"] { width:100%; accent-color:var(--accent); margin-top:6px; }
+input[type="color"] { width:32px; height:24px; padding:0; vertical-align:middle;
+  border:1px solid var(--line); border-radius:6px; background:none; cursor:pointer; }
+.prefjson { width:100%; min-height:62px; resize:vertical; font-family:var(--mono);
+  font-size:11px; line-height:1.5; border:1px solid var(--line); border-radius:7px;
+  background:rgba(128,128,128,.06); color:inherit; padding:7px 8px; margin-top:6px; }
+.trow > select { min-width:96px; }
+.trow output { font-family:var(--mono); font-size:11.5px; color:var(--muted); }
 .gloss-body p { font-size:13px; line-height:1.75; margin:0 0 6px; }
 .gloss-body p.dim { font-size:12px; color:var(--muted); line-height:1.7; }
 .gloss-body ul { margin:4px 0 6px; padding-left:19px; }
@@ -1726,7 +1893,7 @@ body.layout-editing .cgrid .card.editmode {
 .gloss-body b { font-weight:600; }
 .k { display:inline-block; padding:0 5px; border-radius:4px; font-size:11px;
   line-height:16px; color:#fff; }
-.k.blue { background:#0d6efd } .k.green { background:#198754 }
+.k.blue { background:var(--accent) } .k.green { background:var(--ok) }
 .k.orange { background:#fd7e14 } .k.red { background:#dc3545 }
 .bar-row output { width:42px; text-align:right; font-family:var(--mono);
   font-size:11px; color:var(--muted); }
@@ -1739,22 +1906,24 @@ body.layout-editing .cgrid .card.editmode {
 .wheel { text-align:center; padding:8px 4px; border-radius:8px;
   background:rgba(128,128,128,.1); }
 .wheel span { display:block; font-size:11px; color:var(--muted); }
-.wheel b { font-size:16px; font-family:var(--mono); }
+.wheel b { font-size:calc(16px * var(--num-scale)); font-family:var(--mono); }
 .wheel.hot b { color:var(--bad); } .wheel.cold b { color:var(--accent); }
 .gforce { text-align:center; padding:8px; border-radius:8px;
   background:rgba(128,128,128,.1); }
-.gforce b { font-size:20px; font-family:var(--mono); }
+.gforce b { font-size:calc(20px * var(--num-scale)); font-family:var(--mono); }
 .warn { background:rgba(220,53,69,.1); border:1px solid var(--bad);
   color:var(--bad); border-radius:8px; padding:8px 12px;
   font-size:12px; margin-bottom:10px; }
 /* 车辆状态提示（暂停/静止/加载）——避免把「暂停后的上报值」误认为卡死 */
 .badge { border-radius:8px; padding:8px 12px; font-size:12.5px;
   margin-bottom:10px; font-weight:500; border:1px solid; }
-.badge.pause { background:rgba(255,193,7,.16); border-color:#ffc107; color:#8a6100; }
-.badge.idle  { background:rgba(13,110,253,.10); border-color:var(--accent); color:var(--accent); }
-@media (prefers-color-scheme: dark) {
-  .badge.pause { color:#ffd75e; }
-}
+/* 🔴 提示条要同时适配 9 套主题：写死深色只在浅色主题上看得清。
+   color-mix 把「警示色」和当前主题的文字色混一下，深浅背景都自动可读；
+   老浏览器不认 color-mix 就丢弃该行，保留上面那行兜底色（浅色场景正确）。 */
+.badge.pause { background:rgba(255,193,7,.16); border-color:#ffc107;
+  color:#8a6100; color:color-mix(in srgb, #ffc107 45%, var(--text)); }
+.badge.idle  { background:rgba(var(--accent-rgb),.10); border-color:var(--accent);
+  color:var(--accent); color:color-mix(in srgb, var(--accent) 65%, var(--text)); }
 .empty { text-align:center; padding:32px; color:var(--muted); font-size:14px; }
 table { width:100%; border-collapse:collapse; font-size:12px; }
 th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
@@ -1774,6 +1943,7 @@ th { color:var(--muted); font-weight:500; }
   <span class="stat" id="carWrap" style="display:none">车 <b id="carname">-</b></span>
   <span class="nav">
     <a href="/sessions">历史场次</a>
+    <a href="#" id="prefLink" onclick="event.preventDefault(); togglePrefPanel(true)">个性化</a>
     <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)">术语说明</a>
     <a href="#" id="layoutLink" onclick="event.preventDefault(); toggleLayoutPanel(true)">布局</a>
     <a href="#" id="apiLink" onclick="event.preventDefault(); toggleApiPanel(true)">API</a>
@@ -1997,6 +2167,104 @@ th { color:var(--muted); font-weight:500; }
   </aside>
 </div>
 
+<!-- 个性化设置（点「个性化」弹出，右侧滑入） -->
+<div id="prefWrap" class="gloss-wrap">
+  <div class="gloss-mask" onclick="togglePrefPanel(false)"></div>
+  <aside class="gloss" role="dialog" aria-label="个性化设置">
+    <header>
+      <h3>个性化设置</h3>
+      <button onclick="togglePrefPanel(false)" aria-label="关闭">✕</button>
+    </header>
+    <div class="gloss-body">
+      <section>
+        <h4>主题预设</h4>
+        <div class="themepick" id="themePick"></div>
+        <p class="dim">「跟随系统」会随浏览器/系统的深浅色自动切换；其余预设固定不变。</p>
+      </section>
+      <section>
+        <h4>强调色</h4>
+        <div class="accentpick" id="accentPick"></div>
+        <div class="rowbtns">
+          <button onclick="setAccent('')">跟随主题</button>
+          <input type="color" id="accentCustom" value="#0d6efd"
+            onchange="setAccent(this.value)" aria-label="自定义强调色">
+        </div>
+        <p class="dim">影响导航高亮、转速环、进度条与链接色。选「跟随主题」则用当前预设自带的颜色。</p>
+      </section>
+      <section>
+        <h4>排版</h4>
+        <div class="trow">
+          <label for="densitySel">卡片间距</label>
+          <select id="densitySel" onchange="setDensity(this.value)">
+            <option value="compact">紧凑</option>
+            <option value="normal" selected>标准</option>
+            <option value="cozy">宽松</option>
+          </select>
+        </div>
+        <div class="trow" style="display:block">
+          <label for="fontScale">读数大小 <output id="fontScaleOut">100%</output></label>
+          <input type="range" id="fontScale" min="80" max="160" step="5" value="100"
+            oninput="setFontScale(this.value)">
+        </div>
+        <p class="dim">「读数大小」只缩放速度、转速、圈速、胎温等数字，副屏远距离看更清楚。</p>
+      </section>
+      <section>
+        <h4>单位</h4>
+        <div class="trow">
+          <label for="speedUnitSel">速度单位</label>
+          <select id="speedUnitSel" onchange="setSpeedUnit(this.value)">
+            <option value="kph" selected>km/h（公里每小时）</option>
+            <option value="mph">mph（英里每小时）</option>
+          </select>
+        </div>
+        <p class="dim">实时曲线与「本场极速」会同步换算。</p>
+      </section>
+      <section>
+        <h4>图表</h4>
+        <div class="trow">
+          <label for="chartWinSel">实时曲线窗口</label>
+          <select id="chartWinSel" onchange="setChartWindow(this.value)">
+            <option value="120">约 2 秒</option>
+            <option value="300" selected>约 5 秒</option>
+            <option value="600">约 10 秒</option>
+          </select>
+        </div>
+        <div class="trow">
+          <label for="ggMaxSel">G 力量程</label>
+          <select id="ggMaxSel" onchange="setGgMax(this.value)">
+            <option value="1.5">±1.5 g</option>
+            <option value="2">±2 g</option>
+            <option value="3" selected>±3 g</option>
+            <option value="4">±4 g</option>
+          </select>
+        </div>
+        <div id="chartSeries"></div>
+        <p class="dim">G 力量程同时作用于抓地力图与 G 力球的外圈参考环。</p>
+      </section>
+      <section>
+        <h4>备份与恢复</h4>
+        <textarea id="prefJson" class="prefjson" spellcheck="false"
+          aria-label="偏好 JSON"></textarea>
+        <div class="rowbtns">
+          <button onclick="exportPrefs()">导出到此框</button>
+          <button onclick="importPrefs()">从框内导入</button>
+        </div>
+        <div class="rowbtns">
+          <button onclick="resetPrefs()">恢复全部默认</button>
+        </div>
+        <p class="dim">偏好存在<b>本浏览器</b>（localStorage），换设备/换浏览器不通用；
+          想在两台机器间搬偏好，用上面的导出／导入。</p>
+      </section>
+      <section>
+        <button onclick="togglePrefPanel(false)"
+          style="width:100%;border:1px solid var(--line);background:var(--card);
+                 color:inherit;padding:9px;border-radius:7px;cursor:pointer;
+                 font-family:inherit;font-size:13px">完成</button>
+      </section>
+    </div>
+  </aside>
+</div>
+
 <div id="warn" class="warn" style="display:none"></div>
 <div id="statebadge" class="badge" style="display:none"></div>
 
@@ -2007,12 +2275,12 @@ th { color:var(--muted); font-weight:500; }
       <div class="dials">
         <div class="gauge">
           <svg width="132" height="132" viewBox="0 0 132 132">
-            <circle cx="66" cy="66" r="54" fill="none"
-              stroke="rgba(128,128,128,.2)" stroke-width="9"
+            <circle class="bg-ring" cx="66" cy="66" r="54" fill="none"
+              stroke-width="9"
               stroke-dasharray="254.5 339.3" stroke-linecap="round"
               transform="rotate(0 66 66)" />
             <circle id="rpmArc" cx="66" cy="66" r="54" fill="none"
-              stroke="#0d6efd" stroke-width="9" stroke-dasharray="0 339.3"
+              stroke-width="9" stroke-dasharray="0 339.3"
               stroke-linecap="round" />
           </svg>
           <div class="gauge-val">
@@ -2020,7 +2288,7 @@ th { color:var(--muted); font-weight:500; }
           </div>
         </div>
         <div class="speed">
-          <b id="speed">0</b><span>km/h</span>
+          <b id="speed">0</b><span id="speedUnit">km/h</span>
           <div style="margin-top:10px;font-size:11px;color:var(--muted)">
             本场极速 <b id="maxspeed" style="font-family:var(--mono)">-</b>
           </div>
@@ -2108,7 +2376,7 @@ th { color:var(--muted); font-weight:500; }
     <div class="card span2" id="c-chart">
     <h2>实时曲线 <span id="range" style="float:right;font-weight:400"></span></h2>
     <div class="legend">
-      <span><i style="background:#0d6efd"></i>速度 km/h</span>
+      <span><i style="background:var(--accent)"></i><span id="legendSpeed">速度 km/h</span></span>
       <span><i style="background:#dc3545"></i>转速</span>
       <span><i style="background:#198754"></i>油门</span>
       <span><i style="background:#fd7e14"></i>刹车</span>
@@ -2165,6 +2433,180 @@ th { color:var(--muted); font-weight:500; }
 const $ = id => document.getElementById(id);
 const RPM_MAX = 15000, SPEED_MAX = 320;
 let bestLap = null, lastFrame = null;
+
+// ===========================================================================
+// 个性化设置：主题预设 / 强调色 / 排版 / 单位 / 图表
+// ===========================================================================
+// 存 localStorage（每浏览器一份），理由同布局偏好：这些都是视觉习惯，
+// 跟设备和屏幕尺寸强相关，也不必为它给服务端加写接口。
+// 🔴 新增主题要改两处：这里的 THEMES + CSS 里的 [data-theme="xxx"]，靠 id 对齐。
+//    只改一侧的表现是「面板里有这个选项，点了没反应」。
+const PREF_KEY = 'gt7_prefs_v1';
+const THEMES = [
+  {id:'auto',     name:'跟随系统', desc:'随系统深浅色自动切换',
+   c:['#f5f6f7','#16181c','#0d6efd']},
+  {id:'light',    name:'浅色', desc:'默认白底，白天清晰',
+   c:['#f5f6f7','#fff','#0d6efd']},
+  {id:'dark',     name:'深色', desc:'夜里不晃眼',
+   c:['#16181c','#1e2126','#2b7fff']},
+  {id:'oled',     name:'OLED 赛道黑', desc:'纯黑底＋青柠，夜间/OLED 屏',
+   c:['#000','#0a0b0d','#00e0c6']},
+  {id:'sepia',    name:'米黄护眼', desc:'暖色纸质底，长时间看数据',
+   c:['#f2e9d7','#fdf8ec','#b45309']},
+  {id:'racing',   name:'GT 竞速', desc:'碳纤黑＋GT 红，热血赛道向',
+   c:['#0d0d0f','#16161a','#e10600']},
+  {id:'glacier',  name:'冰川蓝', desc:'冷调浅色，清爽轻量',
+   c:['#eaf2fb','#fff','#0a84ff']},
+  {id:'hud',      name:'HUD 荧光', desc:'黑底荧光绿，赛博 HUD 观感',
+   c:['#04100a','#08180f','#39ff14']},
+  {id:'midnight', name:'午夜紫', desc:'暗紫长夜复盘向',
+   c:['#0c0a18','#15122a','#9b6bff']},
+];
+const ACCENTS = ['#0d6efd','#0a84ff','#00e0c6','#198754','#b45309',
+                 '#e10600','#e83e8c','#9b6bff','#39ff14','#ffb020'];
+// 曲线条目顺序 = 图例顺序；颜色读主题变量，所以换主题的曲线也跟着变
+const SERIES_META = [
+  {k:'speed',    label:'速度', v:'--accent'},
+  {k:'rpm',      label:'转速', v:'--bad'},
+  {k:'throttle', label:'油门', v:'--ok'},
+  {k:'brake',    label:'刹车', v:'--warn'},
+];
+const WINDOWS = [120, 300, 600];        // ≈2/5/10 秒（按 60Hz 采样折算）
+const DEFAULT_PREFS = {
+  theme: 'auto', accent: '', density: 'normal', fontScale: 100,
+  speedUnit: 'kph', chartWindow: 300, ggMax: 3,
+  chartSeries: {speed:true, rpm:true, throttle:true, brake:true},
+};
+
+function hexToRgbStr(hex) {
+  let h = String(hex || '').replace('#', '');
+  if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  const n = parseInt(h, 16);
+  if (isNaN(n) || h.length !== 6) return '';
+  return ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255);
+}
+function loadPrefs() {
+  const p = JSON.parse(JSON.stringify(DEFAULT_PREFS));   // 深拷贝，别改到默认对象
+  try {
+    const s = JSON.parse(localStorage.getItem(PREF_KEY) || '{}');
+    Object.assign(p, s);
+    // 嵌套对象要单独浅合并：直接 Object.assign 会整个覆盖，缺字段就没了
+    if (s.chartSeries) Object.assign(p.chartSeries, s.chartSeries);
+  } catch (e) { /* 存档坏了就从头来 */ }
+  // 合法性兜底：用户手改过 localStorage、或旧版本存的值现在不认了
+  if (!THEMES.some(t => t.id === p.theme)) p.theme = 'auto';
+  if (['compact','normal','cozy'].indexOf(p.density) < 0) p.density = 'normal';
+  if (['kph','mph'].indexOf(p.speedUnit) < 0) p.speedUnit = 'kph';
+  if (WINDOWS.indexOf(+p.chartWindow) < 0) p.chartWindow = 300;
+  p.fontScale = Math.min(160, Math.max(80, +p.fontScale || 100));
+  p.ggMax = Math.min(4, Math.max(1.5, +p.ggMax || 3));
+  return p;
+}
+let prefs = loadPrefs();
+function savePrefs() {
+  try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); }
+  catch (e) { /* 隐私模式写不进去：本次会话内仍生效 */ }
+}
+
+// canvas 不继承 CSS 变量，画之前把变量值取出来交给 ctx
+function gvar(name, fb) {
+  const v = getComputedStyle(document.documentElement)
+    .getPropertyValue(name).trim();
+  return v || fb || '#888';
+}
+// 速度换算：全 UI 只此一处知道 mph 的存在，其余照常接收 km/h
+const KPH_TO_MPH = 0.621371;
+function spd(kph) { return prefs.speedUnit === 'mph' ? kph * KPH_TO_MPH : kph; }
+function spdUnit() { return prefs.speedUnit === 'mph' ? 'mph' : 'km/h'; }
+
+function applyPrefs() {
+  const d = document.documentElement;
+  d.setAttribute('data-theme', prefs.theme);
+  d.setAttribute('data-density', prefs.density);
+  d.style.setProperty('--num-scale', (prefs.fontScale / 100).toFixed(2));
+  const rgb = hexToRgbStr(prefs.accent);
+  if (rgb) {
+    d.style.setProperty('--accent', prefs.accent);
+    d.style.setProperty('--accent-rgb', rgb);
+  } else {
+    // 没选自定强调色 → 清掉内联值，让当前主题预设自带的颜色生效
+    d.style.removeProperty('--accent');
+    d.style.removeProperty('--accent-rgb');
+  }
+  $('speedUnit').textContent = spdUnit();
+  $('legendSpeed').textContent = '速度 ' + spdUnit();
+  GG_MAX = +prefs.ggMax;          // 抓地力图与 G 力球共用同一量程
+  renderPrefPanel();
+}
+
+function setTheme(id)     { prefs.theme = id; savePrefs(); applyPrefs(); }
+function setAccent(v)     { prefs.accent = v || ''; savePrefs(); applyPrefs(); }
+function setDensity(v)    { prefs.density = v; savePrefs(); applyPrefs(); }
+function setSpeedUnit(v)  { prefs.speedUnit = v; savePrefs(); applyPrefs(); }
+function setGgMax(v)      { prefs.ggMax = +v; savePrefs(); applyPrefs(); }
+function setChartWindow(v){ prefs.chartWindow = +v; savePrefs(); applyPrefs(); }
+function setFontScale(v) {
+  prefs.fontScale = +v; savePrefs();
+  document.documentElement.style.setProperty(
+    '--num-scale', (prefs.fontScale / 100).toFixed(2));
+  $('fontScaleOut').textContent = prefs.fontScale + '%';
+}
+function toggleSeries(k, on) { prefs.chartSeries[k] = !!on; savePrefs(); }
+
+function renderPrefPanel() {
+  $('themePick').innerHTML = THEMES.map(t =>
+    '<button class="tbox' + (t.id === prefs.theme ? ' on' : '') +
+    '" onclick="setTheme(\'' + t.id + '\')"><span class="sw">' +
+    t.c.map(c => '<i style="background:' + c + '"></i>').join('') +
+    '</span><b>' + t.name + '</b><span>' + t.desc + '</span></button>').join('');
+  $('accentPick').innerHTML = ACCENTS.map(a =>
+    '<button style="background:' + a + '"' + (prefs.accent === a ? ' class="on"' : '') +
+    ' title="' + a + '" aria-label="强调色 ' + a +
+    '" onclick="setAccent(\'' + a + '\')"></button>').join('');
+  $('chartSeries').innerHTML = SERIES_META.map(s =>
+    '<div class="trow"><label><input type="checkbox"' +
+    (prefs.chartSeries[s.k] ? ' checked' : '') +
+    ' onchange="toggleSeries(\'' + s.k + '\',this.checked)"> ' + s.label +
+    '</label><span style="width:22px;height:3px;border-radius:2px;background:var(' +
+    s.v + ')"></span></div>').join('');
+  // 面板每次打开都按当前偏好回填控件（手改 localStorage 或导入后也要同步）
+  $('densitySel').value = prefs.density;
+  $('speedUnitSel').value = prefs.speedUnit;
+  $('chartWinSel').value = String(prefs.chartWindow);
+  $('ggMaxSel').value = String(prefs.ggMax);
+  $('fontScale').value = prefs.fontScale;
+  $('fontScaleOut').textContent = prefs.fontScale + '%';
+  $('accentCustom').value = hexToRgbStr(prefs.accent)
+    ? prefs.accent : gvar('--accent', '#0d6efd');
+}
+function togglePrefPanel(open) {
+  $('prefWrap').classList.toggle('open', !!open);
+  if (open) { renderPrefPanel(); exportPrefs(); }
+}
+function exportPrefs() {
+  $('prefJson').value = JSON.stringify(prefs, null, 1);
+}
+function importPrefs() {
+  let v = ($('prefJson').value || '').trim();
+  try {
+    const s = JSON.parse(v);
+    if (!s || typeof s !== 'object' || Array.isArray(s)) throw new Error('格式不符');
+    localStorage.setItem(PREF_KEY, JSON.stringify(s));
+    prefs = loadPrefs();      // 走一遍兜底校验，脏值不会被写进状态
+    applyPrefs();
+    v = '已导入并应用（非法字段已自动纠正为默认值）';
+  } catch (e) {
+    v = '导入失败：' + e.message + '。请把导出的 JSON 原样粘贴到这里。';
+  }
+  $('prefJson').value = v;
+}
+function resetPrefs() {
+  if (!confirm('恢复默认主题、强调色、单位与图表设置？（已保存的布局不受影响）')) return;
+  try { localStorage.removeItem(PREF_KEY); } catch (e) { /* 读不到就算了 */ }
+  prefs = loadPrefs();
+  applyPrefs();
+  exportPrefs();
+}
 
 function fmtLap(sec) {
   if (!sec && sec !== 0) return '-';
@@ -2228,16 +2670,16 @@ function render(s) {
   $('gear').textContent = (L.gear > 0 ? L.gear : (L.gear === 0 ? 'N' : 'R')) + ' 档';
   $('rpmArc').setAttribute('stroke-dasharray', (frac * 254.5) + ' 339.3');
 
-  // 速度
-  $('speed').textContent = Math.round(L.speed_kph);
+  // 速度（显示单位由个性化面板决定，内部一律 km/h）
+  $('speed').textContent = Math.round(spd(L.speed_kph));
   // 本场极速：由接收器按会话累计（不随历史缓冲滚动而变）
   if (s.session_max_speed != null) {
-    $('maxspeed').textContent = Math.round(s.session_max_speed);
+    $('maxspeed').textContent = Math.round(spd(s.session_max_speed));
   }
   // 近 10 秒极速：从 history 窗口算，用于对照「刚才跑多快」
   let mx10 = 0;
   for (const f of s.history) if (f.speed_kph > mx10) mx10 = f.speed_kph;
-  $('maxspeed10').textContent = Math.round(mx10);
+  $('maxspeed10').textContent = Math.round(spd(mx10));
 
   // 踏板
   const thr = Math.round(L.throttle * 100), brk = Math.round(L.brake * 100);
@@ -2444,45 +2886,52 @@ function drawChart(hist) {
   if (!hist || hist.length < 2) return;
   const svg = $('chart');
   const W = 600, H = 110, PAD = 7;
-  const n = Math.min(hist.length, 300);
+  // 窗口长度由个性化面板决定（约 2 / 5 / 10 秒）
+  const n = Math.min(hist.length, prefs.chartWindow);
   const data = hist.slice(-n);
   const step = W / Math.max(1, n - 1);
   const DH = H - PAD * 2;                    // 可绘制高度（留上下边距）
   const yOf = (v, s) => PAD + DH * (1 - Math.min(v / s, 1));
+  const grid = gvar('--cv-grid', 'rgba(128,128,128,.18)');
 
   let out = '';
   for (let i = 0; i <= 4; i++) {
     const y = PAD + DH / 4 * i;
     out += '<line x1="0" y1="' + y.toFixed(1) + '" x2="' + W + '" y2="' + y.toFixed(1) +
-           '" stroke="rgba(128,128,128,.18)" stroke-width="1"/>';
+           '" stroke="' + grid + '" stroke-width="1"/>';
   }
 
   // 🔴 速度轴必须自动缩放
   // 原先是固定 0~320，跑 350+ 时整条曲线被裁到视口外 → 图表一片空白，
   // 看起来像「没数据」，实际是画到框外面去了。
-  const vmax = Math.max(80, ...data.map(f => f.speed_kph));
-  const vScale = Math.ceil(vmax / 50) * 50;
+  // 换算成 mph 后数值整体变小，所以先换算再定刻度，步长也跟着单位走。
+  const vRaw = data.map(f => spd(f.speed_kph || 0));
+  const vmax = Math.max(spd(80), ...vRaw);
+  const vStep = spdUnit() === 'mph' ? 25 : 50;
+  const vScale = Math.max(vStep, Math.ceil(vmax / vStep) * vStep);
 
   const series = [
-    { get: f => f.speed_kph,      scale: vScale, color: '#0d6efd', w: 1.8 },
-    { get: f => f.rpm,            scale: 16000,  color: '#dc3545', w: 1.2 },
-    { get: f => f.throttle * 100, scale: 100,    color: '#198754', w: 1.2 },
-    { get: f => f.brake * 100,    scale: 100,    color: '#fd7e14', w: 1.2 },
+    { k: 'speed',    get: f => spd(f.speed_kph || 0), scale: vScale, w: 1.8 },
+    { k: 'rpm',      get: f => f.rpm || 0,            scale: 16000,  w: 1.2 },
+    { k: 'throttle', get: f => (f.throttle || 0) * 100, scale: 100,  w: 1.2 },
+    { k: 'brake',    get: f => (f.brake || 0) * 100,    scale: 100,  w: 1.2 },
   ];
 
   for (const se of series) {
+    if (!prefs.chartSeries[se.k]) continue;      // 面板里关掉的曲线不画
+    const meta = SERIES_META.find(m => m.k === se.k);
     let d = '';
     for (let i = 0; i < data.length; i++) {
       const x = i * step;
       const y = yOf(se.get(data[i]), se.scale);
       d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
     }
-    out += '<path d="' + d + '" fill="none" stroke="' + se.color +
+    out += '<path d="' + d + '" fill="none" stroke="' + gvar(meta.v, '#888') +
            '" stroke-width="' + se.w + '" stroke-linejoin="round"/>';
   }
   svg.innerHTML = out;
   $('range').textContent = '最近 ' + n + ' 帧 / 约 ' + (n / 60).toFixed(1) +
-    ' 秒 · 速度轴 0~' + vScale;
+    ' 秒 · 速度轴 0~' + vScale + ' ' + spdUnit();
 }
 
 // ---------- 圈速格式化 ----------
@@ -2520,7 +2969,7 @@ function drawMap(path) {
   ctx.clearRect(0, 0, W, H);
 
   if (!path || path.length < 2) {
-    ctx.fillStyle = 'rgba(128,128,128,.65)';
+    ctx.fillStyle = gvar('--cv-text', 'rgba(128,128,128,.65)');
     ctx.font = '13px system-ui,-apple-system,sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText('等待赛道数据…（车开动后自动绘制）', W / 2, H / 2);
@@ -2558,9 +3007,11 @@ function drawMap(path) {
 
   // 起点（绿圈）与当前位置（白点）
   const s0 = path[0], sN = path[path.length - 1];
-  ctx.fillStyle = '#198754';
+  ctx.fillStyle = gvar('--ok', '#198754');
   ctx.beginPath(); ctx.arc(px(s0[0]), py(s0[1]), 5, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#0d6efd'; ctx.lineWidth = 2.5;
+  // 当前位置：卡片底色填充 + 强调色描边，深浅主题上都看得见
+  ctx.fillStyle = gvar('--card', '#fff');
+  ctx.strokeStyle = gvar('--accent', '#0d6efd'); ctx.lineWidth = 2.5;
   ctx.beginPath(); ctx.arc(px(sN[0]), py(sN[1]), 5.5, 0, Math.PI * 2);
   ctx.fill(); ctx.stroke();
 
@@ -2576,17 +3027,19 @@ function drawGG(gg) {
   const ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
   const cx = W / 2, cy = H / 2;
-  const GMAX = 3;
+  const GMAX = GG_MAX;                    // 量程跟着个性化面板走
   const R = Math.min(W, H) / 2 - 16;
   const sc = R / GMAX;
+  const CV_TEXT = gvar('--cv-text', 'rgba(128,128,128,.65)');
   ctx.clearRect(0, 0, W, H);
 
   ctx.lineWidth = 1;
   for (let g = 1; g <= GMAX; g++) {
-    ctx.strokeStyle = g === GMAX ? 'rgba(128,128,128,.42)' : 'rgba(128,128,128,.22)';
+    // 外圈 = 量程边界，用最重的 --cv-edge；内圈参考环用 --cv-ring
+    ctx.strokeStyle = g === GMAX ? gvar('--cv-edge') : gvar('--cv-ring');
     ctx.beginPath(); ctx.arc(cx, cy, sc * g, 0, Math.PI * 2); ctx.stroke();
   }
-  ctx.strokeStyle = 'rgba(128,128,128,.35)';
+  ctx.strokeStyle = gvar('--cv-axis', 'rgba(128,128,128,.35)');
   ctx.beginPath();
   ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
   ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
@@ -2605,7 +3058,7 @@ function drawGG(gg) {
     ctx.globalAlpha = 1;
   }
 
-  ctx.fillStyle = 'rgba(128,128,128,.85)';
+  ctx.fillStyle = CV_TEXT;
   ctx.font = '10px system-ui,-apple-system,sans-serif';
   ctx.textAlign = 'center';
   ctx.fillText('加速', cx, cy - R - 5);
@@ -2615,7 +3068,7 @@ function drawGG(gg) {
   ctx.textAlign = 'right';
   ctx.fillText('左转', cx - R - 3, cy + 3);
   if (!gg || !gg.length) {
-    ctx.fillStyle = 'rgba(128,128,128,.6)';
+    ctx.fillStyle = CV_TEXT;
     ctx.textAlign = 'center';
     ctx.font = '12px system-ui,-apple-system,sans-serif';
     ctx.fillText('过弯后自动生成', cx, cy - 6);
@@ -2626,24 +3079,24 @@ function drawGG(gg) {
 // 与上面的散点图互补：
 //   · 散点图 = 整场的「抓地力圆」（慢变量，看极限用到多少）
 //   · G 力球 = 当前这一刻的 G（快变量，跟着方向盘和踏板实时晃）
-const GG_MAX = 3;
+// 🔴 let 而不是 const：个性化面板的「G 力量程」会改它，抓地力图与 G 力球共用。
+let GG_MAX = 3;
 let ggBall = { x: 0, y: 0 };      // 平滑后的球位（单位 g）
 let ggTarget = { x: 0, y: 0 };    // 目标球位（来自最新帧）
 let ggTrail = [];                 // 最近轨迹（g 坐标）
 let ggReady = false;
 let ggLastUpdate = 0;             // 上次收到数据的时间（用于停数据后回正）
 
+// 之前这里判断 prefers-color-scheme —— 换成偏好主题后会在深色系统上失效
+// （用户选了浅色，球还是按深色画）。现在直接读当前主题的变量值。
 function ggTheme() {
-  const dark = !!(window.matchMedia &&
-    window.matchMedia('(prefers-color-scheme: dark)').matches);
-  return dark ? {
-    bowl: 'rgba(255,255,255,.04)', ring: 'rgba(255,255,255,.10)',
-    edge: 'rgba(255,255,255,.26)', axis: 'rgba(255,255,255,.16)',
-    text: 'rgba(255,255,255,.55)', shadow: 'rgba(0,0,0,.55)',
-  } : {
-    bowl: 'rgba(0,0,0,.028)', ring: 'rgba(0,0,0,.075)',
-    edge: 'rgba(0,0,0,.18)', axis: 'rgba(0,0,0,.12)',
-    text: 'rgba(0,0,0,.5)', shadow: 'rgba(0,0,0,.22)',
+  return {
+    bowl: gvar('--cv-bowl', 'rgba(0,0,0,.03)'),
+    ring: gvar('--cv-ring', 'rgba(0,0,0,.08)'),
+    edge: gvar('--cv-edge', 'rgba(0,0,0,.18)'),
+    axis: gvar('--cv-axis', 'rgba(0,0,0,.12)'),
+    text: gvar('--cv-text', 'rgba(0,0,0,.5)'),
+    shadow: gvar('--cv-shadow', 'rgba(0,0,0,.22)'),
   };
 }
 
@@ -2751,11 +3204,15 @@ function toggleGlossary(open) {
 }
 // ESC 关闭
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { toggleGlossary(false); toggleApiPanel(false); }
+  if (e.key === 'Escape') {
+    toggleGlossary(false); toggleApiPanel(false); togglePrefPanel(false);
+  }
 });
 
+// 拉多少帧跟着面板的曲线窗口走：窗口拉到 10 秒，这里就得要 600 帧，
+// 否则曲线会因为数据不够而画不满。
 function poll() {
-  fetch('/api/state?frames=300').then(r => r.json()).then(render)
+  fetch('/api/state?frames=' + prefs.chartWindow).then(r => r.json()).then(render)
     .catch(() => { $('dot').className = 'dot off';
       $('status').textContent = '服务无响应'; });
 }
@@ -2930,6 +3387,9 @@ function syncFromDOM() {
   });
 })();
 applyLayout();            // 启动时按保存的布局排列一次
+// 放在最后：applyPrefs() 会读写 GG_MAX / 依赖已声明完的函数，
+// 提前调用会撞上 let 的暂时性死区。
+applyPrefs();             // 再把主题/单位/图表偏好应用到页面上
 </script>
 </body>
 </html>
