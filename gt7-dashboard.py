@@ -96,6 +96,8 @@ class TelemetryHub:
         self._warning: str | None = None
         self._connected = False
         self._last_frame_t = 0.0
+        # 本场发车位（接收器在开跑瞬间快照，见 gt7-recorder）
+        self._grid_start = 0
         self._has_coords = False
         self._session_max_speed = 0.0
         # 赛道轨迹 [[x,z,G], ...] 与 G-G 散点 [[横向,纵向], ...]
@@ -177,9 +179,14 @@ class TelemetryHub:
                 self._recording = bool(payload.get("recording"))
                 self._source_ips = payload.get("source_ips", [])
                 self._ps5_filter = payload.get("ps5_filter", "auto")
+                self._grid_start = int(payload.get("grid_start") or 0)
                 self._last_frame_t = time.time()
-                # connected 只表示「有包在来」；recording 才表示「在录数据」
-                self._connected = True
+                # 🔴 connected 不能只看「状态文件存在且能解析」：
+                #    PS5 关机后接收器不再更新文件，但旧文件还在，
+                #    仪表盘会永远显示「采集中」。用文件写入时刻判新鲜度：
+                #    超过 5 秒没更新（接收器 20Hz 写）= 数据流已断。
+                stale = time.time() - float(payload.get("t") or 0.0) > 5.0
+                self._connected = not stale
 
         except (OSError, json.JSONDecodeError, ValueError, KeyError):
             with self._lock:
@@ -209,6 +216,7 @@ class TelemetryHub:
 
             return {
                 "connected": self._connected,
+                "grid_start": self._grid_start,
                 "frames": self._total_frames,
                 "layouts": dict(self._layouts),
                 "warning": self._warning,
@@ -262,6 +270,39 @@ HUB: TelemetryHub
 # 历史场次
 # ---------------------------------------------------------------------------
 
+# 场次 jsonl 解析缓存：path -> (mtime, size, header, frames)。
+# 🔴 /session 一次请求会跑 analyze_session + compare_session 两个分析，
+#    各自把 30MB jsonl 读一遍纯属浪费；切换参考圈(?ref_lap=N)更是
+#    反复重读同一文件。缓存解析结果后，二次请求只算不读，
+#    页面响应从秒级降到亚秒级。jsonl 落盘后不可变，mtime+size 失效足够。
+_FRAMES_CACHE: dict[str, tuple[float, int, dict, list]] = {}
+
+
+def _load_frames(path: Path) -> tuple[dict, list]:
+    """读场次 jsonl（header + 全部帧），带 2 条目缓存。"""
+    key = str(path)
+    try:
+        st = path.stat()
+        sig = (st.st_mtime, st.st_size)
+    except OSError:
+        return {}, []
+    hit = _FRAMES_CACHE.get(key)
+    if hit and (hit[0], hit[1]) == sig:
+        return hit[2], hit[3]
+    try:
+        lines = path.read_text(encoding="utf-8").strip().split("\n")
+    except OSError:
+        return {}, []
+    if len(lines) < 2:
+        return {}, []
+    header = json.loads(lines[0])
+    frames = [json.loads(x) for x in lines[1:] if x.strip()]
+    while len(_FRAMES_CACHE) >= 2:      # 只留最近 2 个场次，防内存膨胀
+        _FRAMES_CACHE.pop(next(iter(_FRAMES_CACHE)))
+    _FRAMES_CACHE[key] = (sig[0], sig[1], header, frames)
+    return header, frames
+
+
 def compare_session(path: Path, ref_lap_no: int | None = None) -> dict[str, Any]:
     """读场次 jsonl → 圈间对比分析（gt7analysis 纯函数库）。
 
@@ -272,9 +313,8 @@ def compare_session(path: Path, ref_lap_no: int | None = None) -> dict[str, Any]
     不能因为它挂掉影响详情页主体。
     """
     try:
-        lines = path.read_text(encoding="utf-8").strip().split("\n")
-        frames = [json.loads(x) for x in lines[1:] if x.strip()
-                  and '"lap"' in x]
+        _, all_frames = _load_frames(path)
+        frames = [f for f in all_frames if "lap" in f]
         import gt7analysis
         r = gt7analysis.analyze_compare(frames, ref_lap_no=ref_lap_no)
         # 赛车线抽稀：每 6 点取 1，控制页面体积（7200 帧 → ~1200 点）
@@ -393,12 +433,9 @@ def _dominant_car_code(frames: list[dict]) -> int:
 def analyze_session(path: Path) -> dict[str, Any]:
     """读取一个已落盘场次做离线统计。"""
     try:
-        lines = path.read_text(encoding="utf-8").strip().split("\n")
-        if len(lines) < 2:
+        header, frames = _load_frames(path)
+        if not frames:
             return {"error": "文件为空"}
-
-        header = json.loads(lines[0])
-        frames = [json.loads(x) for x in lines[1:]]
 
         speeds = [f["speed_kph"] for f in frames]
         rpms = [f["rpm"] for f in frames]
@@ -541,7 +578,10 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
                                 L.get("max_alert_rpm", 0.0) > 0
                                 and L.get("rpm", 0.0) >= L.get("max_alert_rpm", 0.0))},
             "race": {"time_of_day_ms": L.get("time_of_day", 0),
+                     # 🔴 0x84 在比赛中是「当前名次」（随排名实时变），
+                     #    真正的发车位见 grid_start（开跑瞬间快照）
                      "grid_position": L.get("quali_pos", 0),
+                     "grid_start": snap.get("grid_start", 0),
                      "num_cars": L.get("num_cars", 0)},
             "tyre_temp_c": L.get("tyre_temp", []),
             "suspension_height_m": L.get("susp_height", []),
@@ -655,7 +695,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `turbo_boost` | bar 级 | 涡轮压力 |
 | `engine` | 对象 | 引擎健康：`oil_pressure_bar` / `water_temp_c` / `oil_temp_c` / `body_height_m` |
 | `shift_alert` | 对象 | 换挡提示：`min_rpm` / `max_rpm` / `shift_now`（转速已达换挡点） |
-| `race` | 对象 | 比赛信息：`time_of_day_ms`（赛道时钟）/ `grid_position`（发车位）/ `num_cars`（参赛车数） |
+| `race` | 对象 | 比赛信息：`time_of_day_ms`（赛道时钟）/ `grid_position`（**当前名次**，0x84 在比赛中随排名实时变）/ `grid_start`（发车位，开跑瞬间快照；0=未捕获）/ `num_cars`（参赛车数） |
 | `tyre_temp_c` | ℃ | 四轮表面温度，顺序 FL/FR/RL/RR |
 | `suspension_height_m` | 米 | 四轮悬挂行程，顺序 FL/FR/RL/RR |
 | `wheel_rev_per_s` | 转/秒 | 四轮转速（带符号，倒挡为负） |
@@ -1084,7 +1124,32 @@ td.num {{ font-family:var(--mono); text-align:right; }}
 .kv div {{ background:rgba(128,128,128,.08); border-radius:8px; padding:10px 12px; }}
 .kv span {{ display:block; font-size:11px; color:var(--muted); }}
 .kv b {{ font-size:19px; font-family:var(--mono); }}
+/* —— 全屏加载遮罩：大场次解析要几秒，必须有反馈 —— */
+#loadOv {{ position:fixed; inset:0; z-index:200; display:none;
+  background:rgba(128,128,128,.35); backdrop-filter:blur(2px);
+  align-items:center; justify-content:center; }}
+#loadOv .box {{ background:var(--card); border:1px solid var(--line);
+  border-radius:12px; padding:22px 34px; text-align:center;
+  box-shadow:0 8px 30px rgba(0,0,0,.18); }}
+.spin {{ width:26px; height:26px; margin:0 auto 12px;
+  border:3px solid var(--line); border-top-color:var(--accent);
+  border-radius:50%; animation:spin .8s linear infinite; }}
+@keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+#loadOv .msg {{ font-size:13.5px; }}
+#loadOv .sub {{ font-size:11.5px; color:var(--muted); margin-top:6px; }}
 </style></head><body>
+<div id="loadOv"><div class="box">
+  <div class="spin"></div>
+  <div class="msg" id="loadMsg">加载中…</div>
+  <div class="sub">大场次解析可能需要几秒</div>
+</div></div>
+<script>
+function showLoad(msg) {{
+  var ov = document.getElementById('loadOv');
+  document.getElementById('loadMsg').textContent = msg || '加载中…';
+  ov.style.display = 'flex';
+}}
+</script>
 <div class="top">
   <a class="back" href="/">&larr; 返回仪表盘</a>
   <h1>{title}</h1>
@@ -1101,6 +1166,13 @@ _SESSIONS_PAGE_JS = """
 .sbtn:hover { background:rgba(128,128,128,.16); }
 </style>
 <script>
+// 点击场次链接立刻显示加载遮罩：
+// 服务端解析大场次（几万帧 jsonl）要几秒，期间页面停在列表页
+// 毫无反应，用户会以为没点上。遮罩会一直显示到新页面渲染完。
+document.addEventListener('click', function (e) {
+  var a = e.target.closest('a[href^="/session"]');
+  if (a) showLoad('正在解析场次数据…');
+});
 function sessPost(file, action, value) {
   fetch('/api/v1/sessions/' + encodeURIComponent(file) + '/' + action, {
     method: 'POST',
@@ -1186,15 +1258,19 @@ _COMPARE_TMPL = """
     （时间差曲线 / 峰谷表）都以所选圈为基准重算。</p>
 </div>
 <div class="card">
-  <h2>速度峰值 / 谷值（参考圈 vs 最新圈）</h2>
+  <h2>哪里快 / 哪里慢 —— 关键点对比</h2>
+  <div id="pvSummary" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
   <table class="pv-table">
-    <thead><tr><th>距离 (m)</th><th>类型</th>
-      <th style="text-align:right">参考圈</th>
-      <th style="text-align:right">最新圈</th></tr></thead>
+    <thead><tr><th>距离 (m)</th><th>关键点</th>
+      <th style="text-align:right">最新圈</th>
+      <th style="text-align:right">最快圈</th>
+      <th style="text-align:right">差值</th></tr></thead>
     <tbody id="pvBody"></tbody>
   </table>
   <p class="dim" style="font-size:11.5px;margin-top:8px">
-    峰谷按速度平滑后检测（幅度 ≥ 12 km/h）。同距离两圈速度差即为该弯的得失。</p>
+    关键点 = 直道尾速（峰）与弯心速度（谷），按距离配对。差值 = 最新圈 − 最快圈：
+    <b style="color:var(--ok)">绿 +</b> 最新圈更快，
+    <b style="color:var(--bad)">红 −</b> 更慢。</p>
 </div>
 <script>
 const CMP = __DATA__;
@@ -1213,6 +1289,7 @@ const CMP = __DATA__;
   window.lapSelChange = function (v) {
     const u = new URL(location.href);
     u.searchParams.set('ref_lap', v);
+    showLoad('正在按第 ' + v + ' 圈重新分析…');
     location.href = u.toString();
   };
   (function fillLapSel() {
@@ -1286,32 +1363,37 @@ const CMP = __DATA__;
     });
   }
 
-  // —— 峰谷对比表（按最近距离配对，容差 30m）——
-  const ref = CMP.peaks_ref || [], cur = CMP.peaks_cur || [];
-  const rows = [];
-  ref.forEach(rv => {
-    let bestC = null, bestD = 1e9;
-    cur.forEach(cv2 => {
-      const dd = Math.abs(cv2.distance - rv.distance);
-      if (dd < bestD) { bestD = dd; bestC = cv2; }
-    });
-    if (bestD <= 30) { rows.push([rv, bestC]); }
-    else rows.push([rv, null]);
-  });
-  cur.forEach(cv2 => {
-    if (!ref.some(rv => Math.abs(rv.distance - cv2.distance) <= 30))
-      rows.push([null, cv2]);
-  });
-  rows.sort((a, b) => (a[0] || a[1]).distance - (b[0] || b[1]).distance);
-  const kindTxt = k => k === 'peak' ? '峰 ↑' : '谷 ↓';
-  const kc = k => k === 'peak' ? 'var(--ok)' : 'var(--bad)';
-  document.getElementById('pvBody').innerHTML = rows.map(([rv, cv3]) => {
-    const dd = rv ? rv.distance : (cv3 ? cv3.distance : '-');
-    return '<tr><td>' + dd + '</td>'
-      + '<td style="color:' + kc((rv || cv3).kind) + '">' + kindTxt((rv || cv3).kind) + '</td>'
-      + '<td class="num">' + (rv ? rv.speed_kph : '—') + '</td>'
-      + '<td class="num">' + (cv3 ? cv3.speed_kph : '—') + '</td></tr>';
-  }).join('') || '<tr><td colspan="4">无</td></tr>';
+  // —— 关键点对比表（服务端已按圈内相对位置配好对）——
+  // 口径：差值 = 最新圈 − 最快圈。正 = 最新圈更快（绿），负 = 更慢（红）。
+  const rows = CMP.pv_pairs || [];
+  const kindTxt = k => k === 'peak' ? '直道尾速' : '弯心速度';
+  const dTxt = d => (d > 0 ? '+' : '') + d.toFixed(1);
+  const dColor = d => d > 0.05 ? 'var(--ok)' : (d < -0.05 ? 'var(--bad)' : 'var(--muted)');
+  document.getElementById('pvBody').innerHTML = rows.map(p =>
+    '<tr><td>' + p.distance + '</td>'
+    + '<td>' + kindTxt(p.kind) + '</td>'
+    + '<td class="num">' + p.speed_cur + '</td>'
+    + '<td class="num">' + p.speed_ref + '</td>'
+    + '<td class="num"><b style="color:' + dColor(p.delta) + '">'
+    + dTxt(p.delta) + '</b></td></tr>'
+  ).join('') || '<tr><td colspan="5">无</td></tr>';
+
+  // —— 摘要：这一圈最大的优势与劣势（一眼看出差距在哪）——
+  const sum = document.getElementById('pvSummary');
+  if (rows.length) {
+    const best = rows.reduce((a, p) => p.delta > a.delta ? p : a);
+    const worst = rows.reduce((a, p) => p.delta < a.delta ? p : a);
+    const distTxt = v => v >= 1000 ? (v / 1000).toFixed(2) + 'k' : Math.round(v);
+    const chip = p => '<span style="font-size:12px;padding:4px 10px;'
+      + 'border-radius:14px;background:rgba(128,128,128,.12)">'
+      + (p.delta > 0 ? '领先最多' : '落后最多') + ' <b style="color:'
+      + (p.delta > 0 ? 'var(--ok)' : 'var(--bad)') + '">' + dTxt(p.delta)
+      + ' km/h</b> <span style="color:var(--muted)">@'
+      + distTxt(p.distance) + 'm</span></span>';
+    sum.innerHTML = (best.delta > 0 ? chip(best) : '')
+      + (worst.delta < 0 ? chip(worst) : '');
+    sum.style.display = sum.innerHTML ? 'flex' : 'none';
+  }
 })();
 </script>
 """
@@ -2065,6 +2147,7 @@ th { color:var(--muted); font-weight:500; }
       <h2>比赛信息</h2>
       <div class="eng-row"><span>赛道时间</span><b id="rClock">--</b></div>
       <div class="eng-row"><span>发车位</span><b id="rGrid">--</b></div>
+      <div class="eng-row"><span>当前名次</span><b id="rPos">--</b></div>
       <div class="eng-row"><span>参赛车辆</span><b id="rCars">--</b></div>
       <div class="eng-row"><span>比赛状态</span><b id="rState">--</b></div>
     </div>
@@ -2094,11 +2177,15 @@ function render(s) {
   if (!L) return;
 
   // 状态栏
+  // 🔴 connected 由服务端按「状态文件 5 秒内有无更新」判定，
+  //    PS5 关机/退游戏后旧文件还在，必须靠服务端判过期。
   const dot = $('dot');
   if (s.connected) { dot.className = 'dot on'; $('status').textContent = '采集中'; }
-  else { dot.className = 'dot off'; $('status').textContent = '无数据（PS5 未开跑？）'; }
-  $('lap').textContent = L.lap;
-  $('laptime').textContent = fmtLap(s.lap_time);
+  else { dot.className = 'dot off'; $('status').textContent = '已断开（PS5 未开机或已退出游戏）'; }
+  // 菜单态（lap=65535）圈号/圈速都是无意义值，显示占位
+  const inMenu = L.lap == null || L.lap >= 65000;
+  $('lap').textContent = inMenu ? '--' : L.lap;
+  $('laptime').textContent = (!s.connected || inMenu) ? '--:--.---' : fmtLap(s.lap_time);
   $('hz').textContent = s.frames;
   const lay = s.layouts || {};
   $('layout').textContent = Object.keys(lay).map(k => k + ':' + lay[k]).join(' ');
@@ -2233,13 +2320,20 @@ function render(s) {
     const ss = String(tot % 60).padStart(2, '0');
     $('rClock').textContent = hh + ':' + mm + ':' + ss;
   } else { $('rClock').textContent = '--'; }
-  $('rGrid').textContent = L.quali_pos > 0 ? ('第 ' + L.quali_pos + ' 位') : '--';
-  $('rCars').textContent = L.num_cars > 0 ? (L.num_cars + ' 辆') : '--';
+  // —— 比赛信息 ——
+  // 🔴 0x84(quali_pos) 在比赛中是当前名次；真正的发车位是接收器在
+  //    开跑瞬间快照的 grid_start。两者都可能是 65535(菜单态)/0，显示占位。
+  const okPos = v => (v > 0 && v < 65000) ? v : 0;
+  const gp = okPos(s.grid_start), cp = okPos(L.quali_pos);
+  $('rGrid').textContent = gp ? ('第 ' + gp + ' 位') : '--';
+  $('rPos').textContent = cp ? ('第 ' + cp + ' 位') : '--';
+  $('rCars').textContent = okPos(L.num_cars) ? (L.num_cars + ' 辆') : '--';
   $('rState').textContent = L.paused ? '暂停' : (L.loading ? '加载中'
     : (L.car_on_track ? '在赛道' : '维修区/菜单'));
 
   // —— 圈速与油量 / 电量 ——
-  $('lapNo').textContent = (L.lap != null && L.lap >= 0) ? L.lap : '-';
+  $('lapNo').textContent = (L.lap != null && L.lap >= 0 && L.lap < 65000)
+    ? L.lap : '-';
   $('bestLap').textContent = fmtMs(L.best_lap_ms);
   $('lastLap').textContent = fmtMs(L.last_lap_ms);
   $('lapsInRace').textContent = (L.laps_in_race != null && L.laps_in_race > 0)

@@ -872,6 +872,11 @@ class Recorder:
         self._logged_other_ip = False
         # 状态文件上次写入时间（用于节流）
         self._last_status_write = 0.0
+        # 本场发车位（开跑瞬间快照）。
+        # 🔴 0x84 的 quali_pos 在比赛进行中会变成**当前名次**（随排名实时变），
+        #    只在「正式开始采集」那一刻它才是真正的发车位 —— 过期作废。
+        #    0 = 尚未捕获（仪表盘回退显示当前名次）。
+        self._grid_start = 0
         # 最近一次收到包的来源 IP（心跳要发回去）
         self._last_source: str | None = None
         # 上一帧内容指纹（跳过游戏暂停时的重复帧）
@@ -1310,6 +1315,12 @@ class Recorder:
             self._last_lap_ms_seen = sample.last_lap_ms
             self._fuel_mark = sample.gas_level   # 圈首油量从本场第一帧记起
             self._prev_lap = -1
+            # 发车位快照：此刻（刚从静止开始动）quali_pos 还是排位表，
+            # 一旦比赛跑起来它就变成当前名次了。中途启动录制拿到的
+            # 是当时名次（尽力而为，无法回溯真实排位）。
+            self._grid_start = (
+                sample.quali_pos if 0 < sample.quali_pos < 65000 else 0
+            )
             self.session.recording_started = True
             self.session.started_at = now      # 用开跑时刻作为场次起点
             self.session.source_ip = src_ip
@@ -1476,6 +1487,8 @@ class Recorder:
                 "frame": sample.to_json(),
                 "frames_total": self.session.sample_count,
                 "session_start": self.session.started_at,
+                # 本场发车位（开跑瞬间快照；0=未捕获）
+                "grid_start": self._grid_start,
                 # 被跳过的重复帧（游戏暂停时 PS5 会 60Hz 重复发同一帧）
                 "duplicate_frames": self.duplicate_frames,
                 # 按端口收包统计（诊断 176Hz 异常用）

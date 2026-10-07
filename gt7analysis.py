@@ -317,6 +317,47 @@ def race_line(pts: list[dict], brake_g: float = -0.25,
 
 # —— 门面 ——————————————————————————————
 
+def match_pv_pairs(peaks_ref: list[dict], peaks_cur: list[dict],
+                   ref_total_m: float, cur_total_m: float,
+                   tol_frac: float = 0.012) -> list[dict]:
+    """把两圈的关键点配成对（同 kind 才配，圈内相对位置差 ≤ tol_frac）。
+
+    🔴 为什么不用绝对距离配对：两圈的速度积分漂移可达上百米
+       （实测同场 3/4 圈同弯道相差 60~300m），绝对距离 30m 容差
+       只配上 6/17；改用「圈长分数」（相对位置）配 11/17，
+       且位置差 <1.1%，弯道对得整整齐齐。
+
+    返回 [{kind, distance, distance_cur, speed_ref, speed_cur, delta}, ...]
+    （distance 取参考圈的，delta = 最新圈 − 参考圈，正=最新圈更快）
+    """
+    pairs: list[dict] = []
+    if ref_total_m <= 0 or cur_total_m <= 0:
+        return pairs
+    taken: set[int] = set()
+    for rv in peaks_ref:
+        rf = rv["distance"] / ref_total_m
+        best: dict | None = None
+        best_f = 1e9
+        for cv in peaks_cur:
+            if cv["kind"] != rv["kind"] or id(cv) in taken:
+                continue
+            f = abs(cv["distance"] / cur_total_m - rf)
+            if f < best_f:
+                best_f, best = f, cv
+        if best is not None and best_f <= tol_frac:
+            taken.add(id(best))
+            pairs.append({
+                "kind": rv["kind"],
+                "distance": rv["distance"],
+                "distance_cur": best["distance"],
+                "speed_ref": rv["speed_kph"],
+                "speed_cur": best["speed_kph"],
+                "delta": round(best["speed_kph"] - rv["speed_kph"], 1),
+            })
+    pairs.sort(key=lambda p: p["distance"])
+    return pairs
+
+
 def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
                     step: float = 10.0) -> dict:
     """门面：分组 → 每圈采样 → 选参考圈（缺省=最快圈）→ 时间差 + 峰谷 + 赛车线。
@@ -331,7 +372,8 @@ def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
         return {"laps_analyzed": 0, "lap_summary": [], "ref_lap": None,
                 "cur_lap": None, "time_diff": {"step": step, "grid": [],
                                                "diff_ms": []},
-                "peaks_ref": [], "peaks_cur": [], "race_line": {"segments": []}}
+                "peaks_ref": [], "peaks_cur": [], "pv_pairs": [],
+                "race_line": {"segments": []}}
     summary = []
     for n, pts in samples.items():
         speeds = [p["speed_kph"] for p in pts]
@@ -351,13 +393,21 @@ def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
     if cur_lap_no == ref_lap_no and len(samples) > 1:
         cur_lap_no = sorted(samples)[-2]
     r = time_diff(samples.get(cur_lap_no, []), samples[ref_lap_no], step)
+    peaks_ref = find_peaks_valleys(samples[ref_lap_no])
+    peaks_cur = (find_peaks_valleys(samples[cur_lap_no])
+                 if cur_lap_no in samples else [])
+    # 圈长：采样点最后一帧的累计距离（m）
+    ref_total = samples[ref_lap_no][-1]["dist"]
+    cur_total = (samples[cur_lap_no][-1]["dist"]
+                 if cur_lap_no in samples else 0.0)
     return {
         "laps_analyzed": len(samples),
         "lap_summary": summary,
         "ref_lap": ref_lap_no,
         "cur_lap": cur_lap_no,
         "time_diff": r,
-        "peaks_ref": find_peaks_valleys(samples[ref_lap_no]),
-        "peaks_cur": find_peaks_valleys(samples[cur_lap_no]) if cur_lap_no in samples else [],
+        "peaks_ref": peaks_ref,
+        "peaks_cur": peaks_cur,
+        "pv_pairs": match_pv_pairs(peaks_ref, peaks_cur, ref_total, cur_total),
         "race_line": race_line(samples[ref_lap_no]),
     }
