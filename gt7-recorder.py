@@ -172,6 +172,18 @@ class TelemetrySample:
     gas_capacity: float = 0.0
     car_code: int = 0
     turbo_boost: float = 0.0
+    # —— 引擎健康（格式 A 内，长期没解析）——
+    oil_pressure: float = 0.0     # 0x54 油压（bar）
+    water_temp: float = 0.0       # 0x58 水温（℃）
+    oil_temp: float = 0.0         # 0x5C 油温（℃）
+    body_height: float = 0.0      # 0x38 车身高度（米）
+    # —— 比赛信息 ——
+    time_of_day: int = 0          # 0x80 赛道时钟（毫秒，当天已过时间）
+    quali_pos: int = 0            # 0x84 发车位
+    num_cars: int = 0             # 0x86 参赛车辆数
+    # —— 换挡提示转速（转速条/换挡灯用）——
+    min_alert_rpm: float = 0.0    # 0x88
+    max_alert_rpm: float = 0.0    # 0x8A
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -214,6 +226,15 @@ class TelemetrySample:
             "gas_capacity": round(self.gas_capacity, 2),
             "car_code": self.car_code,
             "turbo_boost": round(self.turbo_boost, 3),
+            "oil_pressure": round(self.oil_pressure, 2),
+            "water_temp": round(self.water_temp, 1),
+            "oil_temp": round(self.oil_temp, 1),
+            "body_height": round(self.body_height, 4),
+            "time_of_day": self.time_of_day,
+            "quali_pos": self.quali_pos,
+            "num_cars": self.num_cars,
+            "min_alert_rpm": round(self.min_alert_rpm, 0),
+            "max_alert_rpm": round(self.max_alert_rpm, 0),
         }
 
 
@@ -689,6 +710,18 @@ class Decoder:
                 gas_capacity=f32(0x48) if n >= 0x4C else 0.0,
                 car_code=u32(0x124) if n >= 0x128 else 0,
                 turbo_boost=f32(0x50) if n >= 0x54 else 0.0,
+                # 引擎健康（float32，同一段连续布局）
+                oil_pressure=f32(0x54) if n >= 0x58 else 0.0,
+                water_temp=f32(0x58) if n >= 0x5C else 0.0,
+                oil_temp=f32(0x5C) if n >= 0x60 else 0.0,
+                body_height=f32(0x38) if n >= 0x3C else 0.0,
+                # 比赛信息（0x80 时钟 u32 / 0x84 发车位 u16 / 0x86 车数 u16）
+                time_of_day=u32(0x80) if n >= 0x84 else 0,
+                quali_pos=u16(0x84) if n >= 0x86 else 0,
+                num_cars=u16(0x86) if n >= 0x88 else 0,
+                # 换挡提示转速（u16，单位 rpm）
+                min_alert_rpm=float(u16(0x88)) if n >= 0x8A else 0.0,
+                max_alert_rpm=float(u16(0x8A)) if n >= 0x8C else 0.0,
             )
 
         except (struct.error, IndexError, ValueError) as e:

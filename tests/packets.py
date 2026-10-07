@@ -5,7 +5,11 @@ MAGIC = 0x47375330
 
 def build_packet(on_track=True, spd_ms=40.0, x=100.0, z=50.0, vx=None, vz=0.0,
                  lap=1, laps_in_race=10, last_lap=0, flags=None,
-                 rpm=5000.0, gas=80.0, cap=100.0, gear=3, car_code=1234):
+                 rpm=5000.0, gas=80.0, cap=100.0, gear=3, car_code=1234,
+                 oil_pressure=4.5, water_temp=85.0, oil_temp=95.0,
+                 body_height=0.12, time_of_day=43200000, quali_pos=5,
+                 num_cars=16, min_alert_rpm=6000, max_alert_rpm=8500,
+                 turbo=0.0):
     b = bytearray(296)
     struct.pack_into("<I", b, 0, MAGIC)
     struct.pack_into("<3f", b, 0x04, x, 1.0, z)          # position
@@ -27,5 +31,15 @@ def build_packet(on_track=True, spd_ms=40.0, x=100.0, z=50.0, vx=None, vz=0.0,
         struct.pack_into("<f", b, 0x60 + i * 4, 75.0)
     b[0x90] = gear
     b[0x91] = 200
+    struct.pack_into("<f", b, 0x38, body_height)
+    struct.pack_into("<f", b, 0x50, turbo)
+    struct.pack_into("<f", b, 0x54, oil_pressure)
+    struct.pack_into("<f", b, 0x58, water_temp)
+    struct.pack_into("<f", b, 0x5C, oil_temp)
+    struct.pack_into("<I", b, 0x80, time_of_day)
+    struct.pack_into("<H", b, 0x84, quali_pos)
+    struct.pack_into("<H", b, 0x86, num_cars)
+    struct.pack_into("<H", b, 0x88, min_alert_rpm)
+    struct.pack_into("<H", b, 0x8A, max_alert_rpm)
     struct.pack_into("<I", b, 0x124, car_code)
     return bytes(b)

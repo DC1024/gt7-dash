@@ -468,6 +468,20 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
             "fuel_pct": L.get("gas_level", 0.0),
             "fuel_capacity_l": L.get("gas_capacity", 0.0),
             "turbo_boost": L.get("turbo_boost", 0.0),
+            "engine": {
+                "oil_pressure_bar": L.get("oil_pressure", 0.0),
+                "water_temp_c": L.get("water_temp", 0.0),
+                "oil_temp_c": L.get("oil_temp", 0.0),
+                "body_height_m": L.get("body_height", 0.0),
+            },
+            "shift_alert": {"min_rpm": L.get("min_alert_rpm", 0.0),
+                            "max_rpm": L.get("max_alert_rpm", 0.0),
+                            "shift_now": bool(
+                                L.get("max_alert_rpm", 0.0) > 0
+                                and L.get("rpm", 0.0) >= L.get("max_alert_rpm", 0.0))},
+            "race": {"time_of_day_ms": L.get("time_of_day", 0),
+                     "grid_position": L.get("quali_pos", 0),
+                     "num_cars": L.get("num_cars", 0)},
             "tyre_temp_c": L.get("tyre_temp", []),
             "suspension_height_m": L.get("susp_height", []),
             "wheel_rev_per_s": L.get("wheel_rads", []),
@@ -555,6 +569,9 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `fuel_pct` | 0~100 | 剩余油量百分比 |
 | `fuel_capacity_l` | 升 | 油箱容量 |
 | `turbo_boost` | bar 级 | 涡轮压力 |
+| `engine` | 对象 | 引擎健康：`oil_pressure_bar` / `water_temp_c` / `oil_temp_c` / `body_height_m` |
+| `shift_alert` | 对象 | 换挡提示：`min_rpm` / `max_rpm` / `shift_now`（转速已达换挡点） |
+| `race` | 对象 | 比赛信息：`time_of_day_ms`（赛道时钟）/ `grid_position`（发车位）/ `num_cars`（参赛车数） |
 | `tyre_temp_c` | ℃ | 四轮表面温度，顺序 FL/FR/RL/RR |
 | `suspension_height_m` | 米 | 四轮悬挂行程，顺序 FL/FR/RL/RR |
 | `wheel_rev_per_s` | 转/秒 | 四轮转速（带符号，倒挡为负） |
@@ -1388,6 +1405,16 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .fill.fuel { background:linear-gradient(90deg,#0d6efd,#6610f2); }
 .fill.fuel.low { background:var(--bad); }
 .fill.turbo { background:#20c997; }
+.shiftlamp { display:flex; gap:5px; justify-content:center; margin:9px 0 2px; }
+.shiftlamp i { width:15px; height:7px; border-radius:3px;
+  background:rgba(128,128,128,.28); transition:background .05s; }
+.shiftlamp.hot i { background:#dc3545; box-shadow:0 0 7px #dc3545; }
+.shiftlamp i.on { background:#28a745; box-shadow:0 0 7px #28a745; }
+.eng-row { display:flex; justify-content:space-between; font-size:13px;
+  padding:5px 0; border-bottom:1px solid rgba(128,128,128,.12); }
+.eng-row:last-child { border-bottom:none; }
+.eng-row b { font-family:var(--mono); }
+.eng-row b.ok { color:var(--ok); } .eng-row b.hot { color:var(--bad); }
 /* 圈速面板 */
 .laps { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
 .laps > div { background:rgba(128,128,128,.1); border-radius:8px; padding:8px 10px; }
@@ -1785,6 +1812,13 @@ th { color:var(--muted); font-weight:500; }
           </div>
         </div>
       </div>
+      <div class="shiftlamp" id="shiftLamp">
+        <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+      </div>
+      <div style="text-align:center;font-size:11px;color:var(--muted)">
+        建议档 <b id="sugGear" style="font-family:var(--mono)">-</b>
+        · 换挡区间 <b id="alertRpm" style="font-family:var(--mono)">-</b>
+      </div>
     </div>
 
     <div class="card" id="c-pedal">
@@ -1875,6 +1909,29 @@ th { color:var(--muted); font-weight:500; }
       <div class="wheel" id="w3"><span>右后</span><b>--</b></div>
       <div class="gforce"><span>G 力矢量</span><b id="gvec">0.00</b></div>
     </div>
+    <div class="susp" id="suspRow" style="display:flex;justify-content:space-around;
+      margin-top:10px;font-size:11.5px;color:var(--muted)">
+      <span>悬挂 左前 <b id="s0" style="font-family:var(--mono)">--</b></span>
+      <span>右前 <b id="s1" style="font-family:var(--mono)">--</b></span>
+      <span>左后 <b id="s2" style="font-family:var(--mono)">--</b></span>
+      <span>右后 <b id="s3" style="font-family:var(--mono)">--</b></span>
+    </div>
+    </div>
+
+    <div class="card" id="c-engine">
+      <h2>引擎健康</h2>
+      <div class="eng-row"><span>水温</span><b id="eWater">--</b></div>
+      <div class="eng-row"><span>油温</span><b id="eOil">--</b></div>
+      <div class="eng-row"><span>油压</span><b id="eOilP">--</b></div>
+      <div class="eng-row"><span>车身高度</span><b id="eBody">--</b></div>
+    </div>
+
+    <div class="card" id="c-race">
+      <h2>比赛信息</h2>
+      <div class="eng-row"><span>赛道时间</span><b id="rClock">--</b></div>
+      <div class="eng-row"><span>发车位</span><b id="rGrid">--</b></div>
+      <div class="eng-row"><span>参赛车辆</span><b id="rCars">--</b></div>
+      <div class="eng-row"><span>比赛状态</span><b id="rState">--</b></div>
     </div>
   </div>
 </div>
@@ -1982,6 +2039,61 @@ function render(s) {
     el.className = 'wheel' + (t > 112 ? ' hot' : (t < 68 ? ' cold' : ''));
   });
   $('gvec').textContent = Math.hypot(lat, lon).toFixed(2);
+
+  // 悬挂高度（米 → 厘米显示；GT7 该值是相对基准的行程，可为负）
+  (L.susp_height || []).forEach((h, i) => {
+    const el = $('s' + i); if (!el) return;
+    el.textContent = (h === 0 && !L.has_coords) ? '--' : (h * 100).toFixed(1) + 'cm';
+  });
+  $('suspRow').style.display = (L.susp_height && L.susp_height.some(v => v !== 0))
+    ? '' : 'none';
+
+  // —— 换挡灯：min/maxAlertRPM 给出换挡窗口，转速逼近上限时点亮 ——
+  const aMin = L.min_alert_rpm || 0, aMax = L.max_alert_rpm || 0;
+  const lamp = $('shiftLamp');
+  if (aMax > 0) {
+    const r0 = L.rpm || 0;
+    // 7 段：从 aMin 到 aMax 分 7 档，超过 aMax 全亮闪烁
+    let lit = 0;
+    if (r0 >= aMax) lit = 7;
+    else if (r0 > aMin) lit = Math.min(6, Math.floor((r0 - aMin) / (aMax - aMin) * 6) + 1);
+    lamp.classList.toggle('hot', r0 >= aMax);
+    Array.from(lamp.children).forEach((el, i) => el.classList.toggle('on', i < lit));
+    $('alertRpm').textContent = Math.round(aMin) + '-' + Math.round(aMax);
+  } else {
+    // 无换挡数据 → 按 RPM_MAX 兜底（85% 起逐段点亮）
+    const lit = Math.min(7, Math.floor((rpm / RPM_MAX) * 8));
+    lamp.classList.toggle('hot', rpm >= RPM_MAX * 0.95);
+    Array.from(lamp.children).forEach((el, i) => el.classList.toggle('on', i < lit));
+    $('alertRpm').textContent = '-';
+  }
+  const sg = L.suggested_gear || 0;
+  $('sugGear').textContent = sg > 0 ? sg : '-';
+
+  // —— 引擎健康 ——
+  const water = L.water_temp || 0, oilT = L.oil_temp || 0, oilP = L.oil_pressure || 0;
+  const eW = $('eWater'), eO = $('eOil'), eP = $('eOilP');
+  eW.textContent = water ? Math.round(water) + ' °C' : '--';
+  eW.className = water > 105 ? 'hot' : (water && water < 60 ? '' : 'ok');
+  eO.textContent = oilT ? Math.round(oilT) + ' °C' : '--';
+  eO.className = oilT > 130 ? 'hot' : (oilT && oilT < 70 ? '' : 'ok');
+  eP.textContent = oilP ? oilP.toFixed(1) + ' bar' : '--';
+  eP.className = (oilP && oilP < 2.0) ? 'hot' : 'ok';
+  $('eBody').textContent = L.body_height ? (L.body_height * 100).toFixed(1) + ' cm' : '--';
+
+  // —— 比赛信息 ——
+  const tod = L.time_of_day || 0;
+  if (tod > 0) {
+    const tot = Math.floor(tod / 1000);            // 当天已过秒数
+    const hh = String(Math.floor(tot / 3600) % 24).padStart(2, '0');
+    const mm = String(Math.floor(tot / 60) % 60).padStart(2, '0');
+    const ss = String(tot % 60).padStart(2, '0');
+    $('rClock').textContent = hh + ':' + mm + ':' + ss;
+  } else { $('rClock').textContent = '--'; }
+  $('rGrid').textContent = L.quali_pos > 0 ? ('第 ' + L.quali_pos + ' 位') : '--';
+  $('rCars').textContent = L.num_cars > 0 ? (L.num_cars + ' 辆') : '--';
+  $('rState').textContent = L.paused ? '暂停' : (L.loading ? '加载中'
+    : (L.car_on_track ? '在赛道' : '维修区/菜单'));
 
   // —— 圈速与油量 ——
   $('lapNo').textContent = (L.lap != null && L.lap >= 0) ? L.lap : '-';
@@ -2396,6 +2508,7 @@ const CARD_TITLES = {
   'c-rpm':'转速与速度', 'c-pedal':'踏板与 G 力', 'c-lap':'圈速与油量',
   'c-gball':'G 力球', 'c-gg':'G-G 图', 'c-map':'赛道地图',
   'c-chart':'实时曲线', 'c-wheel':'四轮状态',
+  'c-engine':'引擎健康', 'c-race':'比赛信息',
 };
 const DEFAULT_CARDS = [
   {id:'c-rpm',  span:1, show:true},
@@ -2404,6 +2517,8 @@ const DEFAULT_CARDS = [
   {id:'c-gball',span:1, show:true},
   {id:'c-gg',   span:1, show:true},
   {id:'c-wheel',span:1, show:true},
+  {id:'c-engine',span:1, show:true},
+  {id:'c-race', span:1, show:true},
   {id:'c-map',  span:2, show:true},
   {id:'c-chart',span:2, show:true},
 ];
@@ -2422,6 +2537,16 @@ let layoutState = {
       layoutState = s;
     }
   } catch (e) { /* 存档坏了就用默认 */ }
+  // 版本升级对齐：旧存档缺少后来新增的卡片时，按默认顺序补进去。
+  // 不做这一步，升级后新卡会「存在但排在错位/不可见」，用户会当成 bug。
+  // 已有卡片的位置与显隐保持不变，只做「缺啥补啥」。
+  layoutState.layouts.forEach(function (l) {
+    DEFAULT_CARDS.forEach(function (d) {
+      if (!l.cards.some(function (c) { return c.id === d.id; })) {
+        l.cards.push(JSON.parse(JSON.stringify(d)));
+      }
+    });
+  });
 })();
 
 function curLayout() {

@@ -64,6 +64,9 @@
 | `fuel_pct` | 0~100 | 剩余油量百分比 |
 | `fuel_capacity_l` | 升 | 油箱容量 |
 | `turbo_boost` | bar 级 | 涡轮压力 |
+| `engine` | 对象 | 引擎健康：`oil_pressure_bar` / `water_temp_c` / `oil_temp_c` / `body_height_m` |
+| `shift_alert` | 对象 | 换挡提示：`min_rpm` / `max_rpm` / `shift_now`（转速已达换挡点） |
+| `race` | 对象 | 比赛信息：`time_of_day_ms`（赛道时钟）/ `grid_position`（发车位）/ `num_cars`（参赛车数） |
 | `tyre_temp_c` | ℃ | 四轮表面温度，顺序 FL/FR/RL/RR |
 | `suspension_height_m` | 米 | 四轮悬挂行程，顺序 FL/FR/RL/RR |
 | `wheel_rev_per_s` | 转/秒 | 四轮转速（带符号，倒挡为负） |
