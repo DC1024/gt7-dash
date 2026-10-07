@@ -591,10 +591,13 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
 （`favorite: bool`、`custom_name: string`），收藏的场次排在最前。
+列表每项还带 `car_name`（车型短名，从 `cars.csv` 查 ShortName，查不到为空串）。
 
 ### 参数
 
 - `frames=N`：历史帧数，live 默认 120、上限 600；sessions 详情默认 0（不带回帧）
+- `ref_lap=N`（sessions 详情）：指定参考圈号做赛道线/时间差对比分析，
+  默认取最快圈；圈号不存在（如手改 URL）自动回退最快圈。
 - 返回 404 的情形：场次文件名不存在 / 非法路径
 
 ## 字段与单位约定（对外承诺，只加不改）
@@ -614,6 +617,21 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `max_speed_kph` | float | 本场极速（km/h） |
 | `completed_laps` | int | 已完成圈数 |
 | `lap_times` | array | `[[第几圈, 圈速毫秒], ...]` |
+| `car_code` | int | 车型码（全场非 0 众数；读不到为 0） |
+| `car_name` | string | 车型短名，`cars.csv` 查 ShortName，查不到空串 |
+| `laps` | array | 逐圈详情，见下表 |
+| `best_lap` | object 或 null | 最快圈 `{lap, time}`；无完整圈为 null |
+
+`laps[]` 每项：
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `lap` | int | 圈号 |
+| `time` | float | 圈速（秒） |
+| `incomplete` | bool | true = 该圈数据不足 20s，判为不完整（不计入 best_lap） |
+
+> 圈速/赛道线分析统一走 `clean_laps` 剔除假圈：前圈（开局排队静止）、
+> 末圈（完赛滑行离场）、菜单态（lap=65535），以圈距离偏离中位数判假。
+> 列表与详情里的圈速表都不再出现这些假圈。
 
 ### `car`（速度/温度/开度等的单位都标在字段名里）
 | 字段 | 单位 | 说明 |
@@ -674,6 +692,10 @@ curl "http://localhost:8787/api/v1/laps"
 # 历史场次列表，然后取某场的统计
 curl "http://localhost:8787/api/v1/sessions"
 curl "http://localhost:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jsonl"
+
+# 详情页分析（赛车线 / 时间差对比）；?ref_lap=N 指定参考圈（缺省=最快圈）
+curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl"
+curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&ref_lap=3"
 ```
 
 ## 稳定性说明
