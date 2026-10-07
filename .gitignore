@@ -16,3 +16,4 @@ cars.csv.tmp
 *.tmp
 cars.csv.tmp
 *.tmp
+_ui_check/

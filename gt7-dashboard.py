@@ -1415,6 +1415,10 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .eng-row:last-child { border-bottom:none; }
 .eng-row b { font-family:var(--mono); }
 .eng-row b.ok { color:var(--ok); } .eng-row b.hot { color:var(--bad); }
+/* 🔴 布局必须写在 CSS 里：JS 用 style.display='' 恢复显示时，
+   会把内联的 display:flex 一起清掉 → 回退成 block，四轮挤成一串。 */
+.susp { display:flex; justify-content:space-around; margin-top:10px;
+  font-size:11.5px; color:var(--muted); flex-wrap:wrap; gap:4px 0; }
 /* 圈速面板 */
 .laps { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
 .laps > div { background:rgba(128,128,128,.1); border-radius:8px; padding:8px 10px; }
@@ -1909,8 +1913,7 @@ th { color:var(--muted); font-weight:500; }
       <div class="wheel" id="w3"><span>右后</span><b>--</b></div>
       <div class="gforce"><span>G 力矢量</span><b id="gvec">0.00</b></div>
     </div>
-    <div class="susp" id="suspRow" style="display:flex;justify-content:space-around;
-      margin-top:10px;font-size:11.5px;color:var(--muted)">
+    <div class="susp" id="suspRow">
       <span>悬挂 左前 <b id="s0" style="font-family:var(--mono)">--</b></span>
       <span>右前 <b id="s1" style="font-family:var(--mono)">--</b></span>
       <span>左后 <b id="s2" style="font-family:var(--mono)">--</b></span>
