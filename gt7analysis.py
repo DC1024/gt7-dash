@@ -10,10 +10,43 @@ from __future__ import annotations
 import bisect
 import math
 
+# —— 车型解析 ——————————————————————————————
+
+_CAR_CSV_CACHE: dict[str, dict[str, str]] = {}
+
+
+def car_name_of(code: int, csv_path: str | None = None) -> str:
+    """carCode → 车名。表来自 helper/download_cars_csv.py 下载的社区 CSV
+    （格式 `ID,ShortName,Maker`，首行表头）。无表或未命中返回 CAR-ID-xxx。
+
+    结果按 csv 路径缓存，多次调用只读一次文件。
+    """
+    if not code or code <= 0:
+        return ""
+    key = csv_path or ""
+    if key not in _CAR_CSV_CACHE:
+        table: dict[str, str] = {}
+        if csv_path:
+            try:
+                with open(csv_path, encoding="utf-8", errors="replace") as fh:
+                    for line in fh.read().splitlines()[1:]:
+                        seg = line.split(",")
+                        if len(seg) >= 2 and seg[0].strip().isdigit():
+                            table[seg[0].strip()] = seg[1].strip()
+            except OSError:
+                pass
+        _CAR_CSV_CACHE[key] = table
+    return _CAR_CSV_CACHE[key].get(str(code), f"CAR-ID-{code}")
+
+
 # —— 基础：分组与采样 ——————————————————————————————
 
 def split_laps(frames: list[dict]) -> dict[int, list[dict]]:
-    """按圈号分组（保持帧顺序），lap<=0 的帧丢弃。"""
+    """按圈号分组（保持帧顺序），lap<=0 的帧丢弃。
+
+    ⚠️ 仅按 lap 分组，**不**剔除首/末假圈。需要剔除前圈/末圈
+    （开局静止、完赛离场）请用 :func:`clean_laps`。
+    """
     laps: dict[int, list[dict]] = {}
     for f in frames:
         lap = f.get("lap") or 0
@@ -21,6 +54,82 @@ def split_laps(frames: list[dict]) -> dict[int, list[dict]]:
             continue
         laps.setdefault(lap, []).append(f)
     return laps
+
+
+def _lap_peak_kph(frames: list[dict]) -> float:
+    """一圈内所有帧的速度峰值 (km/h)。"""
+    return max((f.get("speed_kph") or 0.0) for f in frames)
+
+
+def _lap_distance_m(frames: list[dict]) -> float:
+    """一圈内累计行驶距离（米），按速度 × Δt 积分。
+
+    dt 异常（<=0 或 >1s）的区间不计距离，与 lap_samples 一致。
+    """
+    dist = 0.0
+    prev: dict | None = None
+    for f in frames:
+        if prev is not None:
+            dt = (f.get("t") or 0.0) - (prev.get("t") or 0.0)
+            if 0.001 < dt < 1.0:
+                dist += (prev.get("speed_kph") or 0.0) / 3.6 * dt
+        prev = f
+    return dist
+
+
+def _median(xs: list[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if not n:
+        return 0.0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def clean_laps(frames: list[dict]) -> dict[int, list[dict]]:
+    """按圈分组并剔除假圈（保持帧顺序）。
+
+    假圈都源于 GT7 的 lap 字段语义：
+      1. 菜单态：lap 为 0xFFFF(65535) 等特殊大值，直接丢弃。
+      2. 首圈（比赛开始前，lap=0）与末圈（完赛后离场，末尾 lap=N）：
+         这两段**根本没跑完一整条赛道**，是「假圈」。
+
+    🔑 主判据 = **圈距离**（速度积分，单位米）。
+       真实圈跑完一整条赛道，各圈距离高度一致（实测同场 5400~5800m）；
+       假圈的距离只有几百米（前圈静止/末圈滑行离场）。
+       取各圈距离的**中位数** m，圈距离 < 45% × m 判为假圈。
+       用中位数而非最大值，低速场次也稳。
+
+    辅助判据 = 峰值速度：某圈几乎全静止（峰值 < 30% × 全场最高峰值）也是假圈。
+
+    ⚠️ 只剔除**首圈与末圈**：中间圈即使跑得慢（事故/慢速圈）也保留，
+       避免误删用户的真实数据。单圈场次不剔除（首尾同一圈）。
+    """
+    laps = split_laps(frames)
+    if not laps:
+        return laps
+    # 菜单态（0xFFFF 等特殊值）视为无效圈
+    laps = {n: fs for n, fs in laps.items() if n < 65000}
+    if not laps:
+        return laps
+    ordered = sorted(laps)
+    if len(ordered) < 2:                 # 单圈：首尾同一圈，不剔
+        return laps
+
+    dists = {n: _lap_distance_m(fs) for n, fs in laps.items()}
+    med_d = _median(list(dists.values()))
+    peaks = {n: _lap_peak_kph(fs) for n, fs in laps.items()}
+    max_p = max(peaks.values())
+
+    first, last = ordered[0], ordered[-1]
+    out = dict(laps)
+    for n in (first, last):
+        # 距离过短 → 没跑完赛道（滑行离场 / 原地静止）
+        short = med_d > 0 and dists[n] < 0.45 * med_d
+        # 几乎全静止 → 排队 / 停车场
+        stalled = max_p > 0 and peaks[n] < 0.30 * max_p
+        if short or stalled:
+            del out[n]
+    return out
 
 
 def lap_samples(frames: list[dict]) -> list[dict]:
@@ -210,8 +319,12 @@ def race_line(pts: list[dict], brake_g: float = -0.25,
 
 def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
                     step: float = 10.0) -> dict:
-    """门面：分组 → 每圈采样 → 选参考圈（缺省=最快圈）→ 时间差 + 峰谷 + 赛车线。"""
-    laps = split_laps(frames)
+    """门面：分组 → 每圈采样 → 选参考圈（缺省=最快圈）→ 时间差 + 峰谷 + 赛车线。
+
+    clean_laps 会剔除首/末假圈（前圈、完赛离场圈）与菜单态，
+    否则 25s 的完赛余圈会被当成「最快圈」画出离场的小段赛车线。
+    """
+    laps = clean_laps(frames)
     samples = {n: lap_samples(fs) for n, fs in laps.items()
                if len(fs) >= 30}                     # 少于 30 帧的伪圈跳过
     if not samples:
@@ -229,8 +342,11 @@ def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
             "avg_speed_kph": round(sum(speeds) / len(speeds), 1),
         })
     summary.sort(key=lambda s: s["lap"])
-    if ref_lap_no is None:
-        ref_lap_no = min(summary, key=lambda s: s["duration_s"])["lap"]
+    fastest = min(summary, key=lambda s: s["duration_s"])["lap"]
+    # 指定的参考圈必须真实存在（URL 可能被手改成任意值），
+    # 否则回退到最快圈，避免 KeyError 把整个详情页打挂。
+    if ref_lap_no is None or ref_lap_no not in samples:
+        ref_lap_no = fastest
     cur_lap_no = max(samples)
     if cur_lap_no == ref_lap_no and len(samples) > 1:
         cur_lap_no = sorted(samples)[-2]

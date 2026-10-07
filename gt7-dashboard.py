@@ -101,8 +101,6 @@ class TelemetryHub:
         # 赛道轨迹 [[x,z,G], ...] 与 G-G 散点 [[横向,纵向], ...]
         self._path: list = []
         self._gg: list = []
-        # 车名表（data/cars.csv，helper/download_cars_csv.py 下载）
-        self._car_names: dict[str, str] | None = None
         self._lap_times: list = []
         self._lap_fuel: list = []
         # 本场动力类型（fuel/electric/kart）与能量回收峰值（kW 量级）
@@ -194,17 +192,10 @@ class TelemetryHub:
         code = latest.get("car_code") or 0
         if code <= 0:
             return ""
-        if self._car_names is None:
-            self._car_names = {}
-            fp = self._status_path.parent / "cars.csv"
-            try:
-                for line in fp.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
-                    seg = line.split(",")
-                    if len(seg) >= 2 and seg[0].strip().isdigit():
-                        self._car_names[seg[0].strip()] = seg[1].strip()
-            except Exception:
-                pass    # 没有 CSV 就显示 CAR-ID-xxx
-        return self._car_names.get(str(code), f"CAR-ID-{code}")
+        import gt7analysis
+        return gt7analysis.car_name_of(
+            code, str(self._status_path.parent / "cars.csv")
+        )
 
     def snapshot(self, max_frames: int = 300) -> dict[str, Any]:
         """仪表盘页面拉取。"""
@@ -271,8 +262,11 @@ HUB: TelemetryHub
 # 历史场次
 # ---------------------------------------------------------------------------
 
-def compare_session(path: Path) -> dict[str, Any]:
+def compare_session(path: Path, ref_lap_no: int | None = None) -> dict[str, Any]:
     """读场次 jsonl → 圈间对比分析（gt7analysis 纯函数库）。
+
+    `ref_lap_no` 可选：指定参考圈号（赛车线 / 对比基准）。
+    缺省由 gt7analysis 取最快圈。
 
     失败永远返回 {"error": ...} 而不是抛出——对比是增值功能，
     不能因为它挂掉影响详情页主体。
@@ -282,7 +276,7 @@ def compare_session(path: Path) -> dict[str, Any]:
         frames = [json.loads(x) for x in lines[1:] if x.strip()
                   and '"lap"' in x]
         import gt7analysis
-        r = gt7analysis.analyze_compare(frames)
+        r = gt7analysis.analyze_compare(frames, ref_lap_no=ref_lap_no)
         # 赛车线抽稀：每 6 点取 1，控制页面体积（7200 帧 → ~1200 点）
         for seg in r.get("race_line", {}).get("segments", []):
             seg["pts"] = seg["pts"][::6]
@@ -322,18 +316,46 @@ def save_session_meta(history_dir: Path, meta: dict[str, Any]) -> None:
     fp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def _first_car_code(path: Path) -> int:
+    """轻量读场次首帧的 car_code（车型码，用于列表展示）。
+
+    只读文件头几行，避免扫描整个 jsonl。首帧可能在菜单态
+    （car_code 或为 0），此处尽力而为，没读到返回 0。
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            fh.readline()                     # 跳过 header
+            for _ in range(40):               # 最多看 40 帧
+                line = fh.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                f = json.loads(line)
+                c = f.get("car_code") or 0
+                if c > 0:
+                    return c
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    return 0
+
+
 def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     """列出已落盘的场次文件（合并收藏/自定义名称，收藏优先展示）。"""
     if not history_dir.exists():
         return []
 
     meta = load_session_meta(history_dir)
+    csv_path = str(history_dir / "cars.csv")
     sessions = []
     for f in sorted(history_dir.glob("*.jsonl"), reverse=True)[:limit]:
         try:
             stat = f.stat()
             parts = f.stem.split("_", 2)
             m = meta.get(f.name) or {}
+            import gt7analysis
+            car_name = gt7analysis.car_name_of(_first_car_code(f), csv_path)
             sessions.append(
                 {
                     "file": f.name,
@@ -344,6 +366,7 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                     "modified": datetime.fromtimestamp(stat.st_mtime).strftime(
                         "%Y-%m-%d %H:%M:%S"
                     ),
+                    "car_name": car_name,
                     # —— 用户标注 ——
                     "favorite": bool(m.get("favorite")),
                     "custom_name": m.get("custom_name") or "",
@@ -354,6 +377,17 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     # 收藏的排前面，其余按时间倒序（原顺序）
     sessions.sort(key=lambda s: (not s["favorite"],))
     return sessions
+
+
+def _dominant_car_code(frames: list[dict]) -> int:
+    """全场出现次数最多的非 0 car_code（一场通常同一辆车）。"""
+    from collections import Counter
+    cnt: Counter[int] = Counter()
+    for f in frames:
+        c = f.get("car_code") or 0
+        if c > 0:
+            cnt[c] += 1
+    return cnt.most_common(1)[0][0] if cnt else 0
 
 
 def analyze_session(path: Path) -> dict[str, Any]:
@@ -369,10 +403,17 @@ def analyze_session(path: Path) -> dict[str, Any]:
         speeds = [f["speed_kph"] for f in frames]
         rpms = [f["rpm"] for f in frames]
 
-        # 按圈分组
-        laps: dict[int, list] = {}
-        for f in frames:
-            laps.setdefault(f.get("lap", 0), []).append(f)
+        # —— 车型：取全场 car_code 的非 0 众数 → 车名 ——
+        # （不同车对圈速影响极大，场次里必须能看出开的是什么车）
+        car_code = _dominant_car_code(frames)
+        car_name = ""
+        if car_code:
+            import gt7analysis
+            car_name = gt7analysis.car_name_of(car_code, str(path.parent / "cars.csv"))
+
+        # —— 按圈分组（clean_laps 自动剔除前圈 / 完赛离场圈 / 菜单态）——
+        import gt7analysis
+        laps = gt7analysis.clean_laps(frames)
 
         lap_times = []
         for lap_no, fs in sorted(laps.items()):
@@ -403,6 +444,8 @@ def analyze_session(path: Path) -> dict[str, Any]:
             "laps": lap_times,
             "best_lap": min(valid_laps, key=lambda x: x["time"]) if valid_laps else None,
             "has_coords": any(f.get("has_coords") for f in frames),
+            "car_code": car_code,
+            "car_name": car_name,
             "layouts": {
                 k: sum(1 for f in frames if f.get("layout") == k)
                 for k in ("A", "B", "C")
@@ -834,7 +877,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not str(target).startswith(str(hist)) or not target.exists():
                     self._send_html("<h1>文件不存在或非法路径</h1>", 404)
                     return
-                self._send_html(build_session_page(target, analyze_session(target)))
+                # 参考圈选择器：?ref_lap=N 指定赛车线看第几圈，缺省=最快圈
+                ref_raw = query.get("ref_lap", [""])[0]
+                try:
+                    ref_lap_no = int(ref_raw) if ref_raw else None
+                except ValueError:
+                    ref_lap_no = None
+                self._send_html(build_session_page(
+                    target, analyze_session(target), ref_lap_no=ref_lap_no))
 
             elif path == "/api/session":
                 name = query.get("file", [""])[0]
@@ -1097,13 +1147,21 @@ _COMPARE_TMPL = """
   <svg id="diffSvg" class="cmp-svg" viewBox="0 0 720 180" preserveAspectRatio="none"></svg>
 </div>
 <div class="card">
-  <h2>参考圈赛车线（第 <span id="rlLap">-</span> 圈）</h2>
+  <h2>参考圈赛车线（第 <span id="rlLap">-</span> 圈）
+    <select id="lapSel" onchange="lapSelChange(this.value)"
+      style="float:right;font-weight:400;font-size:13px;padding:4px 8px;
+             border:1px solid var(--line);border-radius:7px;
+             background:var(--card);color:inherit;font-family:inherit"></select>
+  </h2>
   <canvas id="raceLineCv" width="760" height="440"></canvas>
   <div class="legend" style="justify-content:center;margin-top:6px">
     <span><i style="background:#198754"></i>油门</span>
     <span><i style="background:#dc3545"></i>刹车</span>
     <span><i style="background:#0d6efd"></i>滑行</span>
   </div>
+  <p class="dim" style="font-size:11.5px;margin-top:8px">
+    可自选要看第几圈的赛车线。默认取最快圈；切换会刷新本页并把整页分析
+    （时间差曲线 / 峰谷表）都以所选圈为基准重算。</p>
 </div>
 <div class="card">
   <h2>速度峰值 / 谷值（参考圈 vs 最新圈）</h2>
@@ -1128,6 +1186,30 @@ const CMP = __DATA__;
     '参考圈：第 ' + CMP.ref_lap + ' 圈 · 对比：第 ' + CMP.cur_lap
     + ' 圈 · 共分析 ' + CMP.laps_analyzed + ' 圈';
   document.getElementById('rlLap').textContent = CMP.ref_lap;
+
+  // —— 参考圈选择器：列出所有有效圈，默认选中当前参考圈 ——
+  window.lapSelChange = function (v) {
+    const u = new URL(location.href);
+    u.searchParams.set('ref_lap', v);
+    location.href = u.toString();
+  };
+  (function fillLapSel() {
+    const sel = document.getElementById('lapSel');
+    if (!sel) return;
+    const sum = CMP.lap_summary || [];
+    if (sum.length < 2) {          // 只有一圈时没必要选
+      sel.style.display = 'none';
+      return;
+    }
+    sum.forEach(function (s) {
+      const o = document.createElement('option');
+      o.value = s.lap;
+      o.textContent = '第 ' + s.lap + ' 圈 · ' + s.duration_s.toFixed(1) + 's'
+        + (s.lap === CMP.ref_lap ? '（最快）' : '');
+      if (s.lap === CMP.ref_lap) o.selected = true;
+      sel.appendChild(o);
+    });
+  })();
 
   // —— 时间差曲线 ——
   const d = CMP.time_diff, svg = document.getElementById('diffSvg');
@@ -1244,6 +1326,7 @@ def build_sessions_page(hist: Path) -> str:
             f"""<tr data-fav="{'1' if s['favorite'] else '0'}">
       <td><b><a href="/session?file={s['file']}"
          style="color:var(--accent)">{disp}</a></b>{star}</td>
+      <td style="font-size:12.5px">{s.get('car_name') or '<span class="dim">-</span>'}</td>
       <td>{s['modified']}</td>
       <td class="num">{s['size_kb']} KB</td>
       <td class="num">
@@ -1266,7 +1349,7 @@ def build_sessions_page(hist: Path) -> str:
       <input type="checkbox" id="favOnly" onchange="filterFav(this.checked)"> 只看收藏 ★
     </label></h2>
   <table>
-    <tr><th>场次</th><th>采集时间</th>
+    <tr><th>场次</th><th>车型</th><th>采集时间</th>
         <th style="text-align:right">大小</th>
         <th style="text-align:right">操作</th></tr>
     {''.join(rows)}
@@ -1296,11 +1379,11 @@ def build_sessions_page(hist: Path) -> str:
     return _page_shell("历史场次", body)
 
 
-def build_session_page(path: Path, stats: dict) -> str:
+def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None) -> str:
     """单场次详情：把离线统计展示成人能读的页面。"""
     import html as _html
     try:
-        cmp_data = compare_session(path)
+        cmp_data = compare_session(path, ref_lap_no=ref_lap_no)
     except Exception:
         cmp_data = {}
     cmp_json = json.dumps(cmp_data, ensure_ascii=False).replace("</", "<\\/")
@@ -1338,6 +1421,7 @@ def build_session_page(path: Path, stats: dict) -> str:
 <div class="card">
   <h2>概览</h2>
   <div class="kv">
+    <div><span>车型</span><b style="font-size:14px">{_html.escape(stats.get('car_name') or '未识别')}</b></div>
     <div><span>总帧数</span><b>{stats.get('frame_count', 0)}</b></div>
     <div><span>时长</span><b>{stats.get('duration', 0)}s</b></div>
     <div><span>最高速度</span><b>{stats.get('max_speed', 0)}</b></div>
