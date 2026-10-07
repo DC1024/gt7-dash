@@ -61,8 +61,13 @@
 | `g_force.longitudinal` | g | 纵向：正值加速、负值刹车 |
 | `g_force.lateral` | g | 横向：**正值右转、负值左转** |
 | `g_force.magnitude` | g | 合力大小 |
-| `fuel_pct` | 0~100 | 剩余油量百分比 |
-| `fuel_capacity_l` | 升 | 油箱容量 |
+| `fuel_pct` | 0~100 | 剩余油量百分比；**纯电车时是剩余电量 kWh**（看 `powertrain`） |
+| `fuel_capacity_l` | 升 | 油箱容量（纯电为 0） |
+| `powertrain` | 枚举 | 动力类型：`fuel`（燃油/混动）/ `electric`（纯电）/ `kart` |
+| `energy_recovery` | kW 量级 | 能量回收功率；**仅扩展包(~)有值**，默认格式 A 恒为 0 |
+| `max_energy_recovery` | kW 量级 | 本场能量回收峰值 |
+| `throttle_filtered` | 0~1 | 游戏滤波后的油门输出（仅扩展包） |
+| `brake_filtered` | 0~1 | 游戏滤波后的刹车输出（仅扩展包） |
 | `turbo_boost` | bar 级 | 涡轮压力 |
 | `engine` | 对象 | 引擎健康：`oil_pressure_bar` / `water_temp_c` / `oil_temp_c` / `body_height_m` |
 | `shift_alert` | 对象 | 换挡提示：`min_rpm` / `max_rpm` / `shift_now`（转速已达换挡点） |

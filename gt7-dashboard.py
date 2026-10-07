@@ -105,6 +105,9 @@ class TelemetryHub:
         self._car_names: dict[str, str] | None = None
         self._lap_times: list = []
         self._lap_fuel: list = []
+        # 本场动力类型（fuel/electric/kart）与能量回收峰值（kW 量级）
+        self._powertrain: str = "fuel"
+        self._max_energy_recovery: float = 0.0
         self._status_path = status_path
         self._last_mtime = 0.0
 
@@ -169,6 +172,10 @@ class TelemetryHub:
                     self._lap_times = payload["lap_times"]
                 if "lap_fuel" in payload:
                     self._lap_fuel = payload["lap_fuel"]
+                if "powertrain" in payload:
+                    self._powertrain = payload["powertrain"]
+                if "max_energy_recovery" in payload:
+                    self._max_energy_recovery = payload["max_energy_recovery"]
                 self._recording = bool(payload.get("recording"))
                 self._source_ips = payload.get("source_ips", [])
                 self._ps5_filter = payload.get("ps5_filter", "auto")
@@ -220,6 +227,8 @@ class TelemetryHub:
                 "gg": self._gg,
                 "lap_times": self._lap_times,
                 "lap_fuel": self._lap_fuel,
+                "powertrain": self._powertrain,
+                "max_energy_recovery": self._max_energy_recovery,
                 "car_name": self._car_name_of(latest),
                 "session_duration": round(time.time() - self._session_start, 1)
                 if self._session_start
@@ -467,6 +476,15 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
                         "magnitude": round(math.hypot(gl, gt_), 3)},
             "fuel_pct": L.get("gas_level", 0.0),
             "fuel_capacity_l": L.get("gas_capacity", 0.0),
+            # —— 动力类型与能量（新增，稳定承诺）——
+            # powertrain: fuel / electric / kart。electric 时 fuel_pct 是**剩余电量 kWh**，
+            #            fuel_capacity_l 为 0。energy_recovery 仅在扩展包(~)时有值，
+            #            默认格式 A 恒为 0（不代表没有回收，而是协议没给）。
+            "powertrain": snap.get("powertrain", "fuel"),
+            "energy_recovery": L.get("energy_recovery", 0.0),
+            "max_energy_recovery": snap.get("max_energy_recovery", 0.0),
+            "throttle_filtered": L.get("throttle_filtered", 0.0),
+            "brake_filtered": L.get("brake_filtered", 0.0),
             "turbo_boost": L.get("turbo_boost", 0.0),
             "engine": {
                 "oil_pressure_bar": L.get("oil_pressure", 0.0),
@@ -566,8 +584,13 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `g_force.longitudinal` | g | 纵向：正值加速、负值刹车 |
 | `g_force.lateral` | g | 横向：**正值右转、负值左转** |
 | `g_force.magnitude` | g | 合力大小 |
-| `fuel_pct` | 0~100 | 剩余油量百分比 |
-| `fuel_capacity_l` | 升 | 油箱容量 |
+| `fuel_pct` | 0~100 | 剩余油量百分比；**纯电车时是剩余电量 kWh**（看 `powertrain`） |
+| `fuel_capacity_l` | 升 | 油箱容量（纯电为 0） |
+| `powertrain` | 枚举 | 动力类型：`fuel`（燃油/混动）/ `electric`（纯电）/ `kart` |
+| `energy_recovery` | kW 量级 | 能量回收功率；**仅扩展包(~)有值**，默认格式 A 恒为 0 |
+| `max_energy_recovery` | kW 量级 | 本场能量回收峰值 |
+| `throttle_filtered` | 0~1 | 游戏滤波后的油门输出（仅扩展包） |
+| `brake_filtered` | 0~1 | 游戏滤波后的刹车输出（仅扩展包） |
 | `turbo_boost` | bar 级 | 涡轮压力 |
 | `engine` | 对象 | 引擎健康：`oil_pressure_bar` / `water_temp_c` / `oil_temp_c` / `body_height_m` |
 | `shift_alert` | 对象 | 换挡提示：`min_rpm` / `max_rpm` / `shift_now`（转速已达换挡点） |
@@ -1648,9 +1671,11 @@ th { color:var(--muted); font-weight:500; }
            松开油门时会回落。</p>
       </section>
       <section>
-        <h4>油量</h4>
-        <p>剩余燃油百分比（GT7 的 gasLevel）。
-           低于 20% 时进度条转为红色提醒。用于判断还能跑几圈或是否需要进站。</p>
+        <h4>油量 / 电量</h4>
+        <p>燃油车显示<b>剩余油量百分比</b>（GT7 的 gasLevel，低于 20% 进度条转红）；
+           纯电车显示<b>剩余电量 kWh</b>（GT7 在纯电车时把 gasLevel 字段当成电量上报，
+           油箱容量为 0，据此自动识别动力类型）。</p>
+        <p class="dim">用于判断还能跑几圈或是否需要进站。</p>
       </section>
       <section>
         <h4>踏板</h4>
@@ -1842,14 +1867,14 @@ th { color:var(--muted); font-weight:500; }
     </div>
 
     <div class="card" id="c-lap">
-      <h2>圈速与油量</h2>
+      <h2 id="lapCardTitle">圈速与油量</h2>
       <div class="laps">
         <div><span>当前圈</span><b id="lapNo">-</b></div>
         <div><span>最快圈</span><b id="bestLap">--:--.---</b></div>
         <div><span>上一圈</span><b id="lastLap">--:--.---</b></div>
         <div><span>本场圈数</span><b id="lapsInRace">-</b></div>
       </div>
-      <div class="bar-row" style="margin-top:12px"><label>油量</label>
+      <div class="bar-row" style="margin-top:12px"><label id="fuelLabel">油量</label>
         <div class="track"><div class="fill fuel" id="fFuel" style="width:0"></div></div>
         <output id="oFuel">--</output></div>
       <div class="bar-row"><label>涡轮</label>
@@ -1927,6 +1952,7 @@ th { color:var(--muted); font-weight:500; }
       <div class="eng-row"><span>油温</span><b id="eOil">--</b></div>
       <div class="eng-row"><span>油压</span><b id="eOilP">--</b></div>
       <div class="eng-row"><span>车身高度</span><b id="eBody">--</b></div>
+      <div class="eng-row" id="eRecRow" style="display:none"><span>能量回收</span><b id="eRec">--</b></div>
     </div>
 
     <div class="card" id="c-race">
@@ -2083,6 +2109,14 @@ function render(s) {
   eP.textContent = oilP ? oilP.toFixed(1) + ' bar' : '--';
   eP.className = (oilP && oilP < 2.0) ? 'hot' : 'ok';
   $('eBody').textContent = L.body_height ? (L.body_height * 100).toFixed(1) + ' cm' : '--';
+  // 能量回收：仅扩展包(~)有心跳请求时才有值。有值才显示该行，避免占位。
+  const eRec = (typeof L.energy_recovery === 'number' && L.energy_recovery !== 0)
+    ? L.energy_recovery : null;
+  $('eRecRow').style.display = eRec === null ? 'none' : '';
+  // 瞬时回收常回落到 0，把本场峰值一并显示更有信息量
+  const maxRec = s.max_energy_recovery || 0;
+  $('eRec').textContent = eRec === null ? '--'
+    : eRec.toFixed(1) + ' kW' + (maxRec > 0 ? '（峰值 ' + maxRec.toFixed(1) + '）' : '');
 
   // —— 比赛信息 ——
   const tod = L.time_of_day || 0;
@@ -2098,20 +2132,35 @@ function render(s) {
   $('rState').textContent = L.paused ? '暂停' : (L.loading ? '加载中'
     : (L.car_on_track ? '在赛道' : '维修区/菜单'));
 
-  // —— 圈速与油量 ——
+  // —— 圈速与油量 / 电量 ——
   $('lapNo').textContent = (L.lap != null && L.lap >= 0) ? L.lap : '-';
   $('bestLap').textContent = fmtMs(L.best_lap_ms);
   $('lastLap').textContent = fmtMs(L.last_lap_ms);
   $('lapsInRace').textContent = (L.laps_in_race != null && L.laps_in_race > 0)
     ? L.laps_in_race : '-';
 
-  // 油量：GT7 的 gasLevel 是百分比（0~100）
-  const fuel = (typeof L.gas_level === 'number' && L.gas_level > 0)
-    ? Math.min(L.gas_level, 100) : null;
+  // 🔴 动力类型决定「能量」语义：
+  //   · fuel / kart：gas_level = 油量百分比（0~100），gas_capacity = 容量
+  //   · electric：gas_capacity == 0，**gas_level = 剩余电量 kWh**
+  // 所以纯电车按 kWh 显示，油量策略也换成「电量够不够跑完剩余圈数」。
+  const isEV = s.powertrain === 'electric';
+  // 卡片标题与行标签随动力类型切换（油量→电量），术语一致
+  $('lapCardTitle').textContent = isEV ? '圈速与电量' : '圈速与油量';
+  $('fuelLabel').textContent = isEV ? '电量' : '油量';
+  const hasEnergy = (typeof L.gas_level === 'number' && L.gas_level > 0);
   const ff = $('fFuel');
-  if (fuel === null) {
+  if (!hasEnergy) {
     ff.style.width = '0'; $('oFuel').textContent = '--';
+  } else if (isEV) {
+    // 纯电：gas_level 是 kWh 剩余电量，没有 0~100 的百分比基准，
+    // 进度条按一个假定的电池容量标尺（GT7 电车普遍 20~80 kWh）满程显示。
+    const kWh = L.gas_level;
+    const pctOfBattery = Math.min(100, Math.max(0, kWh / 60 * 100));
+    ff.style.width = pctOfBattery + '%';
+    ff.className = 'fill fuel' + (pctOfBattery < 20 ? ' low' : '');
+    $('oFuel').textContent = kWh.toFixed(1) + ' kWh';
   } else {
+    const fuel = Math.min(L.gas_level, 100);
     ff.style.width = fuel + '%';
     ff.className = 'fill fuel' + (fuel < 20 ? ' low' : '');
     $('oFuel').textContent = fuel.toFixed(0) + '%';
@@ -2120,26 +2169,37 @@ function render(s) {
   $('fTurbo').style.width = Math.min(turbo / 3 * 100, 100) + '%';
   $('oTurbo').textContent = turbo.toFixed(2);
 
-  // —— 油量策略：均耗 vs 剩余圈数 → 建议燃油地图方向 ——
+  // —— 油量 / 电量策略：均耗 vs 剩余圈数 ——
   const lf = s.lap_fuel || [];
   const fs2 = $('fuelStrategy');
-  if (lf.length >= 1 && L.gas_capacity > 0 && L.lap != null
-      && L.laps_in_race > 0 && L.laps_in_race >= L.lap) {
+  const perUnit = isEV ? 'kWh' : '%';
+  // 🔴 油车要求 gas_capacity > 0（有油箱才有「燃油地图」概念）；
+  //    电车 gas_capacity == 0，但**更**需要这个策略（判断电量能否跑完剩余圈数），
+  //    所以电车用 isEV 单独放行。
+  const canStrategy = (lf.length >= 1 && L.lap != null && L.laps_in_race > 0
+    && L.laps_in_race >= L.lap && (isEV || L.gas_capacity > 0));
+  if (canStrategy) {
     const used = lf.reduce((a, x) => a + Math.max(0, x[1]), 0);
-    const avg = used / lf.length;                       // %油箱 / 圈
+    const avg = used / lf.length;                       // %或 kWh / 圈
     const remain = L.laps_in_race - L.lap + 1;          // 含当前圈
     const projected = avg * remain;
-    const margin = L.gas_level - projected;             // 百分点（油箱占比）
+    const margin = L.gas_level - projected;             // 百分点或 kWh
+    // 🔴 油车可以调燃油地图省油；电车没有燃油地图，只提示电量够不够
     let advice;
-    if (margin < -2) advice = '<span style="color:var(--bad)">⚠️ 油量不足 → 调稀燃油地图（省油优先）</span>';
-    else if (margin > 12) advice = '<span style="color:var(--ok)">✅ 油量富余 → 可调浓燃油地图（动力优先）</span>';
-    else advice = '👌 油量刚好 → 维持当前燃油地图';
-    fs2.innerHTML = '油量策略：剩 ' + remain + ' 圈 · 均耗 ' + avg.toFixed(1)
-      + '%/圈 · 预计需 ' + projected.toFixed(0) + '% · 余量 '
-      + (margin >= 0 ? '+' : '') + margin.toFixed(0) + 'pt — ' + advice;
+    if (isEV) {
+      if (margin < 0) advice = '<span style="color:var(--bad)">⚠️ 电量可能不够 → 松油门多回收 / 提高再生制动</span>';
+      else advice = '<span style="color:var(--ok)">✅ 电量足够跑完</span>';
+    } else if (margin < -2) {
+      advice = '<span style="color:var(--bad)">⚠️ 油量不足 → 调稀燃油地图（省油优先）</span>';
+    } else if (margin > 12) {
+      advice = '<span style="color:var(--ok)">✅ 油量富余 → 可调浓燃油地图（动力优先）</span>';
+    } else advice = '👌 油量刚好 → 维持当前燃油地图';
+    fs2.innerHTML = (isEV ? '电量策略：' : '油量策略：') + '剩 ' + remain + ' 圈 · 均耗 '
+      + avg.toFixed(1) + perUnit + '/圈 · 预计需 ' + projected.toFixed(0) + perUnit
+      + ' · 余量 ' + (margin >= 0 ? '+' : '') + margin.toFixed(1) + perUnit + ' — ' + advice;
   } else if (lf.length >= 1) {
     fs2.textContent = '已跑 ' + lf.length + ' 圈 · 均耗 '
-      + (lf.reduce((a, x) => a + Math.max(0, x[1]), 0) / lf.length).toFixed(1) + '%/圈';
+      + (lf.reduce((a, x) => a + Math.max(0, x[1]), 0) / lf.length).toFixed(1) + perUnit + '/圈';
   }
 
   // —— 每圈圈速列表（新圈在上，最快圈标绿★）——
@@ -2508,7 +2568,7 @@ ggLoop();                 // 启动 G 力球动画（自带 requestAnimationFram
 // 本来就应该按设备存；也避免给服务端加写入接口。
 const LAYOUT_KEY = 'gt7_layouts_v2';   // v2：默认布局重排过，废弃旧存档
 const CARD_TITLES = {
-  'c-rpm':'转速与速度', 'c-pedal':'踏板与 G 力', 'c-lap':'圈速与油量',
+  'c-rpm':'转速与速度', 'c-pedal':'踏板与 G 力', 'c-lap':'圈速与能量',
   'c-gball':'G 力球', 'c-gg':'G-G 图', 'c-map':'行车轨迹',
   'c-chart':'实时曲线', 'c-wheel':'四轮状态',
   'c-engine':'引擎健康', 'c-race':'比赛信息',

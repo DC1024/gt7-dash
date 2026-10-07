@@ -35,7 +35,8 @@ def make_recorder(rec, tmp_path):
             output=str(tmp_path / "out"), ps5="auto", track_min_speed=15.0,
             track_min_frames=1, session_gap=300.0, heartbeat_interval=5.0,
             probe=False, status_file=None, verbose=False,
-            decryptor="/app/gt7-decrypt", off_track_timeout=15.0)
+            decryptor="/app/gt7-decrypt", off_track_timeout=15.0,
+            packet_type="A", trash_retention_days=30.0)
         for k, v in over.items():
             setattr(args, k, v)
         return rec.Recorder(args)

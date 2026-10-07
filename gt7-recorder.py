@@ -87,6 +87,28 @@ PORT_ADVANCED = 33740        # 格式 B/C：Addendum 扩展字段
 # 会话状态机
 IDLE, SESSION_STARTED, SESSION_ACTIVE = "IDLE", "SESSION_STARTED", "SESSION_ACTIVE"
 
+# 动力类型（powertrain）：由 gas_capacity 判定。
+#
+# 🔴 官方字段说明：fuelCapacity 的范围是
+#      100（多数燃油车）→ 5（卡丁车）→ 0（纯电车）
+#    社区的 getPowertrainType() 就是照这个实现的：
+#      fuel_capacity == 0 → 电动；== 5 → 卡丁车；> 0 → 燃油
+#
+# ⚠️ 判据有边界：GT7 里燃油车容量被归一化成「100%」，并不披露真实升数；
+#    卡丁车恰好是 5。所以不能直接说「小于 10 就是卡丁车」——
+#    这里只严格照 == 0 / == 5 判，其余一律算燃油（含混动，GT7 不对
+#    混动单独标记，混动车的容量仍 > 0，格式 A 里也没有电池字段）。
+POWERTRAIN_FUEL, POWERTRAIN_ELECTRIC, POWERTRAIN_KART = "fuel", "electric", "kart"
+
+
+def classify_powertrain(gas_capacity: float) -> str:
+    """按油箱容量判定动力类型。容差用 1e-3，避免浮点误差把卡丁车判成燃油。"""
+    if gas_capacity <= 1e-3:
+        return POWERTRAIN_ELECTRIC
+    if abs(gas_capacity - 5.0) <= 1e-3:
+        return POWERTRAIN_KART
+    return POWERTRAIN_FUEL
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -104,6 +126,11 @@ class Session:
     last_sample_t: float = 0.0
     laps_seen: set[int] = field(default_factory=set)
     max_speed: float = 0.0
+    # 本场动力类型（fuel / electric / kart），由首帧的油箱容量判定。
+    # 记录在会话级，便于事后分析 jsonl 时知道 gas_level 的单位是升还是 kWh。
+    powertrain: str = "fuel"
+    # 本场出现过的最大能量回收值（kW 量级），仅扩展包有值时非 0
+    max_energy_recovery: float = 0.0
     state: str = SESSION_STARTED
     source_ip: str | None = None
     # True = 已确认车辆在行驶，数据才真正落盘。
@@ -119,6 +146,10 @@ class Session:
             ).isoformat(),
             "circuit": self.circuit,
             "car": self.car,
+            # 动力类型：fuel / electric / kart。
+            # ⚠️ 电动车时各帧的 gas_level 是**剩余电量 kWh**（不是百分比），
+            #    容量字段为 0；分析 jsonl 时要按这个标记决定单位。
+            "powertrain": self.powertrain,
         }
 
 
@@ -168,8 +199,24 @@ class TelemetrySample:
     laps_in_race: int = 0
     best_lap_ms: int | None = None
     last_lap_ms: int | None = None
+    # —— 燃油 / 电量 ——
+    # 🔴 语义取决于动力类型（powertrain）：
+    #   · fuel（燃油/混动）：gas_level = 燃油量，gas_capacity = 油箱容量（GT7 多数车归一为 100）
+    #   · electric（纯电）：gas_capacity == 0，**gas_level 变成剩余电量 kWh**
+    #   · kart（卡丁车）：gas_capacity == 5
+    # 判据来自官方字段说明 + 社区 getPowertrainType() 实现：
+    #   RANGE: 100（多数车）→ 5（卡丁车）→ 0（纯电）
+    # 所以百分比必须用 gas_level / gas_capacity 算，不能直接拿 gas_level 当百分比
+    # （油箱容量不是 100 的车，例如卡丁车 5，直接当百分比会差一个量级）。
     gas_level: float = 0.0
     gas_capacity: float = 0.0
+    powertrain: str = "fuel"          # fuel / electric / kart
+    # —— 扩展能量字段（仅在心跳用 "~" 扩展包时非 0）——
+    # ⚠️ 社区文档标注这些字段「仍在研究中」，偏移可能随固件变化。
+    #    默认心跳是 "A"，拿不到这些值（保持 0），需要显式 --packet-type ~。
+    energy_recovery: float = 0.0       # 能量回收功率（正 = 回收，负 = 输出）
+    throttle_filtered: float = 0.0     # 游戏内部滤波后的油门输出（0~1）
+    brake_filtered: float = 0.0        # 游戏内部滤波后的刹车输出（0~1）
     car_code: int = 0
     turbo_boost: float = 0.0
     # —— 引擎健康（格式 A 内，长期没解析）——
@@ -224,6 +271,10 @@ class TelemetrySample:
             "last_lap_ms": self.last_lap_ms,
             "gas_level": round(self.gas_level, 2),
             "gas_capacity": round(self.gas_capacity, 2),
+            "powertrain": self.powertrain,
+            "energy_recovery": round(self.energy_recovery, 3),
+            "throttle_filtered": round(self.throttle_filtered, 3),
+            "brake_filtered": round(self.brake_filtered, 3),
             "car_code": self.car_code,
             "turbo_boost": round(self.turbo_boost, 3),
             "oil_pressure": round(self.oil_pressure, 2),
@@ -669,8 +720,18 @@ class Decoder:
             # flags 里有 CarOnTrack 标志，比用速度判断「是否在跑」可靠得多
             car_on_track = bool(flags & 0x01)
 
-            self.last_layout = "A"
-            self.frames_by_layout["A"] = self.frames_by_layout.get("A", 0) + 1
+            # 包类型按**实际长度**推断，而不是一律记 "A"。
+            # 心跳切到 B / ~ 后包会变长（316 / 332），状态文件里显示真实类型
+            # 便于确认 PS5 是否真的按我们请求的类型发包（协议改动排查用）。
+            if n >= 0x148:
+                pkt_layout = "~"
+            elif n >= 0x130:
+                pkt_layout = "B"
+            else:
+                pkt_layout = "A"
+            self.last_layout = pkt_layout
+            self.frames_by_layout[pkt_layout] = (
+                self.frames_by_layout.get(pkt_layout, 0) + 1)
 
             return TelemetrySample(
                 t=recv_time,
@@ -693,7 +754,7 @@ class Decoder:
                 g_force=g_force,
                 # ★ 格式 A 就带 position，复盘/超车功能从第一帧可用
                 has_coords=True,
-                layout="A",
+                layout=pkt_layout,
                 # 附加字段
                 velocity=velocity,
                 suggested_gear=suggested,
@@ -708,6 +769,27 @@ class Decoder:
                 last_lap_ms=last_lap if last_lap != 0xFFFFFFFF else None,
                 gas_level=f32(0x44) if n >= 0x48 else 0.0,
                 gas_capacity=f32(0x48) if n >= 0x4C else 0.0,
+                powertrain=classify_powertrain(
+                    f32(0x48) if n >= 0x4C else 0.0),
+                # 能量回收 / 滤波输入：**只在扩展包（~）里有真实值**。
+                #
+                # 🔴 格式 A 的 0x128 之后就结束了（296 字节），按扩展偏移读 A 包
+                #    是越界；而 0x128.. 这段在 A 里是轮速/胎径等，语义完全不同，
+                #    绝不能张冠李戴。所以这里用包长严格守门：
+                #      A = 296B、B = 316B（+5 float 运动数据）、~ = 332B（+扩展）
+                #
+                # ⚠️ 扩展段布局来自社区逆向，两大来源有 4 字节分歧
+                #    （MacManley/gt7-udp 有 torqueVectors，RaceCrewAI/gt-telem 没有），
+                #    且文档自我标注「仍在研究中」。这里采用 MacManley 的
+                #    C++ 结构体布局（偏移可逐字段推导，且最新仍在维护）：
+                #      0x13C throttleFiltered(u8)  0x13D brakeFiltered(u8)
+                #      0x13E u8  0x13F u8
+                #      0x140 torqueVectors(f32)    0x144 energyRecovery(f32)
+                #      0x148 unknown(f32)
+                #    默认心跳是 "A"→ 这段恒为 0；只有显式 --packet-type ~ 才有值。
+                energy_recovery=f32(0x144) if n >= 0x148 else 0.0,
+                throttle_filtered=(data[0x13C] / 255.0) if n >= 0x13D else 0.0,
+                brake_filtered=(data[0x13D] / 255.0) if n >= 0x13E else 0.0,
                 car_code=u32(0x124) if n >= 0x128 else 0,
                 turbo_boost=f32(0x50) if n >= 0x54 else 0.0,
                 # 引擎健康（float32，同一段连续布局）
@@ -1038,14 +1120,19 @@ class Recorder:
 
                 for tgt_ip, tgt_port in targets:
                     try:
-                        s1.sendto(b"A", (tgt_ip, tgt_port))
+                        # 心跳字符决定 PS5 回哪种包：
+                        #   "A" → 296 字节基础包（默认）
+                        #   "B" → 316 字节（+运动数据）  "~" → 332 字节（+能量回收）
+                        s1.sendto(self.args.packet_type.encode("ascii"),
+                                  (tgt_ip, tgt_port))
                     except OSError:
                         pass
                 last_hb = time.time()
                 if hb_count == 1:
                     self.log(
                         f"已启用心跳保活（每 {self.args.heartbeat_interval:.0f} 秒"
-                        f"，目标 {len(targets)} 个）—— 缺少它 PS5 会停止发遥测",
+                        f"，目标 {len(targets)} 个，包类型 {self.args.packet_type}）"
+                        " —— 缺少它 PS5 会停止发遥测",
                         force=True,
                     )
 
@@ -1214,6 +1301,9 @@ class Recorder:
             self._gg_last_t = 0.0
             self.lap_times.clear()
             self.lap_fuel.clear()
+            # 本场动力类型以首帧为准（同一场次不会换车），写进会话头
+            self.session.powertrain = sample.powertrain
+            self.session.max_energy_recovery = 0.0
             # 🔴 _last_lap_ms_seen 要初始化为**当前值**而不是 0：
             #    否则录制启动帧自己就会触发一次「冲线」（0 → 有值），
             #    lap_fuel 第一条恒为 0.0 的假圈。
@@ -1234,14 +1324,22 @@ class Recorder:
         # ---- 正式采集 ----
         self.session.laps_seen.add(sample.lap)
         self.session.max_speed = max(self.session.max_speed, sample.speed_kph)
+        # 能量回收峰值（仅扩展包有值；默认格式 A 恒为 0，不会污染统计）
+        if sample.energy_recovery > self.session.max_energy_recovery:
+            self.session.max_energy_recovery = sample.energy_recovery
 
         # —— 每圈成绩：lastLapTime 变化 = 刚冲线 ——
         # 不用圈号判断（不同模式下起点不一致），用「值变化」最稳：
         # GT7 对同一个 lastLapTime 会连续上报几百帧，必须去重。
         if sample.last_lap_ms and sample.last_lap_ms != self._last_lap_ms_seen:
-            # 🔴 油耗只在冲线时结算：_fuel_mark 是上一冲线时刻的油量，
-            #    差值 = 这一圈的消耗。若放在每帧执行，标记每帧被刷新，
-            #    差值永远只剩一帧的油耗（≈0），且 lap_fuel 会被灌满垃圾。
+            # 🔴 能耗只在冲线时结算：_fuel_mark 是上一冲线时刻的能量读数，
+            #    差值 = 这一圈消耗了多少。若放在每帧执行，标记每帧被刷新，
+            #    差值永远只剩一帧的消耗（≈0），且 lap_fuel 会被灌满垃圾。
+            #
+            # ⚠️ 这条对油车和电车**通用**——因为 gas_level 在两种车上
+            #    都是「剩余能量」读数：燃油车是百分比（0~100），
+            #    纯电车是剩余电量 kWh。所以 lap_fuel 里的数字对电车就是
+            #    「每圈耗多少 kWh」，字段名沿用但单位随 powertrain 变化。
             if self._fuel_mark is not None:
                 self.lap_fuel.append([len(self.lap_times) + 1,
                                       round(self._fuel_mark - sample.gas_level, 2)])
@@ -1393,6 +1491,10 @@ class Recorder:
                 "warning": self.decoder.last_warn,
                 "has_coords": sample.has_coords,
                 "decoder_errors": self.decoder.decode_errors,
+                # 动力类型与能量回收峰值（本场，随首帧确定）
+                "powertrain": self.session.powertrain,
+                "max_energy_recovery": round(self.session.max_energy_recovery, 3),
+                "packet_type": self.args.packet_type,
                 # 紧凑历史：字段名缩写以减小体积
                 "history": list(self._status_buf),
                 # —— 新增：状态元信息 ——
@@ -1576,6 +1678,14 @@ def main() -> int:
         "--heartbeat-interval", type=float, default=5.0,
         help="心跳保活间隔秒数，默认 5。"
              "⚠️ 必须定期向 PS5 发 'A' 心跳，否则 PS5 会停止发送遥测",
+    )
+    p.add_argument(
+        "--packet-type", default="A", choices=["A", "B", "~"],
+        help="请求的遥测包类型（改心跳字符），默认 A（296 字节，最稳）。"
+             "B = 运动数据（316 字节，多 sway/heave/surge，Sport 模式不可用）；"
+             "~ = 扩展数据（332 字节，多能量回收/滤波输入，回放不可用）。"
+             "⚠️ B/~ 的扩展段是社区逆向字段、仍在研究中，且非所有模式都支持；"
+             "普通使用保持 A 即可。纯电车电量在 A 包里就有，无需切包。",
     )
     p.add_argument(
         "--probe", action="store_true",
