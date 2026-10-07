@@ -19,8 +19,12 @@
 | POST | `/api/v1/sessions/<文件名>/favorite` | 收藏/取消收藏，body `{"value": true}` |
 | POST | `/api/v1/sessions/<文件名>/rename` | 改名，body `{"value": "新名称"}` |
 | POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，保留期后自动清除） |
-| GET | `/api/v1/settings` | 回收站保留期与现状 |
+| GET | `/api/v1/settings` | 回收站保留期/清单与场次命名模板 |
 | POST | `/api/v1/settings/trash-retention` | 设置回收站保留天数，body `{"value": 30}`（0=永不清理） |
+| POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
+| POST | `/api/v1/trash/purge` | 清空回收站（彻底删除全部） |
+| POST | `/api/v1/trash/<文件名>/restore` | 从回收站恢复场次到列表 |
+| POST | `/api/v1/trash/<文件名>/delete` | 彻底删除回收站中的单个场次 |
 | GET | `/api/v1/docs` | 本文档 |
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里

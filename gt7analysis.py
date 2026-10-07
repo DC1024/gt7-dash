@@ -376,9 +376,14 @@ def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
                 "race_line": {"segments": []}}
     summary = []
     for n, pts in samples.items():
+        fs = laps.get(n) or []
+        # 🔴 duration 必须用原始帧跨度（和 analyze_session 的圈速表同一口径）。
+        #    之前用重采样最后一点的 t_rel，终点被采样网格截断，
+        #    会出现「表格标第 6 圈最快、选择器默认第 8 圈」的对不上。
+        raw_span = (fs[-1]["t"] - fs[0]["t"]) if len(fs) >= 2 else pts[-1]["t_rel"]
         speeds = [p["speed_kph"] for p in pts]
         summary.append({
-            "lap": n, "duration_s": pts[-1]["t_rel"],
+            "lap": n, "duration_s": round(raw_span, 3),
             "distance_m": pts[-1]["dist"],
             "max_speed_kph": max(speeds),
             "avg_speed_kph": round(sum(speeds) / len(speeds), 1),

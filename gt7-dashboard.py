@@ -381,6 +381,85 @@ def _first_car_code(path: Path) -> int:
     return 0
 
 
+# 场次最快圈缓存：列表页每次刷新都要问每个文件的最快圈，
+# 整包解析太重，这里只流式扫 (lap, t) 两个字段；文件没变直接命中。
+_BEST_LAP_CACHE: dict[tuple[float, int], float | None] = {}
+
+
+def _best_lap_of(path: Path) -> float | None:
+    """场次的最快有效圈（秒，圈跨度 ≥20s 才算，口径同 analyze_session）。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (st.st_mtime, st.st_size)
+    if key in _BEST_LAP_CACHE:
+        return _BEST_LAP_CACHE[key]
+    best: float | None = None
+    cur: int | None = None
+    t0 = t_prev = 0.0
+
+    def _close() -> None:
+        nonlocal best
+        if cur is not None and t_prev - t0 >= 20.0 \
+                and (best is None or t_prev - t0 < best):
+            best = round(t_prev - t0, 3)
+
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            fh.readline()                       # header 行
+            for line in fh:
+                try:
+                    f = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                lap = f.get("lap")
+                t = f.get("t") or 0.0
+                if not isinstance(lap, int) or lap <= 0 or lap >= 65000:
+                    continue
+                if lap != cur:                  # 换圈 = 上一圈结束
+                    _close()
+                    cur, t0 = lap, t
+                t_prev = t
+        _close()
+    except OSError:
+        return None
+    _BEST_LAP_CACHE[key] = best
+    return best
+
+
+DEFAULT_NAME_TEMPLATE = "{车型} {时间} {最快圈}"
+
+
+def _fmt_lap_name(sec: float | None) -> str:
+    if not sec:
+        return "-"
+    m = int(sec // 60)
+    return f"{m}:{sec - m * 60:06.3f}"
+
+
+def _session_display_name(s: dict, tpl: str) -> str:
+    """按模板生成默认显示名。手动改名（custom_name）优先，由调用方处理。
+
+    支持占位符（中英皆可）：{车型}/{car} {时间}/{time} {最快圈}/{lap}
+    {场次}/{circuit}。模板里出现未知占位符时回退文件名，不让页面挂掉。
+    """
+    name = tpl or DEFAULT_NAME_TEMPLATE
+    for zh, en in (("{车型}", "{car}"), ("{时间}", "{time}"),
+                   ("{最快圈}", "{lap}"), ("{场次}", "{circuit}")):
+        name = name.replace(zh, en)
+    try:
+        out = name.format(
+            car=s.get("car_name") or "未知车",
+            time=s.get("time_str") or s.get("modified", ""),
+            lap=_fmt_lap_name(s.get("best_lap_s")),
+            circuit=s.get("circuit") or "",
+        ).strip()
+    except (KeyError, IndexError, ValueError):
+        out = ""
+    return out or s.get("circuit") or s.get("file", "")
+
+
 def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     """列出已落盘的场次文件（合并收藏/自定义名称，收藏优先展示）。"""
     if not history_dir.exists():
@@ -388,6 +467,8 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
 
     meta = load_session_meta(history_dir)
     csv_path = str(history_dir / "cars.csv")
+    tpl = load_settings(history_dir).get(
+        "session_name_template", DEFAULT_NAME_TEMPLATE)
     sessions = []
     for f in sorted(history_dir.glob("*.jsonl"), reverse=True)[:limit]:
         try:
@@ -396,22 +477,32 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
             m = meta.get(f.name) or {}
             import gt7analysis
             car_name = gt7analysis.car_name_of(_first_car_code(f), csv_path)
-            sessions.append(
-                {
-                    "file": f.name,
-                    "timestamp": parts[0] if parts else "",
-                    "time_of_day": parts[1] if len(parts) > 1 else "",
-                    "circuit": parts[2] if len(parts) > 2 else "unknown",
-                    "size_kb": round(stat.st_size / 1024, 1),
-                    "modified": datetime.fromtimestamp(stat.st_mtime).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                    "car_name": car_name,
-                    # —— 用户标注 ——
-                    "favorite": bool(m.get("favorite")),
-                    "custom_name": m.get("custom_name") or "",
-                }
-            )
+            # 文件名里的时间戳 → 短格式「10-08 00:27」
+            ts = (parts[0] or "") if parts else ""
+            tod = (parts[1] if len(parts) > 1 else "")[:6]
+            time_str = (f"{ts[4:6]}-{ts[6:8]} {tod[:2]}:{tod[2:4]}"
+                        if len(ts) >= 8 and len(tod) >= 4 else "")
+            best = _best_lap_of(f)
+            entry = {
+                "file": f.name,
+                "timestamp": parts[0] if parts else "",
+                "time_of_day": parts[1] if len(parts) > 1 else "",
+                "circuit": parts[2] if len(parts) > 2 else "unknown",
+                "size_kb": round(stat.st_size / 1024, 1),
+                "modified": datetime.fromtimestamp(stat.st_mtime).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "car_name": car_name,
+                "best_lap_s": best,
+                "time_str": time_str,
+                # —— 用户标注 ——
+                "favorite": bool(m.get("favorite")),
+                "custom_name": m.get("custom_name") or "",
+            }
+            # 展示名：手动改名优先，否则按默认模板组合
+            entry["display_name"] = (entry["custom_name"]
+                                     or _session_display_name(entry, tpl))
+            sessions.append(entry)
         except OSError:
             continue
     # 收藏的排前面，其余按时间倒序（原顺序）
@@ -625,8 +716,12 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | POST | `/api/v1/sessions/<文件名>/favorite` | 收藏/取消收藏，body `{"value": true}` |
 | POST | `/api/v1/sessions/<文件名>/rename` | 改名，body `{"value": "新名称"}` |
 | POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，保留期后自动清除） |
-| GET | `/api/v1/settings` | 回收站保留期与现状 |
+| GET | `/api/v1/settings` | 回收站保留期/清单与场次命名模板 |
 | POST | `/api/v1/settings/trash-retention` | 设置回收站保留天数，body `{"value": 30}`（0=永不清理） |
+| POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
+| POST | `/api/v1/trash/purge` | 清空回收站（彻底删除全部） |
+| POST | `/api/v1/trash/<文件名>/restore` | 从回收站恢复场次到列表 |
+| POST | `/api/v1/trash/<文件名>/delete` | 彻底删除回收站中的单个场次 |
 | GET | `/api/v1/docs` | 本文档 |
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
@@ -842,6 +937,68 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             cors=True)
             return
 
+        # —— 默认名称模板：POST /api/v1/settings/name-template {"value": "..."} ——
+        if parsed.path == "/api/v1/settings/name-template":
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except Exception:
+                body = {}
+            v = str(body.get("value") or "").strip()[:120]
+            if not v:
+                v = DEFAULT_NAME_TEMPLATE      # 存空 = 回到默认模板
+            s = load_settings(hist)
+            s["session_name_template"] = v
+            save_settings(hist, s)
+            self._send_json({"ok": True, "session_name_template": v,
+                             "hint": "已保存，列表页刷新后生效"}, cors=True)
+            return
+
+        # —— 回收站操作：POST /api/v1/trash/purge | /api/v1/trash/<name>/<action> ——
+        tseg = parsed.path.split("/")
+        if len(tseg) >= 4 and tseg[1:4] == ["api", "v1", "trash"]:
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            trash = hist / "_trash"
+            if len(tseg) == 5 and tseg[4] == "purge":
+                if not trash.is_dir():
+                    self._send_json({"ok": True, "purged": 0}, cors=True)
+                    return
+                cnt = 0
+                for tf in trash.glob("*.jsonl"):
+                    try:
+                        tf.unlink()
+                        cnt += 1
+                    except OSError:
+                        continue
+                self._send_json({"ok": True, "purged": cnt,
+                                 "hint": f"已彻底删除 {cnt} 个文件"}, cors=True)
+                return
+            if len(tseg) != 6 or not tseg[5]:
+                self._send_json({"error": "not found"}, 404, cors=True)
+                return
+            name, action = Path(tseg[4]).name, tseg[5]
+            target = (trash / name).resolve()
+            if (not str(target).startswith(str(trash)) or not target.exists()
+                    or target.suffix != ".jsonl"):
+                self._send_json({"error": "回收站里没有这个文件", "file": name},
+                                404, cors=True)
+                return
+            if action == "restore":
+                dest = hist / name
+                if dest.exists():
+                    self._send_json({"error": "同名场次已存在，无法恢复"},
+                                    409, cors=True)
+                    return
+                target.rename(dest)
+                self._send_json({"ok": True, "hint": "已恢复到场次列表"}, cors=True)
+            elif action == "delete":
+                target.unlink()
+                self._send_json({"ok": True, "hint": "已彻底删除"}, cors=True)
+            else:
+                self._send_json({"error": "unknown action"}, 404, cors=True)
+            return
+
         seg = parsed.path.split("/")
         # /api/v1/sessions/<name>/<action>
         if (len(seg) != 6 or seg[1:4] != ["api", "v1", "sessions"]
@@ -939,14 +1096,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not str(target).startswith(str(hist)) or not target.exists():
                     self._send_html("<h1>文件不存在或非法路径</h1>", 404)
                     return
-                # 参考圈选择器：?ref_lap=N 指定赛车线看第几圈，缺省=最快圈
+                # 参考圈选择器：?ref_lap=N 指定赛车线看第几圈，缺省=最快圈。
+                # 🔴 「最快圈」必须用 analyze_session 的口径（真实帧跨度、
+                #    剔除 <20s 的残圈），而不是 analyze_compare 内部拿重采样
+                #    duration 再取 min——两者分母不同，会出现「表格标第 6 圈
+                #    最快、选择器却默认第 8 圈」的对不上。这里显式传 best_lap。
                 ref_raw = query.get("ref_lap", [""])[0]
+                stats = analyze_session(target)
                 try:
                     ref_lap_no = int(ref_raw) if ref_raw else None
                 except ValueError:
                     ref_lap_no = None
+                if ref_lap_no is None:
+                    ref_lap_no = (stats.get("best_lap") or {}).get("lap")
                 self._send_html(build_session_page(
-                    target, analyze_session(target), ref_lap_no=ref_lap_no))
+                    target, stats, ref_lap_no=ref_lap_no))
 
             elif path == "/api/session":
                 name = query.get("file", [""])[0]
@@ -1048,11 +1212,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     tsize = sum(f.stat().st_size for f in tfiles)
                 except OSError:
                     pass
+                trash_items = []
+                for tf in sorted(tfiles, key=lambda x: x.name, reverse=True):
+                    try:
+                        st = tf.stat()
+                        trash_items.append({
+                            "name": tf.name,
+                            "size_kb": round(st.st_size / 1024, 1),
+                            "modified": datetime.fromtimestamp(
+                                st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                        })
+                    except OSError:
+                        continue
                 self._send_json({
                     "meta": {"api_version": 1},
                     "trash_retention_days": s.get("trash_retention_days", 30),
                     "trash_files": len(tfiles),
                     "trash_size_mb": round(tsize / 1048576, 1),
+                    "trash": trash_items,
+                    "session_name_template": s.get(
+                        "session_name_template", DEFAULT_NAME_TEMPLATE),
                 }, cors=True)
 
             elif path == "/api/v1/docs":
@@ -1336,7 +1515,69 @@ function loadTrashSettings() {
       '回收站现有 ' + d.trash_files + ' 个文件（' + d.trash_size_mb + ' MB）'
       + ' · 当前保留 ' + d.trash_retention_days + ' 天';
     document.getElementById('retDays').value = d.trash_retention_days;
+    document.getElementById('nameTpl').value =
+      d.session_name_template || '{车型} {时间} {最快圈}';
+    // —— 回收站清单：恢复 / 彻底删除 ——
+    var items = d.trash || [];
+    document.getElementById('trashSummary').textContent =
+      items.length ? items.length + ' 个文件' : '';
+    var box = document.getElementById('trashList');
+    if (!items.length) {
+      box.innerHTML = '<p style="font-size:12.5px;color:var(--muted)">回收站是空的。</p>';
+      return;
+    }
+    box.innerHTML = '<table><tr><th>文件</th><th style="text-align:right">大小</th>' +
+      '<th style="text-align:right">删除时间</th><th style="text-align:right">操作</th></tr>' +
+      items.map(function (t) {
+        // 用 data-* 传值而不是把文件名塞进 onclick 的引号里：
+        // 这段 JS 又是被 Python 三引号字符串包着的，单反斜杠会被 Python 先吃掉，
+        // 生成 'trashPost('' + t.name' 这种坏语法（整段脚本直接不执行）。
+        var nm = String(t.name).replace(/"/g, '&quot;');
+        return '<tr><td style="font-size:12px;font-family:var(--mono)">' + t.name +
+          '</td><td class="num">' + t.size_kb + ' KB</td><td class="num">' + t.modified +
+          '</td><td class="num">' +
+          '<button class="sbtn" data-trash="' + nm + '" data-act="restore">↩ 恢复</button>' +
+          '<button class="sbtn" data-trash="' + nm + '" data-act="delete">✕ 彻底删除</button>' +
+          '</td></tr>';
+      }).join('') + '</table>';
   });
+}
+document.getElementById('trashList').addEventListener('click', function (e) {
+  var btn = e.target.closest('button[data-trash]');
+  if (!btn) return;
+  trashPost(btn.getAttribute('data-trash'), btn.getAttribute('data-act'));
+});
+function saveNameTpl() {
+  var v = document.getElementById('nameTpl').value.trim();
+  if (!v) { alert('模板不能为空（留空保存会恢复默认）'); return; }
+  fetch('/api/v1/settings/name-template', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({value: v})
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.ok) location.reload();
+    else alert(d.error || '保存失败');
+  }).catch(function (e) { alert('请求失败：' + e); });
+}
+function trashPost(name, action) {
+  if (action === 'delete' &&
+      !confirm('彻底删除「' + name + '」？\\n（不可恢复，请确认不再需要）')) return;
+  fetch('/api/v1/trash/' + encodeURIComponent(name) + '/' + action, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: '{}'
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.ok) loadTrashSettings(); else alert(d.error || '操作失败');
+  }).catch(function (e) { alert('请求失败：' + e); });
+}
+function purgeTrash() {
+  if (!confirm('清空回收站？\\n（所有已删除场次将被彻底删除，不可恢复）')) return;
+  fetch('/api/v1/trash/purge', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: '{}'
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.ok) { loadTrashSettings(); }
+    else alert(d.error || '操作失败');
+  }).catch(function (e) { alert('请求失败：' + e); });
 }
 function saveRetention() {
   var v = parseFloat(document.getElementById('retDays').value);
@@ -1360,7 +1601,7 @@ function filterFav(only) {
   });
 }
 function sessDel(file) {
-  if (!confirm('确定删除这场数据？\\n（文件移入服务器 data/_trash/，可找回）')) return;
+  if (!confirm('确定删除这场数据？\\n（移入下方「回收站」，可恢复或彻底删除）')) return;
   sessPost(file, 'delete', null);
 }
 </script>
@@ -1374,6 +1615,13 @@ _COMPARE_TMPL = """
 #raceLineCv { width:100%; max-width:760px; display:block; margin:0 auto;
   border-radius:8px; background:rgba(128,128,128,.06); }
 .pv-table td, .pv-table th { padding:5px 9px; font-size:12.5px; }
+/* 🔴 .legend 样式只定义在主仪表盘页，历史页 shell 里没有——
+   之前图例的 <i> 色块在这里渲染成 0×0，看起来就是光秃秃三个字。 */
+.legend { display:flex; gap:16px; font-size:12px; color:var(--muted);
+  justify-content:center; flex-wrap:wrap; margin-top:6px; }
+.legend span { display:inline-flex; align-items:center; }
+.legend i { display:inline-block; width:16px; height:4px; border-radius:2px;
+  margin-right:5px; }
 </style>
 <div class="card">
   <h2>圈间对比分析 <span id="cmpMeta" style="float:right;font-weight:400"></span></h2>
@@ -1442,11 +1690,20 @@ const CMP = __DATA__;
       sel.style.display = 'none';
       return;
     }
+    // 🔴 「最快」标注必须按真实圈速算，不能贴在当前参考圈上——
+    //    否则用户切到别的圈，选择器会把那一圈也叫「最快」（实测踩过）。
+    //    口径与左侧圈速表一致：≥20s 才算有效圈。
+    const valid = sum.filter(s => s.duration_s >= 20);
+    const fastestLap = valid.length
+      ? valid.reduce((a, s) => s.duration_s < a.duration_s ? s : a).lap : null;
     sum.forEach(function (s) {
       const o = document.createElement('option');
+      const tags = [];
+      if (s.lap === fastestLap) tags.push('最快');
+      if (s.lap === CMP.ref_lap && s.lap !== fastestLap) tags.push('参考圈');
       o.value = s.lap;
       o.textContent = '第 ' + s.lap + ' 圈 · ' + s.duration_s.toFixed(1) + 's'
-        + (s.lap === CMP.ref_lap ? '（最快）' : '');
+        + (tags.length ? '（' + tags.join('·') + '）' : '');
       if (s.lap === CMP.ref_lap) o.selected = true;
       sel.appendChild(o);
     });
@@ -1568,7 +1825,7 @@ def build_sessions_page(hist: Path) -> str:
 
     rows = []
     for s in sessions:
-        disp = s["custom_name"] or s["circuit"]
+        disp = s.get("display_name") or s["circuit"]
         disp_attr = disp.replace('"', "&quot;")
         star = ' <span style="color:#d4a017">★</span>' if s["favorite"] else ""
         rows.append(
@@ -1606,10 +1863,29 @@ def build_sessions_page(hist: Path) -> str:
 </div>
 
 <div class="card">
-  <h2>回收站</h2>
+  <h2>显示设置</h2>
+  <p style="font-size:12.5px;color:var(--muted)">
+    场次默认按模板命名（手动改过名的场次不受影响）。可用占位符：
+    <b>{{车型}}</b> <b>{{时间}}</b> <b>{{最快圈}}</b> <b>{{场次}}</b></p>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <input id="nameTpl" placeholder="{{车型}} {{时间}} {{最快圈}}"
+      style="flex:1;min-width:220px;padding:7px 10px;border:1px solid var(--line);
+             border-radius:7px;background:var(--card);color:inherit;
+             font-family:inherit;font-size:13px">
+    <button onclick="saveNameTpl()"
+      style="border:1px solid var(--line);background:var(--card);color:inherit;
+             padding:7px 14px;border-radius:7px;cursor:pointer;
+             font-family:inherit;font-size:13px">保存模板</button>
+    <span id="tplMsg" style="font-size:12px;color:var(--muted)"></span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>回收站 <span id="trashSummary" style="float:right;font-weight:400;
+      font-size:12px;color:var(--muted)"></span></h2>
   <p style="font-size:12.5px;color:var(--muted)">
     删除的场次先移入 <b>data/_trash/</b>，超过保留期后由服务自动真删
-    （每小时检查一次）。设 <b>0</b> = 永不自动清理。</p>
+    （每小时检查一次，设 <b>0</b> 天 = 永不自动清理）；也可以在这里手动清理。</p>
   <div id="trashInfo" style="font-size:13px;margin:10px 0">加载中…</div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <label style="font-size:13px">保留天数：
@@ -1622,8 +1898,13 @@ def build_sessions_page(hist: Path) -> str:
       style="border:1px solid var(--line);background:var(--card);color:inherit;
              padding:7px 14px;border-radius:7px;cursor:pointer;
              font-family:inherit;font-size:13px">保存</button>
+    <button onclick="purgeTrash()"
+      style="border:1px solid var(--bad);background:var(--card);color:var(--bad);
+             padding:7px 14px;border-radius:7px;cursor:pointer;
+             font-family:inherit;font-size:13px">清空回收站</button>
     <span id="retMsg" style="font-size:12px;color:var(--muted)"></span>
   </div>
+  <div id="trashList" style="margin-top:10px"></div>
 </div>""" + _SESSIONS_PAGE_JS
     return _page_shell("历史场次", body)
 
@@ -1897,7 +2178,9 @@ input[type="color"] { width:32px; height:24px; padding:0; vertical-align:middle;
 .k.orange { background:#fd7e14 } .k.red { background:#dc3545 }
 .bar-row output { width:42px; text-align:right; font-family:var(--mono);
   font-size:11px; color:var(--muted); }
-.chart { width:100%; height:110px; display:block; }
+/* 实时曲线：分面小图（small multiples），每个通道独立 Y 轴与刻度 */
+.chsvg { display:block; }
+.chaxis { font-size:9px; }
 .legend { display:flex; gap:14px; font-size:11px; color:var(--muted);
   margin-bottom:6px; flex-wrap:wrap; }
 .legend i { display:inline-block; width:10px; height:2.5px;
@@ -1944,8 +2227,8 @@ th { color:var(--muted); font-weight:500; }
   <span class="nav">
     <a href="/sessions">历史场次</a>
     <a href="#" id="prefLink" onclick="event.preventDefault(); togglePrefPanel(true)">个性化</a>
-    <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)">术语说明</a>
     <a href="#" id="layoutLink" onclick="event.preventDefault(); toggleLayoutPanel(true)">布局</a>
+    <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)">术语说明</a>
     <a href="#" id="apiLink" onclick="event.preventDefault(); toggleApiPanel(true)">API</a>
   </span>
 </div>
@@ -2285,6 +2568,7 @@ th { color:var(--muted); font-weight:500; }
           </svg>
           <div class="gauge-val">
             <b id="rpm">0</b><span id="gear">N 档</span>
+            <span id="gaugeMax" style="font-size:10px;color:var(--muted)"></span>
           </div>
         </div>
         <div class="speed">
@@ -2375,14 +2659,7 @@ th { color:var(--muted); font-weight:500; }
 
     <div class="card span2" id="c-chart">
     <h2>实时曲线 <span id="range" style="float:right;font-weight:400"></span></h2>
-    <div class="legend">
-      <span><i style="background:var(--accent)"></i><span id="legendSpeed">速度 km/h</span></span>
-      <span><i style="background:#dc3545"></i>转速</span>
-      <span><i style="background:#198754"></i>油门</span>
-      <span><i style="background:#fd7e14"></i>刹车</span>
-    </div>
-    <svg class="chart" id="chart" viewBox="0 0 600 110"
-      preserveAspectRatio="none"></svg>
+    <div id="chart"></div>
   </div>
 
     <div class="card span2" id="c-wheel">
@@ -2403,10 +2680,10 @@ th { color:var(--muted); font-weight:500; }
     </div>
 
     <div class="card" id="c-engine">
-      <h2>引擎健康</h2>
+      <h2 id="engineTitle">引擎健康</h2>
       <div class="eng-row"><span>水温</span><b id="eWater">--</b></div>
-      <div class="eng-row"><span>油温</span><b id="eOil">--</b></div>
-      <div class="eng-row"><span>油压</span><b id="eOilP">--</b></div>
+      <div class="eng-row" id="eOilRow"><span>油温</span><b id="eOil">--</b></div>
+      <div class="eng-row" id="eOilPRow"><span>油压</span><b id="eOilP">--</b></div>
       <div class="eng-row"><span>车身高度</span><b id="eBody">--</b></div>
       <div class="eng-row" id="eRecRow" style="display:none"><span>能量回收</span><b id="eRec">--</b></div>
     </div>
@@ -2433,6 +2710,16 @@ th { color:var(--muted); font-weight:500; }
 const $ = id => document.getElementById(id);
 const RPM_MAX = 15000, SPEED_MAX = 320;
 let bestLap = null, lastFrame = null;
+// —— 转速表自适应量程的状态（一场内累计观测，换车重置） ——
+let rpmSeenMax = 0;        // 本场见过的最高转速
+let rpmSeenCar = '';       // 观测时的车型名（换车即重置观测）
+let rpmGaugeMax = RPM_MAX; // 当前表底
+let pauseHoldUntil = 0;    // 暂停徽标的粘滞截止时间（见 render 内说明）
+// 把任意值向上取到「好看的表底」：7500 / 8000 / 26000 这种，而不是 7312。
+function niceCeil(x) {
+  const step = x > 12000 ? 1000 : (x > 6000 ? 500 : 250);
+  return Math.ceil(x / step) * step;
+}
 
 // ===========================================================================
 // 个性化设置：主题预设 / 强调色 / 排版 / 单位 / 图表
@@ -2464,12 +2751,14 @@ const THEMES = [
 ];
 const ACCENTS = ['#0d6efd','#0a84ff','#00e0c6','#198754','#b45309',
                  '#e10600','#e83e8c','#9b6bff','#39ff14','#ffb020'];
-// 曲线条目顺序 = 图例顺序；颜色读主题变量，所以换主题的曲线也跟着变
+// 曲线条目 = 分面顺序。颜色用 Okabe-Ito 色弱安全色板（固定色值，
+// 不随主题变）：四条线原本共用一套红绿橙蓝，转速红和刹车橙太接近，
+// 分面后每条线有独立小图，颜色只起辅助标识作用。
 const SERIES_META = [
-  {k:'speed',    label:'速度', v:'--accent'},
-  {k:'rpm',      label:'转速', v:'--bad'},
-  {k:'throttle', label:'油门', v:'--ok'},
-  {k:'brake',    label:'刹车', v:'--warn'},
+  {k:'speed',    label:'速度', unit:'km/h', c:'#0072B2'},
+  {k:'rpm',      label:'转速', unit:'rpm',  c:'#D55E00'},
+  {k:'throttle', label:'油门', unit:'%',    c:'#009E73'},
+  {k:'brake',    label:'刹车', unit:'%',    c:'#CC79A7'},
 ];
 const WINDOWS = [120, 300, 600];        // ≈2/5/10 秒（按 60Hz 采样折算）
 const DEFAULT_PREFS = {
@@ -2534,7 +2823,6 @@ function applyPrefs() {
     d.style.removeProperty('--accent-rgb');
   }
   $('speedUnit').textContent = spdUnit();
-  $('legendSpeed').textContent = '速度 ' + spdUnit();
   GG_MAX = +prefs.ggMax;          // 抓地力图与 G 力球共用同一量程
   renderPrefPanel();
 }
@@ -2567,8 +2855,8 @@ function renderPrefPanel() {
     '<div class="trow"><label><input type="checkbox"' +
     (prefs.chartSeries[s.k] ? ' checked' : '') +
     ' onchange="toggleSeries(\'' + s.k + '\',this.checked)"> ' + s.label +
-    '</label><span style="width:22px;height:3px;border-radius:2px;background:var(' +
-    s.v + ')"></span></div>').join('');
+    '</label><span style="width:22px;height:3px;border-radius:2px;background:' +
+    s.c + '"></span></div>').join('');
   // 面板每次打开都按当前偏好回填控件（手改 localStorage 或导入后也要同步）
   $('densitySel').value = prefs.density;
   $('speedUnitSel').value = prefs.speedUnit;
@@ -2644,7 +2932,13 @@ function render(s) {
   //    如果界面不说明，很容易被误认为「数据卡死」。
   //    这里明确告诉用户当前是什么状态。
   const sb = $('statebadge');
-  if (L.paused) {
+  // 🔴 暂停判定加 1.5s 粘滞：GT7 的 Paused 位（flags bit1）在部分暂停
+  //    场景（暂停菜单切换瞬间 / 回放 / 换镜头）会短暂清零，直接跟随
+  //    就出现「有时显示有时不显示」。见到暂停位就保持 1.5s；
+  //    期间车速起来（真的继续跑了）则立刻解除。
+  if (L.paused) pauseHoldUntil = Date.now() + 1500;
+  const showPaused = Date.now() < pauseHoldUntil && (L.paused || (L.speed_kph || 0) < 1);
+  if (showPaused) {
     sb.className = 'badge pause';
     sb.textContent = '⏸ 游戏已暂停 —— 以下数值是 GT7 暂停时的上报值（速度0/踏板0 属正常）';
     sb.style.display = 'block';
@@ -2664,11 +2958,23 @@ function render(s) {
   $('main').style.display = 'block';
 
   // 转速表
-  const rpm = Math.min(L.rpm, RPM_MAX);
-  const frac = rpm / RPM_MAX;
-  $('rpm').textContent = Math.round(L.rpm);
+  // 🔴 量程必须按车自适应：固定 15000 的后果是「游戏里表满、这里才 2/3」
+  //    （家用车红区 7k 上），电车电机 2 万+ 又会把表撑爆。
+  //    优先用游戏下发的红区 max_alert_rpm；没给就用本场见过的最高转速
+  //    放大 6%；换车（车型名变化）后重新观测。
+  rpmSeenMax = Math.max(rpmSeenMax, L.rpm || 0);
+  if (s.car_name && rpmSeenCar && s.car_name !== rpmSeenCar) rpmSeenMax = 0;
+  rpmSeenCar = s.car_name || rpmSeenCar;
+  const aMin0 = L.min_alert_rpm || 0, aMax0 = L.max_alert_rpm || 0;
+  const baseMax = aMax0 > 0 ? aMax0 * 1.06
+                : (rpmSeenMax > 0 ? rpmSeenMax * 1.06 : RPM_MAX);
+  rpmGaugeMax = niceCeil(Math.max(baseMax, 3000));
+  const rpm = L.rpm || 0;
+  const frac = Math.min(rpm / rpmGaugeMax, 1);
+  $('rpm').textContent = Math.round(rpm);
   $('gear').textContent = (L.gear > 0 ? L.gear : (L.gear === 0 ? 'N' : 'R')) + ' 档';
   $('rpmArc').setAttribute('stroke-dasharray', (frac * 254.5) + ' 339.3');
+  $('gaugeMax').textContent = '表底 ' + Math.round(rpmGaugeMax).toLocaleString('en-US');
 
   // 速度（显示单位由个性化面板决定，内部一律 km/h）
   $('speed').textContent = Math.round(spd(L.speed_kph));
@@ -2725,16 +3031,24 @@ function render(s) {
     Array.from(lamp.children).forEach((el, i) => el.classList.toggle('on', i < lit));
     $('alertRpm').textContent = Math.round(aMin) + '-' + Math.round(aMax);
   } else {
-    // 无换挡数据 → 按 RPM_MAX 兜底（85% 起逐段点亮）
-    const lit = Math.min(7, Math.floor((rpm / RPM_MAX) * 8));
-    lamp.classList.toggle('hot', rpm >= RPM_MAX * 0.95);
+    // 无换挡数据 → 按自适应表底兜底（85% 起逐段点亮）
+    const lit = Math.min(7, Math.floor((rpm / rpmGaugeMax) * 8));
+    lamp.classList.toggle('hot', rpm >= rpmGaugeMax * 0.95);
     Array.from(lamp.children).forEach((el, i) => el.classList.toggle('on', i < lit));
     $('alertRpm').textContent = '-';
   }
   const sg = L.suggested_gear || 0;
-  $('sugGear').textContent = sg > 0 ? sg : '-';
+  // 🔴 协议约定：建议档 15 = 「当前没有建议档」（电车/滑行时恒为 15），
+  //    直接显示「建议档 15」是错的，要显示 '-'。
+  $('sugGear').textContent = (sg > 0 && sg < 15) ? sg : '-';
 
   // —— 引擎健康 ——
+  // 🔴 电车没有机油：油温/油压行必须隐藏，否则给电车显示「油压 0.0 bar
+  //    过低报警」纯属误导。动力类型在下面油量段也会用到，这里先算一次。
+  const isEVPwr = s.powertrain === 'electric';
+  $('engineTitle').textContent = isEVPwr ? '动力系统' : '引擎健康';
+  $('eOilRow').style.display = isEVPwr ? 'none' : '';
+  $('eOilPRow').style.display = isEVPwr ? 'none' : '';
   const water = L.water_temp || 0, oilT = L.oil_temp || 0, oilP = L.oil_pressure || 0;
   const eW = $('eWater'), eO = $('eOil'), eP = $('eOilP');
   eW.textContent = water ? Math.round(water) + ' °C' : '--';
@@ -2884,54 +3198,91 @@ function render(s) {
 
 function drawChart(hist) {
   if (!hist || hist.length < 2) return;
-  const svg = $('chart');
-  const W = 600, H = 110, PAD = 7;
+  const wrap = $('chart'); if (!wrap) return;
   // 窗口长度由个性化面板决定（约 2 / 5 / 10 秒）
   const n = Math.min(hist.length, prefs.chartWindow);
   const data = hist.slice(-n);
-  const step = W / Math.max(1, n - 1);
-  const DH = H - PAD * 2;                    // 可绘制高度（留上下边距）
-  const yOf = (v, s) => PAD + DH * (1 - Math.min(v / s, 1));
+  const T = n / 60;                        // 窗口时长（60Hz 采样）
+
+  // 🔴 分面（small multiples）而不是四条线挤一张图：
+  //    速度 0~300、转速 0~上万、踏板 0~100%，量纲差两个数量级，
+  //    共用一把尺必然有通道「看起来跳到顶」——油门的绿线爬满格
+  //    纯粹是尺度假象。每个通道独立 Y 轴 + 参考网格 + 刻度值。
+  // SVG 尺寸用容器实际像素宽（每 100ms 重画，跟随窗口变化），
+  // 不用 viewBox 拉伸——拉伸会把刻度文字拽变形。
+  const W = Math.max(320, (wrap.clientWidth || 600) | 0);
+  const PADL = 6, PADR = 36;               // 右侧留白放 Y 刻度值
+  const PW = W - PADL - PADR;
+  const FH = 52, XLH = 15;                 // 分面绘图高 / 底部时间轴行高
   const grid = gvar('--cv-grid', 'rgba(128,128,128,.18)');
+  const tcol = gvar('--cv-text', 'rgba(128,128,128,.6)');
+  const x = i => PADL + PW * i / (n - 1);
 
-  let out = '';
-  for (let i = 0; i <= 4; i++) {
-    const y = PAD + DH / 4 * i;
-    out += '<line x1="0" y1="' + y.toFixed(1) + '" x2="' + W + '" y2="' + y.toFixed(1) +
-           '" stroke="' + grid + '" stroke-width="1"/>';
-  }
+  // Y 量程：速度/油门刹车按窗口数据自适应取整；转速直接用表底
+  // （与转速表同一把尺，看曲线就知道离红区多远）。
+  const vUnit = spdUnit();
+  const vStep = vUnit === 'mph' ? 25 : 50;
+  let vWin = 0;
+  for (const f of data) vWin = Math.max(vWin, spd(f.speed_kph || 0));
+  const vMax = Math.max(vStep, Math.ceil(vWin / vStep) * vStep);
+  const rMax = rpmGaugeMax;
 
-  // 🔴 速度轴必须自动缩放
-  // 原先是固定 0~320，跑 350+ 时整条曲线被裁到视口外 → 图表一片空白，
-  // 看起来像「没数据」，实际是画到框外面去了。
-  // 换算成 mph 后数值整体变小，所以先换算再定刻度，步长也跟着单位走。
-  const vRaw = data.map(f => spd(f.speed_kph || 0));
-  const vmax = Math.max(spd(80), ...vRaw);
-  const vStep = spdUnit() === 'mph' ? 25 : 50;
-  const vScale = Math.max(vStep, Math.ceil(vmax / vStep) * vStep);
-
-  const series = [
-    { k: 'speed',    get: f => spd(f.speed_kph || 0), scale: vScale, w: 1.8 },
-    { k: 'rpm',      get: f => f.rpm || 0,            scale: 16000,  w: 1.2 },
-    { k: 'throttle', get: f => (f.throttle || 0) * 100, scale: 100,  w: 1.2 },
-    { k: 'brake',    get: f => (f.brake || 0) * 100,    scale: 100,  w: 1.2 },
+  const facets = [
+    {k:'speed',    get:f => spd(f.speed_kph || 0),    max:vMax, ticks:[0, vMax/2, vMax]},
+    {k:'rpm',      get:f => f.rpm || 0,               max:rMax, ticks:[0, rMax/2, rMax]},
+    {k:'throttle', get:f => (f.throttle || 0) * 100,  max:100,  ticks:[0, 50, 100]},
+    {k:'brake',    get:f => (f.brake || 0) * 100,     max:100,  ticks:[0, 50, 100]},
   ];
+  const shown = facets.filter(fc => prefs.chartSeries[fc.k]);
+  const meta = k => SERIES_META.find(m => m.k === k);
+  const fmtTick = v => v >= 1000 ? (v / 1000) + 'k' : Math.round(v);
 
-  for (const se of series) {
-    if (!prefs.chartSeries[se.k]) continue;      // 面板里关掉的曲线不画
-    const meta = SERIES_META.find(m => m.k === se.k);
-    let d = '';
-    for (let i = 0; i < data.length; i++) {
-      const x = i * step;
-      const y = yOf(se.get(data[i]), se.scale);
-      d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+  let html = '';
+  for (let idx = 0; idx < shown.length; idx++) {
+    const fc = shown[idx], m = meta(fc.k);
+    const isLast = idx === shown.length - 1;
+    const H = FH + (isLast ? XLH : 0);
+    const y = v => 7 + (FH - 14) * (1 - Math.min(Math.max(v / fc.max, 0), 1));
+    let s = '<svg class="chsvg" width="' + W + '" height="' + H +
+            '" viewBox="0 0 ' + W + ' ' + H + '">';
+    // 参考网格 + Y 刻度值（0 实线，其余虚线）
+    for (const tv of fc.ticks) {
+      const gy = y(tv).toFixed(1);
+      s += '<line x1="' + PADL + '" y1="' + gy + '" x2="' + (PADL + PW) +
+           '" y2="' + gy + '" stroke="' + grid + '" stroke-width="1"' +
+           (tv === 0 ? '' : ' stroke-dasharray="3 3"') + '/>';
+      s += '<text class="chaxis" x="' + (PADL + PW + 4) + '" y="' + (+gy + 3) +
+           '" fill="' + tcol + '">' + fmtTick(tv) + '</text>';
     }
-    out += '<path d="' + d + '" fill="none" stroke="' + gvar(meta.v, '#888') +
-           '" stroke-width="' + se.w + '" stroke-linejoin="round"/>';
+    // 通道名（左上角，用本通道颜色，替代原来的图例）
+    s += '<text x="' + (PADL + 2) + '" y="11" font-size="10" font-weight="600" fill="' +
+         m.c + '">' + m.label + ' ' +
+         (m.k === 'speed' ? vUnit : m.unit) + '</text>';
+    // 当前时刻 = 右缘竖虚线
+    s += '<line x1="' + (PADL + PW) + '" y1="7" x2="' + (PADL + PW) +
+         '" y2="' + (FH - 7) + '" stroke="' + m.c + '" stroke-width="1" stroke-dasharray="2 3" opacity=".55"/>';
+    // 数据线
+    let d = '';
+    for (let i = 0; i < n; i++) {
+      d += (i === 0 ? 'M' : 'L') + x(i).toFixed(1) + ',' + y(fc.get(data[i])).toFixed(1);
+    }
+    s += '<path d="' + d + '" fill="none" stroke="' + m.c +
+         '" stroke-width="1.6" stroke-linejoin="round"/>';
+    // 底部分面画 X 轴时间窗（-5s ~ 0s），右端即「现在」
+    if (isLast) {
+      s += '<text class="chaxis" x="' + PADL + '" y="' + (FH + 11) +
+           '" fill="' + tcol + '">-' + T.toFixed(0) + 's</text>';
+      s += '<text class="chaxis" x="' + (PADL + PW / 2) + '" y="' + (FH + 11) +
+           '" text-anchor="middle" fill="' + tcol + '">-' + (T / 2).toFixed(1) + 's</text>';
+      s += '<text class="chaxis" x="' + (PADL + PW) + '" y="' + (FH + 11) +
+           '" text-anchor="end" fill="' + m.c + '">现在 0s</text>';
+    }
+    s += '</svg>';
+    html += s;
   }
-  svg.innerHTML = out;
-  $('range').textContent = '最近 ' + n + ' 帧 / 约 ' + (n / 60).toFixed(1) +
-    ' 秒 · 速度轴 0~' + vScale + ' ' + spdUnit();
+  wrap.innerHTML = html;
+  $('range').textContent = '最近 ' + n + ' 帧 / 约 ' + T.toFixed(1) +
+    ' 秒 · 各通道独立刻度';
 }
 
 // ---------- 圈速格式化 ----------
