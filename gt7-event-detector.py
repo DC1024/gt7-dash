@@ -598,7 +598,10 @@ class EventDetector:
                         #    胎温看哪一侧过热，悬挂看是不是压了路肩/草地
                         #    （一边悬挂被顶起 = 车轮压到路边）。
                         #    tyre_press / tyre_wear 格式 A 恒 0，**不进证据**。
-                        "四轮胎温_C": [round(t) for t in peak.tyre_temp],
+                        # 🔴 胎温保留 1 位小数：四轮差异常常只有零点几度，
+                        #    round 成整数会抹成 [60,60,60,60]，看着又像假数据
+                        #    （而这个事件的判据恰恰就是"四轮不一样"）。
+                        "四轮胎温_C": [round(t, 1) for t in peak.tyre_temp],
                         "四轮悬挂_mm": [round(h * 1000) for h in peak.susp_height],
                     },
                     comment_hint="四轮附着差异过大，可能是单轮压到路肩或草地",
