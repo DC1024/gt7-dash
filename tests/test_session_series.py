@@ -146,3 +146,12 @@ class TestFrameRow:
     def test_throttle_brake_scaled_to_percent(self, dash):
         row = dash._frame_row({"t": 0, "throttle": 0.63, "brake": 0.5}, 0.0)
         assert row[3] == 63 and row[4] == 50
+
+    def test_lap_sentinel_normalised_to_zero(self, dash):
+        """菜单态 lap=0xFFFF 不能在表格/CSV 里漏出来（实测末帧会出现 65535）。"""
+        assert dash._frame_row({"t": 0, "lap": 65535}, 0.0)[9] == 0
+        assert dash._frame_row({"t": 0, "lap": 65000}, 0.0)[9] == 0
+
+    def test_real_lap_numbers_untouched(self, dash):
+        for n in (0, 1, 2, 17, 64999):
+            assert dash._frame_row({"t": 0, "lap": n}, 0.0)[9] == n

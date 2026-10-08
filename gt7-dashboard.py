@@ -656,6 +656,17 @@ def _fuel_pct(f: dict) -> float | None:
     return round((f.get("gas_level") or 0.0) / cap * 100.0, 1)
 
 
+def _lap_no(f: dict) -> int:
+    """帧的圈号。菜单态哨兵值（0xFFFF=65535 等）归 0，避免表格/CSV 里冒出 65535。
+
+    GT7 在菜单、自由练习等场景会把 lap 写成 0xFFFF；gt7analysis.clean_laps 已把
+    这类圈整圈丢弃，但**逐帧**接口是按原始帧输出的，不归一化就会漏出来。
+    统一按 0 处理（0 = 未进入计时圈），与前端「菜单态显示占位」的口径一致。
+    """
+    n = int(f.get("lap") or 0)
+    return 0 if n >= 65000 else n
+
+
 def _frame_row(f: dict, t0: float) -> list:
     """把一帧压成一行（列顺序见 _SERIES_COLS）。"""
     g = f.get("g_force") or [0.0, 0.0, 0.0]
@@ -669,7 +680,7 @@ def _frame_row(f: dict, t0: float) -> list:
         round(g[1] if len(g) > 1 else 0.0, 2),      # 横向 G
         round(g[0] if len(g) > 0 else 0.0, 2),      # 纵向 G（正=加速，负=制动）
         _fuel_pct(f),
-        int(f.get("lap") or 0),
+        _lap_no(f),
     ]
 
 
@@ -1051,7 +1062,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `gear` | 档位 | — |
 | `glat` / `glon` | 横向 / 纵向 G（沿用游戏内 `g_force` 的横向在前定义） | g |
 | `fuel` | 油量百分比；纯电车无此口径时为 `null` | % |
-| `lap` | 圈号 | — |
+| `lap` | 圈号；`0` 表示尚未进入计时圈（菜单态哨兵 `0xFFFF` 也归一为 `0`） | — |
 
 `series` 额外返回 `laps[]`（每圈 `lap` / `t0` / `dur` / `frames`）、
 `total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、

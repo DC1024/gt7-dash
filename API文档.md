@@ -145,7 +145,7 @@
 | `gear` | 档位 | — |
 | `glat` / `glon` | 横向 / 纵向 G（沿用游戏内 `g_force` 的横向在前定义） | g |
 | `fuel` | 油量百分比；纯电车无此口径时为 `null` | % |
-| `lap` | 圈号 | — |
+| `lap` | 圈号；`0` 表示尚未进入计时圈（菜单态哨兵 `0xFFFF` 也归一为 `0`） | — |
 
 `series` 额外返回 `laps[]`（每圈 `lap` / `t0` / `dur` / `frames`）、
 `total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、
