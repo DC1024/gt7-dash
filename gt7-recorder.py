@@ -928,6 +928,9 @@ class Recorder:
         # 想显示每圈列表就得自己攒：lastLapTime 值变化 = 刚跑完一圈。
         self.lap_times: list[list] = []      # [[第几圈, 毫秒], ...]
         self._last_lap_ms_seen = 0           # 去重：同一圈会连续上报几百帧
+        # 本圈起点的墙上时刻。冲线那一帧更新；初值 = 场次起点。
+        # 仪表盘用它算「本圈已用时」，否则只能给「场次已用时」。
+        self._lap_started_at: float = 0.0
         # 上一帧的圈数（用于检测「圈数重置 = 新比赛」）
         self._prev_lap = -1
         # 本容器本次启动已记录的场次数
@@ -1329,6 +1332,9 @@ class Recorder:
             self._last_lap_ms_seen = sample.last_lap_ms
             self._fuel_mark = sample.gas_level   # 圈首油量从本场第一帧记起
             self._prev_lap = -1
+            # 本圈起点的墙上时刻（见 _write_status 里的 lap_started_at）。
+            # 场次开始时先按场次起点算，第一次冲线后自动切成真正的圈起点。
+            self._lap_started_at = now
             # 发车位快照：此刻（刚从静止开始动）quali_pos 还是排位表，
             # 一旦比赛跑起来它就变成当前名次了。中途启动录制拿到的
             # 是当时名次（尽力而为，无法回溯真实排位）。
@@ -1372,6 +1378,12 @@ class Recorder:
                     self.lap_fuel = self.lap_fuel[-60:]
             self._fuel_mark = sample.gas_level
             self._last_lap_ms_seen = sample.last_lap_ms
+            # 🔴 冲线 = 新圈的起点。记下来，仪表盘才能算出**真正的**本圈用时。
+            #    在此之前仪表盘用的是「场次已用时」（latest.t - session_start），
+            #    那个不随圈重置 —— 主界面那个圈速大计时器其实一直在从场次
+            #    开始往上加，跑第 3 圈时显示的是 3 圈的累计时间。
+            #    这个时刻是精确的：last_lap_ms 变化的那一帧就是冲线那一帧。
+            self._lap_started_at = now
             self.lap_times.append([len(self.lap_times) + 1, sample.last_lap_ms])
             if len(self.lap_times) > 60:      # 防止超长耐力赛撑爆状态文件
                 self.lap_times = self.lap_times[-60:]
@@ -1509,6 +1521,8 @@ class Recorder:
                 "frame": sample.to_json(),
                 "frames_total": self.session.sample_count,
                 "session_start": self.session.started_at,
+                # 本圈起点（墙上时刻）。仪表盘 lap_time = frame.t - 这个值。
+                "lap_started_at": self._lap_started_at,
                 # 本场发车位（开跑瞬间快照；0=未捕获）
                 "grid_start": self._grid_start,
                 # 被跳过的重复帧（游戏暂停时 PS5 会 60Hz 重复发同一帧）

@@ -115,6 +115,9 @@ class TelemetryHub:
         self._max_energy_recovery: float = 0.0
         self._status_path = status_path
         self._last_mtime = 0.0
+        # 本圈起点（墙上时刻）。由接收器写在状态文件里，冲线时更新。
+        # 0 = 老记录器没给 → 退回「场次起点」口径并如实标注。
+        self._lap_started_at: float = 0.0
 
     def refresh(self) -> None:
         """
@@ -162,6 +165,9 @@ class TelemetryHub:
                     self._buffer.extend(history)
                 self._latest = frame
                 self._session_start = payload.get("session_start", 0.0)
+                # 缺失时置 0（不是沿用上一场！换场后沿用会算出上一圈的角度）
+                self._lap_started_at = float(
+                    payload.get("lap_started_at") or 0.0)
                 self._total_frames = payload.get("frames_total", self._total_frames)
                 self._layouts = payload.get("layouts", {})
                 self._warning = payload.get("warning")
@@ -220,7 +226,16 @@ class TelemetryHub:
             if latest is not None:
                 _normalize_u16_frame(latest)
             lap_time = 0.0
-            if latest and self._session_start:
+            if latest and self._lap_started_at:
+                # 🔴 本圈已用时 = 当前帧时刻 − **本圈起点**。
+                #    早先这里减的是 session_start，于是主界面那个圈速大计时器
+                #    显示的其实是「场次已用时」：跑第 3 圈时它显示的是三圈的
+                #    累计时间，冲线也不归零。v1 的 current_lap_time_s 文档写的是
+                #    「本圈已用时」，也对不上。
+                lap_time = max(0.0, latest["t"] - self._lap_started_at)
+            elif latest and self._session_start:
+                # 兜底：老记录器不写 lap_started_at。绝不静默给错数——
+                # 用 lap_time_source 标出来，消费方自己决定信不信。
                 lap_time = max(0.0, latest["t"] - self._session_start)
 
             return {
@@ -242,6 +257,8 @@ class TelemetryHub:
                 if self._session_start
                 else 0,
                 "lap_time": round(lap_time, 3),
+                "lap_time_source": ("lap" if self._lap_started_at
+                                    else "session"),
                 "latest": latest,
                 "history": frames,
                 "server_time": time.time(),
@@ -1712,7 +1729,14 @@ def session_profile(path: Path, lap_no: int | None = None,
        对齐，实际赛道上能差十几米 —— 实时刹车点预告会直接指错位置。
        两种口径都返回（length_m / length_by_speed_m），差值当诊断指标。
 
-    `lap` 缺省 = 最快圈（与 /raceline 同一约定）。
+    🔴 **正在跑的那一圈不能当参考圈。** 一场正在录制的比赛里，圈号最大的那一圈
+       还在跑：它时长更短（所以 clean_laps 的速度积分口径下反而"最快"）、
+       坐标折线只覆盖半条赛道。拿它做参考，实时最近点定位会大面积失配 ——
+       实测横向误差飙到 300 m（≈车在 5 秒里跑过的距离），
+       而错误表现是"偶尔算错"而不是"报错"，极难查。
+       所以录制进行中时，把最大圈号排除在外。
+
+    `lap` 缺省 = 最快圈（与 /raceline 同一约定），但只在**已跑完**的圈里挑。
     """
     try:
         laps, grouped, _t0 = _valid_laps(path)
@@ -1720,15 +1744,44 @@ def session_profile(path: Path, lap_no: int | None = None,
         return {"error": str(e)}
     if not grouped:
         return {"error": "没有可用的圈数据"}
-    if lap_no is None:
-        lap_no = (analyze_session(path).get("best_lap") or {}).get("lap")
-    if not lap_no or int(lap_no) not in grouped:
-        return {"error": f"第 {lap_no} 圈没有可用数据",
-                "available_laps": sorted(grouped.keys())}
 
     _, store = _load_frames(path)
     if not store:
         return {"error": "帧加载失败"}
+
+    # 录制进行中 → 排除「正在跑的那一圈」。
+    # 🔴 判据必须取**原始帧里的最大圈号**，不能用 clean_laps 过滤后的最大圈号：
+    #    半圈常常已经被 clean_laps 当假圈剔掉了，那时 filtered 的最大圈号是一个
+    #    **跑完了的**合法圈 —— 拿它去排除等于白白丢掉一份好参考
+    #    （实测：一圈完整的第 2 圈被误排除，参考圈退回到第 1 圈）。
+    recording = _recording_active(path.parent)
+    usable = sorted(grouped.keys())
+    if recording:
+        raw_max = store.memo_compute(
+            "raw_max_lap",
+            lambda: max((f.get("lap") or 0) for f in store.lap_frames()))
+        trimmed = [n for n in usable if n != raw_max]
+        # 不能把唯一的一圈也排掉，否则永远没有参考圈可用
+        usable = trimmed or usable
+
+    if lap_no is not None and int(lap_no) not in usable:
+        want = int(lap_no)
+        # 两种拒绝理由要分清：正在跑 vs 根本没有这一圈。
+        # 混成一句话会让消费方无从下手（"重试"还是"别重试"）。
+        in_progress = recording and (
+            want not in grouped or want >= max(grouped, default=0))
+        why = "lap_in_progress" if in_progress else "no_data"
+        return {"error": f"第 {lap_no} 圈不可作为参考（{why}）",
+                "why": why, "recording": recording,
+                "available_laps": usable}
+
+    if lap_no is None:
+        if not usable:
+            return {"error": "还没有跑完一整圈，暂无参考圈", "why": "no_lap",
+                    "recording": recording, "available_laps": []}
+        best = (analyze_session(path).get("best_lap") or {}).get("lap")
+        lap_no = best if best in usable else usable[-1]
+
     key = ("profile", int(lap_no), round(float(step_m), 2),
            round(float(prominence_kph), 2))
 
@@ -1742,7 +1795,8 @@ def session_profile(path: Path, lap_no: int | None = None,
         #    「命中缓存」这件事就变得测不出来（内容相等但对象不同）。
         out: dict[str, Any] = {
             "meta": {"api_version": 1, "file": path.name,
-                     "available_laps": sorted(grouped.keys()),
+                     "available_laps": usable,
+                     "recording": recording,
                      "laps": laps},
         }
         out.update(prof)
@@ -2583,6 +2637,11 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
             "best_lap_ms": L.get("best_lap_ms"),
             "last_lap_ms": L.get("last_lap_ms"),
             "current_lap_time_s": snap.get("lap_time", 0.0),
+            # 口径来源：lap = 真的本圈用时（接收器给了圈起点）；
+            #           session = 兜底，退化成**场次**已用时（老接收器没写
+            #           lap_started_at）。消费方据此决定信不信 ——
+            #           给一个看起来正常的错数字比报错难查一百倍。
+            "current_lap_time_source": snap.get("lap_time_source", "session"),
         },
         "track": {"path": snap.get("path", []),
                   "gg_samples": snap.get("gg", [])},
@@ -2706,7 +2765,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `current_lap` | int | 当前圈号 |
 | `laps_in_race` | int | 本局总圈数 |
 | `best_lap_ms` / `last_lap_ms` | 毫秒 | 最快圈 / 上一圈（null = 还没跑完） |
-| `current_lap_time_s` | 秒 | 本圈已用时 |
+| `current_lap_time_s` | 秒 | **本圈**已用时（从冲线起算，冲线归零） |
+| `current_lap_time_source` | str | `lap` = 真本圈用时；`session` = 兜底口径（退化成场次已用时）。只在老接收器没写 `lap_started_at` 时出现 `session` |
 
 ### `track`
 | 字段 | 说明 |
@@ -3094,7 +3154,19 @@ t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这�
 峰谷显著度阈值）。点太多（>3000）会自动放大步长，实际值回填在 `step_m`。
 
 圈长不足 200 m、或帧数不足 20、或该圈不在有效圈里时返回 `{"error": ...}`
-（圈不在时会额外给 `available_laps`），**不返回半成品关键点**。
+（额外给 `why` 与 `available_laps`），**不返回半成品关键点**。
+
+### 🔴 正在跑的那一圈不能当参考圈
+
+一场正在录制的比赛里，圈号最大的那一圈还在跑：它时长更短（在 `clean_laps`
+的速度积分口径下反而"最快"）、坐标折线只覆盖半条赛道。拿它当参考，实时最近点
+定位会大面积失配 —— 实测横向误差飙到 **300 m**（≈ 车在 5 秒里跑过的距离），
+而表现形式是"偶尔算错"而不是报错。
+
+所以录制进行中时，本接口会排除**原始帧里圈号最大的那一圈**（判据取原始帧的
+最大圈号，不是 `clean_laps` 过滤后的 —— 半圈常已被当假圈剔掉，那时取过滤后的
+最大值会误伤一个跑完了的合法圈）。`meta.recording` 会说明当前是否录制中，
+`why` 为 `lap_in_progress` 时表示请求的正是那一圈，`no_lap` 表示一圈都还没跑完。
 
 ## 使用示例
 

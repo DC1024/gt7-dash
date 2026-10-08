@@ -150,3 +150,86 @@ class TestRouteWiring:
     def test_session_list_exposes_live_flag(self, src):
         """消费方靠 `live` 挑当前那场；没有它只能靠 modified 猜，猜错是静默错。"""
         assert '"live": bool(live and (now - stat.st_mtime) < 20.0),' in src
+
+
+class TestInProgressLapExcluded:
+    """正在跑的那一圈不能当参考圈。
+
+    这是**实机集成时抓到的真 bug**：Coach 首次接入一场正在录制的比赛时，
+    圈号最大的那一圈还在跑 —— 时长更短（在 clean_laps 的速度积分口径下
+    反而算"最快"）、坐标折线只覆盖半条赛道。拿它做参考，实时最近点定位
+    大面积失配（实测横向误差飙到 300 m ≈ 车在 5 秒里跑过的距离），
+    而表现形式是"偶尔算错"而不是报错 —— 这种最难查。
+    """
+
+    @staticmethod
+    def _write(path: Path, laps: int, partial_last: float = 0.0) -> Path:
+        """laps 圈完整数据；partial_last > 0 时再追加一圈的部分帧。"""
+        lines = [json.dumps({"session_id": path.stem, "circuit": "test",
+                             "car": 1302, "powertrain": "fuel",
+                             "has_coords": True}, ensure_ascii=False)]
+        for lap in range(1, laps + 1):
+            for f in synth_lap(radius_m=600.0, lap=lap):
+                lines.append(json.dumps(f, ensure_ascii=False))
+        if partial_last > 0:
+            frames = synth_lap(radius_m=600.0, lap=laps + 1)
+            for f in frames[:int(len(frames) * partial_last)]:
+                lines.append(json.dumps(f, ensure_ascii=False))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _mark_recording(history_dir: Path, on: bool = True) -> None:
+        import time as _t
+        (history_dir / "status.json").write_text(json.dumps({
+            "t": _t.time() if on else 0.0, "recording": on,
+            "frame": {"t": 0.0},
+        }), encoding="utf-8")
+
+    def test_partial_lap_would_win_without_the_guard(self, dash, tmp_path):
+        """先证明这个坑真的存在：不排除进行中的圈时，它会当选。
+
+        没有这条断言，将来有人删掉排除逻辑，测试也照样绿 —— 那就白测了。
+        """
+        sess = self._write(tmp_path / "s.jsonl", laps=1, partial_last=0.35)
+        d = dash.session_profile(sess, lap_no=None)
+        assert "error" not in d, d
+        # 半圈被当成"最快圈"，圈长明显短于整圈
+        assert d["lap"] == 2, d
+        assert d["length_m"] < 2 * 3.14159 * 600 * 0.6
+
+    def test_recording_excludes_in_progress_lap(self, dash, tmp_path):
+        sess = self._write(tmp_path / "s.jsonl", laps=2, partial_last=0.35)
+        self._mark_recording(tmp_path, True)
+        d = dash.session_profile(sess, lap_no=None)
+        assert "error" not in d, d
+        assert d["meta"]["recording"] is True
+        assert d["meta"]["available_laps"] == [1, 2]
+        assert d["lap"] == 1, d
+        # 整圈：圈长应当接近 2πR
+        assert d["length_m"] == pytest.approx(2 * 3.14159 * 600, rel=0.02)
+
+    def test_explicit_in_progress_lap_is_rejected(self, dash, tmp_path):
+        sess = self._write(tmp_path / "s.jsonl", laps=2, partial_last=0.35)
+        self._mark_recording(tmp_path, True)
+        d = dash.session_profile(sess, lap_no=3)
+        assert "error" in d
+        assert d["why"] == "lap_in_progress"
+        assert d["available_laps"] == [1, 2]
+
+    def test_not_recording_keeps_all_laps(self, dash, tmp_path):
+        """录制已结束 → 最后一圈也是跑完的，不能一刀切掉。"""
+        sess = self._write(tmp_path / "s.jsonl", laps=2)
+        self._mark_recording(tmp_path, False)
+        d = dash.session_profile(sess, lap_no=2)
+        assert "error" not in d, d
+        assert d["meta"]["recording"] is False
+        assert d["lap"] == 2
+
+    def test_single_lap_still_usable_while_recording(self, dash, tmp_path):
+        """只有一圈时不能把唯一的一圈也排掉 —— 那样永远没有参考圈。"""
+        sess = self._write(tmp_path / "s.jsonl", laps=0, partial_last=1.0)
+        self._mark_recording(tmp_path, True)
+        d = dash.session_profile(sess, lap_no=None)
+        assert "error" not in d, d
+        assert d["meta"]["available_laps"] == [1]

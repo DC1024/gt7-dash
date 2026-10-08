@@ -162,3 +162,79 @@ class TestLapTimes:
         r._check_off_track(t + 25)
         feed(r, dec, drive_frames(120, t + 26))
         assert len(r.lap_times) <= 2, "新场次的圈速应重新攒"
+
+
+class TestLapStartedAt:
+    """圈起点时刻 —— 「本圈已用时」的唯一可靠来源。
+
+    坑：仪表盘原先用 `frame.t - session_start` 算「本圈已用时」，那其实是
+    **场次已用时**，不随圈重置 —— 主界面那个圈速大计时器跑第 3 圈时显示的
+    是三圈的累计时间，冲线也不归零。接收器是唯一知道「冲线发生在哪一帧」
+    的地方（last_lap_ms 变化的那帧就是），所以由它把这个时刻写进状态文件。
+    """
+
+    def test_set_at_session_start(self, rec, dec, make_recorder):
+        r = make_recorder(status_file=None)
+        t = time.time()
+        feed(r, dec, [(build_packet(True, 40.0, 100, 50, lap=1, last_lap=95000),
+                       t + i / 60) for i in range(30)])
+        assert r._lap_started_at > 0, "场次开始就该有圈起点（兜底 = 场次起点）"
+
+    def test_advances_on_lap_crossing(self, rec, dec, make_recorder):
+        r = make_recorder(status_file=None)
+        t = time.time()
+        # drive_frames 每 120 帧换一次 last_lap → 即冲线
+        feed(r, dec, drive_frames(400, t0=t))
+        first = r._lap_started_at
+        assert len(r.lap_times) >= 2, r.lap_times
+        assert first > t, "冲线后圈起点应当被推进到场次开始之后"
+
+    def test_written_into_status_file(self, rec, dec, make_recorder, tmp_path):
+        import json
+        sf = tmp_path / "status.json"
+        r = make_recorder(status_file=str(sf))
+        t = time.time()
+        feed(r, dec, drive_frames(400, t0=t))
+        payload = json.loads(sf.read_text(encoding="utf-8"))
+        assert "lap_started_at" in payload, "状态文件必须带上圈起点"
+        assert payload["lap_started_at"] == r._lap_started_at
+        # 关键语义：lap_started_at 必须晚于 session_start（否则等于没做这件事）
+        assert payload["lap_started_at"] > payload["session_start"]
+
+
+class TestLapStartedAt:
+    """圈起点时刻 —— 「本圈已用时」的唯一可靠来源。
+
+    坑：仪表盘原先用 `frame.t - session_start` 算「本圈已用时」，那其实是
+    **场次已用时**，不随圈重置 —— 主界面那个圈速大计时器跑第 3 圈时显示的
+    是三圈的累计时间，冲线也不归零。接收器是唯一知道「冲线发生在哪一帧」
+    的地方（last_lap_ms 变化的那帧就是），所以由它把这个时刻写进状态文件。
+    """
+
+    def test_set_at_session_start(self, rec, dec, make_recorder):
+        r = make_recorder(status_file=None)
+        t = time.time()
+        feed(r, dec, [(build_packet(True, 40.0, 100, 50, lap=1, last_lap=95000),
+                       t + i / 60) for i in range(30)])
+        assert r._lap_started_at > 0, "场次开始就该有圈起点（兜底 = 场次起点）"
+
+    def test_advances_on_lap_crossing(self, rec, dec, make_recorder):
+        r = make_recorder(status_file=None)
+        t = time.time()
+        # drive_frames 每 120 帧换一次 last_lap → 即冲线
+        feed(r, dec, drive_frames(400, t0=t))
+        first = r._lap_started_at
+        assert len(r.lap_times) >= 2, r.lap_times
+        assert first > t, "冲线后圈起点应当被推进到场次开始之后"
+
+    def test_written_into_status_file(self, rec, dec, make_recorder, tmp_path):
+        import json
+        sf = tmp_path / "status.json"
+        r = make_recorder(status_file=str(sf))
+        t = time.time()
+        feed(r, dec, drive_frames(400, t0=t))
+        payload = json.loads(sf.read_text(encoding="utf-8"))
+        assert "lap_started_at" in payload, "状态文件必须带上圈起点"
+        assert payload["lap_started_at"] == r._lap_started_at
+        # 关键语义：lap_started_at 必须晚于 session_start（否则等于没做这件事）
+        assert payload["lap_started_at"] > payload["session_start"]
