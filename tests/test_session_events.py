@@ -223,3 +223,101 @@ def test_highlights_params(dash, tmp_path):
     assert len(top1) == 1
     none_ = dash.session_highlights(f, top=0, min_score=999.0)["clips"]
     assert none_ == []
+
+
+def test_spin_direction_comes_from_curvature_not_fake_steer(dash, tmp_path):
+    """方向必须是算出来的，不是恒 0 的假转向角。
+
+    横向 G 为正 = 左转（两场真实数据用「外侧轮角速度更高」独立验证过），
+    合成帧 lat_g=1.3 → 方向「左」，过弯半径 = v²/(a_lat) 量级。
+    """
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames(spin_at=(720, 750)))
+    e = [x for x in dash.session_events(f)["events"] if x["type"] == "spin"][0]
+    assert e["evidence"]["方向"] == "左"          # lat_g > 0
+    r = e["evidence"]["过弯半径_m"]
+    # κ = 1.3×9.80665 / 27.78² ≈ 0.0165 → R ≈ 60m（允许合成数据的粗粒度）
+    assert isinstance(r, int) and 30 <= r <= 120
+    # 🔴 假数据守门：证据里不许再出现恒 0 的「转向角」
+    assert "转向角" not in e["evidence"]
+
+
+def test_video_anchor_maps_clips_into_video_timeline(dash, tmp_path):
+    """绑了录像 → /highlights 每段多给录像时间轴；没绑 → 是 null。
+
+    口径：t_video = t_session − offset_s（offset_s 为负 = 录像比遥测早开始）。
+    """
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames(spin_at=(720, 750), offtrack_at=(600, 700)))
+
+    # 未绑定：clip_start_video 必须是 null，不能是 0（0 会被当成真值）
+    bare = dash.session_highlights(f, top=3, history_dir=tmp_path)
+    assert bare["video"]["bound"] is False
+    assert all(c["clip_start_video"] is None for c in bare["clips"])
+
+    # 绑定：录像比遥测早开始 18 秒 → offset_s = −18 → 录像时间 = 遥测 + 18
+    meta = {f.name: {"video": {"file": "E:/cap/race1.mp4", "offset_s": -18.0,
+                               "source": "manual"}}}
+    (tmp_path / "sessions_meta.json").write_text(
+        __import__("json").dumps(meta), encoding="utf-8")
+
+    info = dash.video_session_info(tmp_path, f)
+    assert info["bound"] is True and info["video_lead_s"] == 18.0
+    assert info["video_start_epoch"] == pytest.approx(
+        info["session_start"] - 18.0, abs=1e-6)
+
+    hl = dash.session_highlights(f, top=3, history_dir=tmp_path)
+    assert hl["video"]["bound"] is True
+    assert hl["ffmpeg_hint"].count("race1.mp4") == 1
+    for c in hl["clips"]:
+        assert c["clip_start_video"] == pytest.approx(c["clip_start"] + 18.0, abs=1e-6)
+        assert c["clip_end_video"] == pytest.approx(c["clip_end"] + 18.0, abs=1e-6)
+
+
+def test_spin_direction_comes_from_curvature_not_fake_steer(dash, tmp_path):
+    """方向必须是算出来的，不是恒 0 的假转向角。
+
+    横向 G 为正 = 左转（两场真实数据用「外侧轮角速度更高」独立验证过），
+    合成帧 lat_g=1.3 → 方向「左」，过弯半径 = v²/(a_lat) 量级。
+    """
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames(spin_at=(720, 750)))
+    e = [x for x in dash.session_events(f)["events"] if x["type"] == "spin"][0]
+    assert e["evidence"]["方向"] == "左"          # lat_g > 0
+    r = e["evidence"]["过弯半径_m"]
+    # κ = 1.3×9.80665 / 27.78² ≈ 0.0165 → R ≈ 60m（允许合成数据的粗粒度）
+    assert isinstance(r, int) and 30 <= r <= 120
+    # 🔴 假数据守门：证据里不许再出现恒 0 的「转向角」
+    assert "转向角" not in e["evidence"]
+
+
+def test_video_anchor_maps_clips_into_video_timeline(dash, tmp_path):
+    """绑了录像 → /highlights 每段多给录像时间轴；没绑 → 是 null。
+
+    口径：t_video = t_session − offset_s（offset_s 为负 = 录像比遥测早开始）。
+    """
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames(spin_at=(720, 750), offtrack_at=(600, 700)))
+
+    # 未绑定：clip_start_video 必须是 null，不能是 0（0 会被当成真值）
+    bare = dash.session_highlights(f, top=3, history_dir=tmp_path)
+    assert bare["video"]["bound"] is False
+    assert all(c["clip_start_video"] is None for c in bare["clips"])
+
+    # 绑定：录像比遥测早开始 18 秒 → offset_s = −18 → 录像时间 = 遥测 + 18
+    meta = {f.name: {"video": {"file": "E:/cap/race1.mp4", "offset_s": -18.0,
+                               "source": "manual"}}}
+    (tmp_path / "sessions_meta.json").write_text(
+        __import__("json").dumps(meta), encoding="utf-8")
+
+    info = dash.video_session_info(tmp_path, f)
+    assert info["bound"] is True and info["video_lead_s"] == 18.0
+    assert info["video_start_epoch"] == pytest.approx(
+        info["session_start"] - 18.0, abs=1e-6)
+
+    hl = dash.session_highlights(f, top=3, history_dir=tmp_path)
+    assert hl["video"]["bound"] is True
+    assert hl["ffmpeg_hint"].count("race1.mp4") == 1
+    for c in hl["clips"]:
+        assert c["clip_start_video"] == pytest.approx(c["clip_start"] + 18.0, abs=1e-6)
+        assert c["clip_end_video"] == pytest.approx(c["clip_end"] + 18.0, abs=1e-6)

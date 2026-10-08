@@ -145,6 +145,8 @@
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
 | `GET /api/v1/sessions/<文件名>/highlights?top=10&pad_before=2&pad_after=1.5&min_score=0&types=&lap=` | **集锦剪辑时间轴**：事件按 `置信度×类型权重` 排序，每段给出可直接喂 ffmpeg 的 `clip_start` / `duration`（含前后留白）。`top=0` = 不限；`types` 逗号分隔过滤 |
+| `GET /api/v1/sessions/<文件名>/video` | **录像↔遥测锚点**：读取当前绑定（文件 / `offset_s` / 换算好的起止时刻） |
+| `POST /api/v1/sessions/<文件名>/video` | **绑定录像**：body 给 `{file, offset_s}` 或 `{file, video_lead_s}` 或 `{file, video_start_iso}` 或 `{file, video_start_epoch}` 或 `{file, probe:true}`；`{clear:true}` 解绑 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 | `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
 
@@ -367,8 +369,13 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
   🔴 胎温**必须保留小数**：四轮差异常常只有零点几度，取整会抹成
   `[60,60,60,60]`，而这个事件的判据恰恰就是「四轮不一样」。
 - 🔴 `tyre_press` / `tyre_wear` 在格式 A 下**恒为 0**（GT7 不广播），
-  因此既不存也不进证据——免得解说词里出现假数字。`spin` 的 `方向`
-  （转向角）协议里没有，同样是 0。
+  因此既不存也不进证据——免得解说词里出现假数字。
+- 🔴 **协议里没有方向盘角度**（2026-10-09 探针结论）。`spin` / `off_track`
+  证据里的 `方向`（左 / 右）和 `过弯半径_m` 是用**曲率**换算的，不是协议字段：
+  `κ = 横向G × 9.80665 / v²`，与轨迹几何曲率相关 0.986（误差中位 0.0004 1/m），
+  符号用「外侧轮角速度更高」独立验证过（横向 G 为正 = 左转）。
+  想复核 / 找真字段：`python tools/probe_fields.py --selftest`（自证工具）
+  然后开车时 `--ps5 <IP> --seconds 25` 跑一次。
 
 ## 集锦高光（剪辑时间轴）
 
@@ -386,6 +393,45 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 
 - 🔴 切片窗口**必须带留白**：从事件正中间开始切，观众看不到"怎么发生的"。
 - 事件只有 `t_rel`（相对圈起点），`/highlights` 负责把它还原成整场时间轴。
+
+## 录像对齐（录像 ↔ 遥测 时间轴锚点）
+
+录像和遥测是**两条独立的时间轴**，中间差一个只有玩家知道的常数（什么时候按的录制）。
+不把这个常数存下来，`/highlights` 给的秒数就没法直接喂 ffmpeg —— 所以它是剪辑 / 配音的
+前置条件。
+
+🔴 **口径（三行一起看，弄反一个整段剪辑就错位）**
+
+```
+t_session = 相对「本场第一个有效圈起点」的秒数   ← /highlights 给的就是它
+offset_s  = 录像开始时刻 − session_start          ← 负数 = 录像比遥测早开始
+t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这个
+```
+
+例：开跑前 18 秒就按了录制 → `offset_s = −18` → 遥测第 30s 对应录像第 48s。
+怕正负号搞反就用 `video_lead_s`（= −`offset_s`，"录像早开始 18 秒"填 18）。
+
+| 字段 | 说明 |
+|---|---|
+| `bound` | 是否已绑定 |
+| `file` | 录像文件路径（只是记下来，服务端不打开它） |
+| `offset_s` / `video_lead_s` | 偏移 / 反向的直觉读法 |
+| `session_start` / `session_start_iso` | 遥测时间轴零点（本地时区） |
+| `video_start_epoch` / `video_start_iso` | 换算出的录像开始时刻 |
+| `source` | `manual` / `ffprobe` / `mtime`——怎么定出来的 |
+
+绑定后 `/highlights` 会多给一份录像时间轴：
+
+- `video`：上面的绑定信息
+- `clips[].clip_start_video` / `clip_end_video`：这段高光在**录像**里的秒数
+- `ffmpeg_hint` 会换成带真实文件名的版本
+
+存哪儿：`data/sessions_meta.json`（边车，与收藏 / 改名同一先例 —— jsonl 是不可变原始数据）。
+
+🔴 **自动探测的坑**：`{"probe": true}` 只在录像文件**就在跑 dashboard 的这台机器上**时有效
+（Docker 部署时看不到你电脑的文件）。有 `ffprobe` 会用 `mtime − duration` 反推开始时刻；
+没有就只能用 mtime，而**多数录制软件（OBS / PS5 相册 / 采集卡）的 mtime 是"录完"的时刻**，
+会偏晚整整一段录像的时长 —— 这种情况响应里会带 `warning`，别当准确值用。
 
 ## 进站与名次
 

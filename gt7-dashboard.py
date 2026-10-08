@@ -49,6 +49,7 @@ import math
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -874,6 +875,107 @@ def load_session_meta(history_dir: Path) -> dict[str, Any]:
 def save_session_meta(history_dir: Path, meta: dict[str, Any]) -> None:
     fp = history_dir / "sessions_meta.json"
     fp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 录像 ↔ 遥测 时间轴锚点（POV 解说 / 自动剪辑的前置条件）
+# ---------------------------------------------------------------------------
+# jsonl 是不可变原始数据，录像绑定只能写边车（与收藏/改名同一先例）。
+#
+# 🔴 时间轴口径——三行必须一起看，弄反一个整段剪辑就错位：
+#     t_session = 相对「本场第一个有效圈起点」的秒数（/highlights 给的就是它）
+#     offset_s  = 录像开始时刻 − session_start（负数 = 录像比遥测早开始）
+#     t_video   = t_session − offset_s
+#   例：开跑前 18 秒就按了录制 → offset_s = −18 → 遥测第 30s 对应录像第 48s。
+#   前端同时提供「录像比遥测早开始 N 秒」= −offset_s，免得用户心算正负号。
+
+
+def lap_start_times(path: Path) -> dict[int, float]:
+    """每圈首帧的墙上时钟（epoch 秒）。没有有效圈 → 空字典。"""
+    try:
+        _laps, grouped, _extra = _valid_laps(path)
+    except Exception:
+        return {}
+    out: dict[int, float] = {}
+    for ln, fs in grouped.items():
+        if fs:
+            t0 = fs[0].get("t")
+            if t0:
+                out[int(ln)] = float(t0)
+    return out
+
+
+def session_start_epoch(path: Path) -> float | None:
+    """场次时间轴的零点 = 第一个有效圈的起点。None = 这场没有有效圈。"""
+    m = lap_start_times(path)
+    return min(m.values()) if m else None
+
+
+def _video_entry(history_dir: Path, name: str) -> dict[str, Any]:
+    canon = session_stem(name) + ".jsonl"
+    return (load_session_meta(history_dir).get(canon) or {}).get("video") or {}
+
+
+def probe_video_start(file: str) -> dict[str, Any]:
+    """猜录像的开始时刻。
+
+    🔴 mtime 陷阱：多数录制软件（OBS / PS5 相册 / 采集卡）的**文件修改时间
+    是录完的时刻**，不是开始的时刻。所以优先用 ffprobe 拿时长反推：
+        start = mtime − duration
+    拿不到 ffprobe 就退回 mtime，并明确标注「偏晚整段时长」，不假装准确。
+    """
+    p = Path(file)
+    if not p.exists():
+        return {"ok": False,
+                "reason": "文件不存在（dashboard 跑在服务器上时看不到你电脑里的文件，"
+                          "属正常；请手动填开始时间或偏移）"}
+    mtime = p.stat().st_mtime
+    dur = None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(p)],
+            capture_output=True, timeout=15, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            dur = float(r.stdout.strip().splitlines()[0])
+    except Exception:
+        dur = None
+    if dur and dur > 0:
+        return {"ok": True, "start_epoch": mtime - dur, "source": "ffprobe",
+                "duration_s": round(dur, 2), "mtime": mtime}
+    return {"ok": True, "start_epoch": mtime, "source": "mtime",
+            "warning": "没有 ffprobe，只能用文件修改时间；而多数录制软件的"
+                       "修改时间是「录完」的时刻，会偏晚整段录像的时长"}
+
+
+def video_session_info(history_dir: Path, path: Path) -> dict[str, Any]:
+    """场次的录像绑定状态 + 换算好的锚点。"""
+    start = session_start_epoch(path)
+    iso = datetime.fromtimestamp(start).isoformat() if start else None
+    b = _video_entry(history_dir, path.name)
+    if not b.get("file"):
+        return {"bound": False, "file": None, "offset_s": None,
+                "session_start": round(start, 3) if start else None,
+                "session_start_iso": iso,
+                "formula": "t_video = t_session - offset_s",
+                "hint": "未绑定录像。绑定后 /highlights 会额外给出每段高光"
+                        "在录像里的秒数，ffmpeg 可直接切。"}
+    off = float(b.get("offset_s") or 0.0)
+    vs = (start + off) if start else None
+    return {
+        "bound": True,
+        "file": b.get("file"),
+        "offset_s": round(off, 3),
+        # 「录像比遥测早开始多少秒」= −offset_s，正数是更直觉的读法
+        "video_lead_s": round(-off, 3),
+        "session_start": round(start, 3) if start else None,
+        "session_start_iso": iso,
+        "video_start_epoch": round(vs, 3) if vs else None,
+        "video_start_iso": datetime.fromtimestamp(vs).isoformat() if vs else None,
+        "source": b.get("source") or "manual",
+        "bound_at": b.get("bound_at"),
+        "formula": "t_video = t_session - offset_s",
+    }
 
 
 # 赛道库 data/tracks.json —— 赛道自动识别的持久化边车文件（jsonl 不可变，
@@ -1866,6 +1968,15 @@ def _frame_to_sample(det, f, i: int):
        steer_angle 协议里没有、tyre_press / tyre_wear 实测恒 0，三者都不读
        （留给 Sample 的默认值 0，避免把假数字带进解说词）。
     """
+    # 转弯曲率 κ = a_lat / v²（正 = 左转）。
+    # 这是**算出来的**不是协议字段：GT7 格式 A 不广播转向角，而事件的
+    # 「往哪拐 / 拐多急」没有它会变成恒 0 的假数据。
+    # 精度实测：与轨迹几何曲率相关 0.986，误差中位 0.0004 1/m。
+    g = f.get("g_force") or (0.0, 0.0, 0.0)
+    v_ms = (f.get("speed_kph") or 0.0) / 3.6
+    curv = 0.0
+    if v_ms > 2.0:                      # 低速时分母太小，κ 会飙到无意义
+        curv = float(g[1]) * 9.80665 / (v_ms * v_ms)
     return det.Sample(
         t=f.get("t") or 0.0, seq=i,
         speed_kph=f.get("speed_kph") or 0.0,
@@ -1875,9 +1986,10 @@ def _frame_to_sample(det, f, i: int):
         throttle=f.get("throttle") or 0.0,
         brake=f.get("brake") or 0.0,
         wheel_speed=list(f.get("wheel_rads") or (0.0, 0.0, 0.0, 0.0)),
-        g_force=list(f.get("g_force") or (0.0, 0.0, 0.0)),
+        g_force=list(g),
         tyre_temp=list(f.get("tyre_temp") or (0.0, 0.0, 0.0, 0.0)),
         susp_height=list(f.get("susp_height") or (0.0, 0.0, 0.0, 0.0)),
+        curvature=curv,
     )
 
 
@@ -2046,12 +2158,17 @@ _DEFAULT_WEIGHT = 1.0
 def session_highlights(path: Path, top: int = 10, pad_before: float = 2.0,
                        pad_after: float = 1.5, min_score: float = 0.0,
                        types: list[str] | None = None,
-                       lap_no: int | None = None) -> dict[str, Any]:
+                       lap_no: int | None = None,
+                       history_dir: Path | None = None) -> dict[str, Any]:
     """把驾驶事件排成**可直接切片的集锦时间轴**。
 
     这是 POV 解说工具 Phase 1（集锦自动剪辑）的交接面：
     每个片段都给出相对场次起点的秒数，ffmpeg 直接 `-ss clip_start -t duration`
     就能切出来，不用再算一次时间轴。
+
+    传了 `history_dir` 且该场次**已绑定录像**（见 `video_session_info`），
+    每段还会多给 `clip_start_video` —— 录像时间轴上的秒数，省得消费方
+    自己减一遍 offset（减错方向是这类对接最常见的翻车点）。
 
     score = confidence × 类型权重（碰撞 10 > 打滑 8 > 出界 7 > …）：
     置信度是「这个事件判得有多准」，权重是「这个事件值不值得放进集锦」，
@@ -2066,19 +2183,15 @@ def session_highlights(path: Path, top: int = 10, pad_before: float = 2.0,
                 "clips": []}
 
     # 圈起点绝对时间（墙上时钟）：把 t_rel 还原成整场时间轴要它。
-    try:
-        laps_list, grouped, _ = _valid_laps(path)
-    except Exception as e:
-        return {"available": False, "reason": str(e), "clips": []}
-    lap_t0: dict[int, float] = {}
-    for ln, fs in grouped.items():
-        if fs:
-            t0 = fs[0].get("t")
-            if t0:
-                lap_t0[int(ln)] = float(t0)
+    lap_t0 = lap_start_times(path)
     if not lap_t0:
         return {"available": False, "reason": "no lap timestamps", "clips": []}
     session_start = min(lap_t0.values())
+
+    # 录像锚点（可为空）：t_video = t_session − offset_s
+    vinfo = (video_session_info(history_dir, path)
+             if history_dir is not None else None)
+    voff = vinfo.get("offset_s") if (vinfo and vinfo.get("bound")) else None
 
     tset = {t.strip() for t in types} if types else None
     clips = []
@@ -2106,10 +2219,13 @@ def session_highlights(path: Path, top: int = 10, pad_before: float = 2.0,
             "score": round(score, 3),
             # 事件本身（相对场次起点，秒）
             "t_start": round(t_abs, 3), "t_end": round(t_end_abs, 3),
-            # 切片窗口（含留白，ffmpeg 直接用这个）
-            "clip_start": round(start, 3),
-            "clip_end": round(end, 3),
-            "duration": round(max(0.1, end - start), 3),
+        # 切片窗口（含留白，ffmpeg 直接用这个）
+        "clip_start": round(start, 3),
+        "clip_end": round(end, 3),
+        "duration": round(max(0.1, end - start), 3),
+        # 录像时间轴（绑了录像才有）：t_video = t_session − offset_s
+        "clip_start_video": (round(start - voff, 3) if voff is not None else None),
+        "clip_end_video": (round(end - voff, 3) if voff is not None else None),
             "evidence": e.get("evidence") or {},
             "hint": e.get("hint") or "",
             "src": e.get("src") or "",
@@ -2132,8 +2248,12 @@ def session_highlights(path: Path, top: int = 10, pad_before: float = 2.0,
         # 权重透明化：消费方要知道排序口径，方便自己调
         "weights": dict(_HIGHLIGHT_WEIGHT),
         "clips": clips,
-        "ffmpeg_hint": ("ffmpeg -ss <clip_start> -i video.mp4 -t <duration> "
-                        "-c copy clip.mp4"),
+        "video": vinfo if vinfo else {"bound": False},
+        "ffmpeg_hint": (
+            f'ffmpeg -ss <clip_start_video> -i "{vinfo.get("file")}" '
+            f"-t <duration> -c copy clip.mp4"
+            if vinfo and vinfo.get("bound")
+            else "ffmpeg -ss <clip_start> -i video.mp4 -t <duration> -c copy clip.mp4"),
     }
 
 
@@ -2550,6 +2670,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
 | `GET /api/v1/sessions/<文件名>/highlights?top=10&pad_before=2&pad_after=1.5&min_score=0&types=&lap=` | **集锦剪辑时间轴**：事件按 `置信度×类型权重` 排序，每段给出可直接喂 ffmpeg 的 `clip_start` / `duration`（含前后留白）。`top=0` = 不限；`types` 逗号分隔过滤 |
+| `GET /api/v1/sessions/<文件名>/video` | **录像↔遥测锚点**：读取当前绑定（文件 / `offset_s` / 换算好的起止时刻） |
+| `POST /api/v1/sessions/<文件名>/video` | **绑定录像**：body 给 `{file, offset_s}` 或 `{file, video_lead_s}` 或 `{file, video_start_iso}` 或 `{file, video_start_epoch}` 或 `{file, probe:true}`；`{clear:true}` 解绑 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 | `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
 
@@ -2772,8 +2894,13 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
   🔴 胎温**必须保留小数**：四轮差异常常只有零点几度，取整会抹成
   `[60,60,60,60]`，而这个事件的判据恰恰就是「四轮不一样」。
 - 🔴 `tyre_press` / `tyre_wear` 在格式 A 下**恒为 0**（GT7 不广播），
-  因此既不存也不进证据——免得解说词里出现假数字。`spin` 的 `方向`
-  （转向角）协议里没有，同样是 0。
+  因此既不存也不进证据——免得解说词里出现假数字。
+- 🔴 **协议里没有方向盘角度**（2026-10-09 探针结论）。`spin` / `off_track`
+  证据里的 `方向`（左 / 右）和 `过弯半径_m` 是用**曲率**换算的，不是协议字段：
+  `κ = 横向G × 9.80665 / v²`，与轨迹几何曲率相关 0.986（误差中位 0.0004 1/m），
+  符号用「外侧轮角速度更高」独立验证过（横向 G 为正 = 左转）。
+  想复核 / 找真字段：`python tools/probe_fields.py --selftest`（自证工具）
+  然后开车时 `--ps5 <IP> --seconds 25` 跑一次。
 
 ## 集锦高光（剪辑时间轴）
 
@@ -2791,6 +2918,45 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 
 - 🔴 切片窗口**必须带留白**：从事件正中间开始切，观众看不到"怎么发生的"。
 - 事件只有 `t_rel`（相对圈起点），`/highlights` 负责把它还原成整场时间轴。
+
+## 录像对齐（录像 ↔ 遥测 时间轴锚点）
+
+录像和遥测是**两条独立的时间轴**，中间差一个只有玩家知道的常数（什么时候按的录制）。
+不把这个常数存下来，`/highlights` 给的秒数就没法直接喂 ffmpeg —— 所以它是剪辑 / 配音的
+前置条件。
+
+🔴 **口径（三行一起看，弄反一个整段剪辑就错位）**
+
+```
+t_session = 相对「本场第一个有效圈起点」的秒数   ← /highlights 给的就是它
+offset_s  = 录像开始时刻 − session_start          ← 负数 = 录像比遥测早开始
+t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这个
+```
+
+例：开跑前 18 秒就按了录制 → `offset_s = −18` → 遥测第 30s 对应录像第 48s。
+怕正负号搞反就用 `video_lead_s`（= −`offset_s`，"录像早开始 18 秒"填 18）。
+
+| 字段 | 说明 |
+|---|---|
+| `bound` | 是否已绑定 |
+| `file` | 录像文件路径（只是记下来，服务端不打开它） |
+| `offset_s` / `video_lead_s` | 偏移 / 反向的直觉读法 |
+| `session_start` / `session_start_iso` | 遥测时间轴零点（本地时区） |
+| `video_start_epoch` / `video_start_iso` | 换算出的录像开始时刻 |
+| `source` | `manual` / `ffprobe` / `mtime`——怎么定出来的 |
+
+绑定后 `/highlights` 会多给一份录像时间轴：
+
+- `video`：上面的绑定信息
+- `clips[].clip_start_video` / `clip_end_video`：这段高光在**录像**里的秒数
+- `ffmpeg_hint` 会换成带真实文件名的版本
+
+存哪儿：`data/sessions_meta.json`（边车，与收藏 / 改名同一先例 —— jsonl 是不可变原始数据）。
+
+🔴 **自动探测的坑**：`{"probe": true}` 只在录像文件**就在跑 dashboard 的这台机器上**时有效
+（Docker 部署时看不到你电脑的文件）。有 `ffprobe` 会用 `mtime − duration` 反推开始时刻；
+没有就只能用 mtime，而**多数录制软件（OBS / PS5 相册 / 采集卡）的 mtime 是"录完"的时刻**，
+会偏晚整整一段录像的时长 —— 这种情况响应里会带 `warning`，别当准确值用。
 
 ## 进站与名次
 
@@ -3155,6 +3321,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             cors=True)
             return
 
+        # —— 录像 ↔ 遥测 锚点：POST /api/v1/sessions/<name>/video ——
+        # 绑定 / 改偏移 / 自动探测 / 解绑，全走这一个端点（POST + body），
+        # 不额外开 DELETE —— 免得 CORS 预检还要放行新方法。
+        vseg = parsed.path.split("/")
+        if (len(vseg) == 6 and vseg[1:4] == ["api", "v1", "sessions"]
+                and vseg[5] == "video"):
+            return self._handle_video_bind(vseg[4])
+
         # /api/v1/sessions/<name>/<action>
         if (len(seg) != 6 or seg[1:4] != ["api", "v1", "sessions"]
                 or not seg[5]):
@@ -3228,6 +3402,120 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         save_session_meta(hist, meta)
         self._send_json({"ok": True, "action": action, "file": name}, cors=True)
+
+    def _handle_video_bind(self, name: str) -> None:
+        """录像锚点的写入端。
+
+        body 任选一种给法（都行，多了以 offset_s 为准）：
+          {"file": "...", "offset_s": -18}         直接给偏移
+          {"file": "...", "video_lead_s": 18}      录像比遥测早开始 18 秒
+          {"file": "...", "video_start_iso": "2026-10-08T19:50:30"}
+          {"file": "...", "video_start_epoch": 1791482000}
+          {"file": "...", "probe": true}           让服务端 stat/ffprobe 这个路径
+          {"clear": true}                          解绑
+        """
+        hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+        target = resolve_session((hist / Path(name).name).resolve())
+        if (not str(target).startswith(str(hist)) or not target.exists()
+                or not is_session_file(target)):
+            self._send_json({"error": "session not found", "file": name},
+                            404, cors=True)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        except Exception:
+            body = {}
+
+        canon = session_stem(name) + ".jsonl"
+        meta = load_session_meta(hist)
+
+        if body.get("clear"):
+            ent = meta.get(canon)
+            if ent:
+                ent.pop("video", None)
+                save_session_meta(hist, meta)
+            self._send_json({"ok": True, "bound": False,
+                             "hint": "已解绑录像"}, cors=True)
+            return
+
+        vfile = str(body.get("file") or "").strip()
+        if not vfile:
+            self._send_json({"error": "缺少 file（录像文件路径）"}, 400, cors=True)
+            return
+
+        start = session_start_epoch(target)
+        if start is None:
+            self._send_json({"error": "这一场没有有效圈，定不了时间轴零点"},
+                            400, cors=True)
+            return
+
+        src = "manual"
+        if "offset_s" in body:
+            try:
+                off = float(body["offset_s"])
+            except (TypeError, ValueError):
+                self._send_json({"error": "offset_s 必须是数字"}, 400, cors=True)
+                return
+        elif "video_lead_s" in body:
+            try:
+                off = -float(body["video_lead_s"])
+            except (TypeError, ValueError):
+                self._send_json({"error": "video_lead_s 必须是数字"}, 400, cors=True)
+                return
+        else:
+            vs = None
+            raw_iso = str(body.get("video_start_iso") or "").strip()
+            if raw_iso:
+                try:
+                    vs = datetime.fromisoformat(raw_iso).timestamp()
+                except ValueError:
+                    self._send_json(
+                        {"error": "video_start_iso 格式不对，例："
+                                  "2026-10-08T19:50:30"}, 400, cors=True)
+                    return
+            elif "video_start_epoch" in body:
+                try:
+                    vs = float(body["video_start_epoch"])
+                except (TypeError, ValueError):
+                    self._send_json({"error": "video_start_epoch 必须是数字"},
+                                    400, cors=True)
+                    return
+            elif body.get("probe"):
+                pr = probe_video_start(vfile)
+                if not pr.get("ok"):
+                    self._send_json({"error": pr.get("reason"), "probed": False},
+                                    400, cors=True)
+                    return
+                vs = float(pr["start_epoch"])
+                src = pr.get("source") or "probe"
+                if pr.get("warning"):
+                    body["_warn"] = pr["warning"]
+            if vs is None:
+                self._send_json(
+                    {"error": "定不了录像开始时刻：给 offset_s / video_lead_s / "
+                              "video_start_iso / video_start_epoch 之一，"
+                              "或用 {\"probe\": true} 让服务端探测（前提是"
+                              "录像文件在跑 dashboard 的这台机器上）"},
+                    400, cors=True)
+                return
+            off = vs - start
+
+        entry = meta.setdefault(canon, {})
+        entry["video"] = {
+            "file": vfile,
+            "offset_s": round(float(off), 3),
+            "source": src,
+            "bound_at": round(time.time(), 3),
+        }
+        save_session_meta(hist, meta)
+        info = video_session_info(hist, target)
+        if body.get("_warn"):
+            info["warning"] = body["_warn"]
+        info["ok"] = True
+        info["hint"] = (f"已绑定：遥测 0s ↔ 录像 {(-off):.1f}s"
+                        f"（t_video = t_session - offset_s）")
+        self._send_json(info, cors=True)
 
     # -- 关闭默认日志（每100ms 一次请求会刷屏）----------------------------
 
@@ -3416,7 +3704,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     or path.endswith("/deviation") or path.endswith("/track")
                     or path.endswith("/events") or path.endswith("/pitstops")
                     or path.endswith("/compare")
-                    or path.endswith("/highlights")):
+                    or path.endswith("/highlights") or path.endswith("/video")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
@@ -3500,6 +3788,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif path.endswith("/highlights"):
                     # 集锦剪辑时间轴：事件按 置信度×类型权重 排序 + 前后留白，
                     # 输出可直接喂 ffmpeg 的 clip_start / duration。
+                    # 传 history_dir：绑了录像的场次多给一份录像时间轴。
                     def _f(key: str, default: float) -> float:
                         try:
                             return float(query.get(key, [default])[0])
@@ -3518,8 +3807,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             min_score=_f("min_score", 0.0),
                             types=[t for t in types_raw.split(",") if t.strip()]
                             or None,
-                            lap_no=lap_no),
+                            lap_no=lap_no, history_dir=hist),
                         cors=True)
+                elif path.endswith("/video"):
+                    # 录像 ↔ 遥测 锚点：读当前绑定（含换算好的起止时刻）
+                    self._send_json(video_session_info(hist, target), cors=True)
                 elif path.endswith("/pitstops"):
                     self._send_json(session_pitstops(target), cors=True)
                 elif path.endswith("/compare"):
@@ -5647,6 +5939,185 @@ _EVENTS_TMPL = r"""
 """
 
 
+# 场次详情页的「录像对齐」卡片（POV 解说 / 自动剪辑的时间轴锚点）。
+#
+# 为什么要有这张卡：/highlights 给的是**遥测时间轴**（相对本场第一个有效圈），
+# 而 ffmpeg 要的是**录像时间轴**。两个时间轴差一个 offset，这个 offset 只有
+# 玩家自己知道（什么时候按的录制），所以必须有个地方让他填一次并存下来。
+#
+# 三种填法，覆盖不同环境：
+#   1. 「录像比遥测早开始 N 秒」——最直觉（录了 18 秒才发车就填 18）
+#   2. 录像开始时刻——对着文件属性填
+#   3. 自动探测——录像文件就在跑 dashboard 的这台机器上时用（ffprobe 优先，
+#      退回 mtime 并明确警告 mtime 通常是"录完"的时刻）
+_VIDEO_TMPL = r"""
+<div class="card" id="cardVideo">
+  <h2>录像对齐
+    <span style="float:right;font-weight:400;font-size:12px;color:var(--muted)">
+      剪辑 / 配音的时间轴锚点</span>
+  </h2>
+  <div id="vidBody"><p class="an-note">读取绑定信息…</p></div>
+</div>
+
+<script>
+(function () {
+  var FILE = '__FILE__';
+  var API = '/api/v1/sessions/' + encodeURIComponent(FILE);
+  var V = null, HL = null;
+  // 按钮样式内联：这套 CSS 里没有 .btn，写个 class 会渲染成裸按钮
+  var BS = 'style="border:1px solid var(--line);background:var(--card);'
+    + 'color:inherit;border-radius:6px;padding:5px 12px;cursor:pointer;'
+    + 'font-family:inherit;font-size:12px"';
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function fmt(v) { return (v == null) ? '—' : (+v).toFixed(1) + 's'; }
+
+  function post(payload, cb) {
+    fetch(API + '/video', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function (r) { return r.json(); }).then(cb, function () {
+      alert('请求失败');
+    });
+  }
+
+  window.vidProbe = function () {
+    var f = (el('vidFile') || {}).value || '';
+    if (!f) { alert('先填录像文件路径'); return; }
+    post({ file: f, probe: true }, function (d) {
+      if (d.error) { alert(d.error); return; }
+      if (d.warning) { alert(d.warning); }
+      render(d);
+    });
+  };
+
+  window.vidBind = function () {
+    var f = ((el('vidFile') || {}).value || '').trim();
+    if (!f) { alert('先填录像文件路径'); return; }
+    var lead = ((el('vidLead') || {}).value || '').trim();
+    var iso = ((el('vidIso') || {}).value || '').trim();
+    if (!lead && !iso) {
+      alert('填「录像比遥测早开始 N 秒」或「录像开始时刻」，二选一');
+      return;
+    }
+    var p = { file: f };
+    if (lead) { p.video_lead_s = parseFloat(lead); }
+    else { p.video_start_iso = iso; }
+    post(p, function (d) {
+      if (d.error) { alert(d.error); return; }
+      render(d);
+    });
+  };
+
+  window.vidUnbind = function () {
+    post({ clear: true }, function (d) {
+      if (d.error) { alert(d.error); return; }
+      render(null);
+      load();
+    });
+  };
+
+  function row(k, v) {
+    return '<div><span>' + k + '</span><b>' + v + '</b></div>';
+  }
+
+  function render(d) {
+    if (d) { V = d; }
+    if (!V) { return; }
+    if (!V.bound) {
+      el('vidBody').innerHTML =
+        '<p class="an-note">未绑定录像。绑定后，每段高光会额外给出'
+        + '<b>录像里的第几秒</b>，ffmpeg 可以直接切。</p>'
+        + formHtml('')
+        + '<p style="font-size:12px;color:var(--muted);margin-top:10px">'
+        + esc(V.session_start_iso || '') + ' = 遥测 0s（本场第一个有效圈的起点）'
+        + '</p>';
+      return;
+    }
+    var h = '<div class="kv">'
+      + row('录像文件', '<span style="font-family:var(--mono);font-size:12px">'
+            + esc(V.file) + '</span>')
+      + row('遥测 0s', esc(V.session_start_iso || '—'))
+      + row('录像起点', esc(V.video_start_iso || '—'))
+      + row('录像早开始', fmt(V.video_lead_s))
+      + row('换算', 't_video = t_session − ' + (+V.offset_s).toFixed(1) + 's')
+      + '</div>';
+
+    if (HL && HL.clips && HL.clips.length) {
+      h += '<table style="margin-top:12px"><tr><th>#</th><th>事件</th>'
+         + '<th style="text-align:right">遥测</th>'
+         + '<th style="text-align:right">录像 ← 切这里</th></tr>';
+      for (var i = 0; i < Math.min(HL.clips.length, 5); i++) {
+        var c = HL.clips[i];
+        h += '<tr><td>' + c.rank + '</td><td>' + esc(c.type_cn) + '（第 '
+          + c.lap + ' 圈）</td><td class="num">' + fmt(c.clip_start) + '</td>'
+          + '<td class="num"><b>' + fmt(c.clip_start_video) + '</b></td></tr>';
+      }
+      h += '</table><p style="font-size:12px;color:var(--muted);margin-top:8px">'
+         + 'ffmpeg 示例：<code>ffmpeg -ss ' + fmt((HL.clips[0] || {}).clip_start_video)
+         + ' -i "' + esc(V.file) + '" -t ' + ((HL.clips[0] || {}).duration || 0)
+         + ' -c copy clip.mp4</code></p>';
+    }
+    h += formHtml(V.file)
+       + '<p style="margin-top:8px"><button ' + BS + ' onclick="vidUnbind()">解绑</button></p>';
+    el('vidBody').innerHTML = h;
+  }
+
+  function formHtml(f) {
+    return '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;'
+      + 'align-items:flex-end">'
+      + '<label style="font-size:12px;color:var(--muted)">录像文件路径<br>'
+      + '<input id="vidFile" value="' + esc(f) + '" placeholder="E:/capture/race1.mp4" '
+      + 'style="width:280px;font-family:var(--mono);font-size:12px;padding:5px 8px;'
+      + 'border:1px solid var(--line);border-radius:6px;background:var(--card);'
+      + 'color:inherit"></label>'
+      + '<label style="font-size:12px;color:var(--muted)">比遥测早开始（秒）<br>'
+      + '<input id="vidLead" placeholder="18" style="width:110px;font-family:var(--mono);'
+      + 'font-size:12px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;'
+      + 'background:var(--card);color:inherit"></label>'
+      + '<label style="font-size:12px;color:var(--muted)">或 录像开始时刻<br>'
+      + '<input id="vidIso" placeholder="2026-10-08 19:50:30" style="width:180px;'
+      + 'font-family:var(--mono);font-size:12px;padding:5px 8px;'
+      + 'border:1px solid var(--line);border-radius:6px;background:var(--card);'
+      + 'color:inherit"></label>'
+      + '<button ' + BS + ' onclick="vidBind()">绑定</button>'
+      + '<button ' + BS + ' onclick="vidProbe()">自动探测</button>'
+      + '</div>'
+      + '<p style="font-size:12px;color:var(--muted);margin-top:8px">'
+      + '「自动探测」只在录像文件<b>就在跑仪表盘的这台机器上</b>时有效'
+      + '（Docker 部署时看不到你电脑的文件）；有 ffprobe 会用它反推开始时刻，'
+      + '否则只能用文件修改时间，而那通常是<b>录完</b>的时刻。</p>';
+  }
+
+  function load() {
+    fetch(API + '/video').then(function (r) { return r.json(); })
+      .then(function (d) {
+        V = d;
+        render(d);
+        // 绑了才去取高光（事件检测冷路径 ~10s，不值得为未绑定的场次付这个钱）
+        if (d && d.bound) {
+          fetch(API + '/highlights?top=5').then(function (r) { return r.json(); })
+            .then(function (h) { HL = h; render(null); },
+                  function () { HL = null; });
+        }
+      }, function () {
+        el('vidBody').innerHTML = '<p class="an-note">读取失败</p>';
+      });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', load);
+  } else { load(); }
+})();
+</script>
+"""
+
+
 # 场次详情页的「进站与名次」卡片。
 #
 # 数据来自 /api/v1/sessions/<名>/pitstops（全场帧遍历一遍 ~0.3s，服务端记忆化）。
@@ -6608,6 +7079,9 @@ window.trackRen = function (id) {{
                        # 两个 IIFE 都是 DOMContentLoaded 前定义，顺序只影响
                        # 卡片视觉位置，不影响函数可用性。
                        + _EVENTS_TMPL.replace('__FILE__', js_file)
+                       # 录像对齐紧跟事件卡：它展示的正是「事件在录像里第几秒」，
+                       # 两张卡一起看才说得通（先看发生了什么，再看去哪儿切）。
+                       + _VIDEO_TMPL.replace('__FILE__', js_file)
                        + _PIT_TMPL.replace('__FILE__', js_file)
                        + _TELEMETRY_TMPL.replace('__FILE__', js_file))
 

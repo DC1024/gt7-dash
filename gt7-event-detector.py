@@ -52,7 +52,18 @@ class Sample:
     clutch: float = 0.0
 
     # 转向
-    steer_angle: float = 0.0      # 方向盘角度，度
+    # 🔴 GT7 格式 A **不广播方向盘角度**（2026-10-09 探针结论 + 社区表核对：
+    #    0x93~0xA3 那段没有任何公开文档标为转向角）。这个字段留着只为兼容，
+    #    dashboard 喂进来恒为 0，**事件证据不许再引用它**——引用就是编数字。
+    #    要用"往哪拐 / 拐多急"，看下面的 curvature。
+    steer_angle: float = 0.0      # （不可用）方向盘角度，度；恒 0
+    # 转弯曲率（1/m），**正 = 左转**。
+    # 由 κ = a_lat / v² 算出（a_lat 取横向 G × 9.80665），不是协议字段。
+    # 两道实测校验（两场真实 jsonl）：
+    #   ① 与轨迹几何曲率的相关性 0.986，误差中位 0.0004 1/m；
+    #   ② 符号用"外侧轮角速度更高"独立验证：横向 G 为正时右轮快 +1.67%、
+    #      为负时右轮慢 −3.01% ⇒ 横向 G 为正 = 左转。
+    curvature: float = 0.0
 
     # 四轮（顺序 FL, FR, RL, RR）
     wheel_speed: list[float] = field(default_factory=lambda: [0.0] * 4)   # rad/s
@@ -223,6 +234,25 @@ def longitudinal_g(s: Sample) -> float:
 
 def vertical_g(s: Sample) -> float:
     return s.g_force[2] if len(s.g_force) >= 3 else 0.0
+
+
+# 曲率阈值：小于它算直线。0.0005 1/m = 半径 2km，比任何赛道弯都平直
+_CURV_EPS = 5e-4
+
+
+def turn_dir(curvature: float) -> str:
+    """曲率 → 人话方向。**正 = 左转**（符号由"外侧轮更快"实测标定）。"""
+    if abs(curvature) < _CURV_EPS:
+        return "直线"
+    return "左" if curvature > 0 else "右"
+
+
+def turn_radius(curvature: float) -> str | int:
+    """曲率 → 过弯半径（m）。直线返回「直线」——返回 2000 这种数字没意义，
+    解说词念出来会变成"以两公里半径过弯"这种笑话。"""
+    if abs(curvature) < _CURV_EPS:
+        return "直线"
+    return int(round(1.0 / abs(curvature)))
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +513,9 @@ class EventDetector:
                         "打滑最严重轮胎": wheel_names[worst],
                         "该轮滑移率": round(slips[worst], 3),
                         "四轮平均滑移率": round(self._mean_slip(peak), 3),
-                        "方向": round(peak.steer_angle, 1),
+                        # 方向由曲率符号定（正=左转），不是转向角——GT7 不广播转向角
+                        "方向": turn_dir(peak.curvature),
+                        "过弯半径_m": turn_radius(peak.curvature),
                     },
                     comment_hint="车辆处于失控边缘，判断这次转向超出了抓地极限",
                 )
@@ -520,7 +552,7 @@ class EventDetector:
                     evidence={
                         "速度_kph": round(s.speed_kph, 1),
                         "平均|滑移率|": round(mean_abs, 3),
-                        "转向角": round(s.steer_angle, 1),
+                        "过弯半径_m": turn_radius(s.curvature),
                     },
                     comment_hint="车辆驶出赛道表面，抓地力大幅下降",
                 )
