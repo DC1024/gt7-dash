@@ -316,10 +316,10 @@ def compare_session(path: Path, ref_lap_no: int | None = None) -> dict[str, Any]
         _, all_frames = _load_frames(path)
         frames = [f for f in all_frames if "lap" in f]
         import gt7analysis
+        # 赛车线抽稀在 gt7analysis.race_line 内部做（decimate=6）。
+        # 🔴 不能在这里对每段各自 [::6]：分段后各自抽稀会把每段末尾
+        #    到下一个边界的点丢掉，一圈上千个分色段留下上千个断隔。
         r = gt7analysis.analyze_compare(frames, ref_lap_no=ref_lap_no)
-        # 赛车线抽稀：每 6 点取 1，控制页面体积（7200 帧 → ~1200 点）
-        for seg in r.get("race_line", {}).get("segments", []):
-            seg["pts"] = seg["pts"][::6]
         return r
     except Exception as e:
         return {"error": str(e)}
@@ -1610,7 +1610,7 @@ function sessDel(file) {
 
 _COMPARE_TMPL = """
 <style>
-.cmp-svg { width:100%; height:190px; display:block; background:rgba(128,128,128,.06);
+.cmp-svg { width:100%; height:auto; display:block; background:rgba(128,128,128,.06);
   border-radius:8px; }
 #raceLineCv { width:100%; max-width:760px; display:block; margin:0 auto;
   border-radius:8px; background:rgba(128,128,128,.06); }
@@ -1628,7 +1628,10 @@ _COMPARE_TMPL = """
   <p style="font-size:12px;color:var(--muted);margin-bottom:6px">
     曲线 = 最新圈相对参考圈的逐距离时间差：<b style="color:var(--bad)">正（上）= 丢时间</b>，
     <b style="color:var(--ok)">负（下）= 更快</b>。参考圈默认取最快圈。</p>
-  <svg id="diffSvg" class="cmp-svg" viewBox="0 0 720 180" preserveAspectRatio="none"></svg>
+  <p style="font-size:11.5px;color:var(--muted);margin-bottom:4px">
+    横轴 = 圈内行驶距离（<b>0 = 起点线</b>），刻度下方的灰色时间是参考圈跑到该位置的时刻；
+    红点 = 丢时间最多处，绿点 = 领先最多处。</p>
+  <svg id="diffSvg" class="cmp-svg" viewBox="0 0 720 236"></svg>
 </div>
 <div class="card">
   <h2>参考圈赛车线（第 <span id="rlLap">-</span> 圈）
@@ -1709,25 +1712,81 @@ const CMP = __DATA__;
     });
   })();
 
-  // —— 时间差曲线 ——
+  // —— 时间差曲线（带坐标参考：X=圈内距离+参考圈时刻，Y=毫秒） ——
   const d = CMP.time_diff, svg = document.getElementById('diffSvg');
   if (d.grid && d.grid.length > 1) {
-    const W = 720, H = 180, P = 10;
+    const W = 720, H = 236;
+    const L = 58, R = W - 12, T = 16, B = H - 40;   // 绘图区
     const amax = Math.max(50, ...d.diff_ms.map(v => Math.abs(v)));
-    const x = i => P + (W - 2 * P) * i / (d.grid.length - 1);
-    const y = v => H / 2 - (H / 2 - P) * v / amax;
-    let html = '<line x1="' + P + '" y1="' + H/2 + '" x2="' + (W-P) + '" y2="'
-      + H/2 + '" stroke="rgba(128,128,128,.5)" stroke-dasharray="4 4"/>';
+    const x = i => L + (R - L) * i / (d.grid.length - 1);
+    const y = v => B / 2 + T / 2 - ((B - T) / 2) * v / amax;
+    const fms = v => {
+      const s = v > 0 ? '+' : (v < 0 ? '-' : '');
+      const a = Math.abs(v);
+      return s + (a >= 10000 ? (a / 1000).toFixed(1) + 's' : Math.round(a) + 'ms');
+    };
+    const fdist = m => m >= 1000
+      ? (m / 1000).toFixed(2).replace(/\.?0+$/, '') + 'k' : Math.round(m) + 'm';
+    const fref = ms => {
+      const t = ms / 1000;
+      return t < 60 ? t.toFixed(1) + 's'
+        : Math.floor(t / 60) + ':' + String(Math.round(t % 60)).padStart(2, '0');
+    };
+    let html = '';
+    // Y 网格：±amax / ±amax/2 / 0
+    for (const f of [1, 0.5, 0, -0.5, -1]) {
+      const v = amax * f, yy = y(v).toFixed(1);
+      html += '<line x1="' + L + '" y1="' + yy + '" x2="' + R + '" y2="' + yy
+        + '" stroke="rgba(128,128,128,.22)" stroke-width="1"/>';
+      html += '<text x="' + (L - 6) + '" y="' + (+yy + 3.5)
+        + '" text-anchor="end" font-size="10" fill="var(--muted)">'
+        + (f === 0 ? '0' : fms(v)) + '</text>';
+    }
+    // X 网格 + 双行标注：圈内距离 / 参考圈到该位置的时刻
+    const refT = d.ref_t_rel_ms || [];
+    for (let k = 0; k <= 8; k++) {
+      const i = Math.round(k / 8 * (d.grid.length - 1));
+      const xx = x(i).toFixed(1);
+      // 两端刻度向内对齐，避免贴边被裁
+      const anchor = k === 0 ? 'start' : (k === 8 ? 'end' : 'middle');
+      html += '<line x1="' + xx + '" y1="' + T + '" x2="' + xx + '" y2="' + B
+        + '" stroke="rgba(128,128,128,.18)" stroke-width="1"/>';
+      html += '<text x="' + xx + '" y="' + (B + 15) + '" text-anchor="' + anchor
+        + '" font-size="10" fill="var(--muted)">' + fdist(d.grid[i]) + '</text>';
+      if (refT.length) {
+        html += '<text x="' + xx + '" y="' + (B + 28) + '" text-anchor="' + anchor
+          + '" font-size="9.5" fill="var(--muted)" opacity=".75">'
+          + fref(refT[i]) + '</text>';
+      }
+    }
+    // 零线加粗（虚线）：上下分界
+    html += '<line x1="' + L + '" y1="' + y(0) + '" x2="' + R + '" y2="' + y(0)
+      + '" stroke="rgba(128,128,128,.55)" stroke-dasharray="4 4"/>';
+    // 差值曲线
     for (let i = 1; i < d.diff_ms.length; i++) {
-      const v = (d.diff_ms[i] + d.diff_ms[i-1]) / 2;
-      html += '<line x1="' + x(i-1).toFixed(1) + '" y1="' + y(d.diff_ms[i-1]).toFixed(1)
+      const v = (d.diff_ms[i] + d.diff_ms[i - 1]) / 2;
+      html += '<line x1="' + x(i - 1).toFixed(1) + '" y1="' + y(d.diff_ms[i - 1]).toFixed(1)
         + '" x2="' + x(i).toFixed(1) + '" y2="' + y(d.diff_ms[i]).toFixed(1)
-        + '" stroke="' + (v >= 0 ? '#dc3545' : '#198754')
+        + '" style="stroke:' + (v >= 0 ? 'var(--bad)' : 'var(--ok)')
         + '" stroke-width="1.6"/>';
     }
-    html += '<text x="' + (P+4) + '" y="16" fill="#dc3545" font-size="10">+' + amax
-      + 'ms</text><text x="' + (P+4) + '" y="' + (H-6) + '" fill="#198754" font-size="10">-'
-      + amax + 'ms</text>';
+    // 最大得失标记：一眼定位「在哪里丢/赚了多少」
+    const iMax = d.diff_ms.reduce((a, v, i) => v > d.diff_ms[a] ? i : a, 0);
+    const iMin = d.diff_ms.reduce((a, v, i) => v < d.diff_ms[a] ? i : a, 0);
+    const mark = (i, color, above) => {
+      const mx = x(i), my = y(d.diff_ms[i]);
+      const label = fms(d.diff_ms[i]) + '@' + fdist(d.grid[i]);
+      const ty = above ? Math.max(T + 9, my - 7) : Math.min(B - 3, my + 14);
+      const tx = Math.min(Math.max(mx, L + 34), R - 34);
+      return '<circle cx="' + mx.toFixed(1) + '" cy="' + my.toFixed(1)
+        + '" r="3" style="fill:' + color + '"/>'
+        + '<text x="' + tx.toFixed(1) + '" y="' + ty.toFixed(1)
+        + '" text-anchor="middle" font-size="9.5" style="fill:' + color
+        + '">' + label + '</text>';
+    };
+    if (d.diff_ms[iMax] > 0) html += mark(iMax, 'var(--bad)', true);
+    if (d.diff_ms[iMin] < 0) html += mark(iMin, 'var(--ok)', false);
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
     svg.innerHTML = html;
   }
 

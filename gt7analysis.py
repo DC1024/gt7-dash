@@ -208,9 +208,12 @@ def time_diff(cur_pts: list[dict], ref_pts: list[dict],
 
     diff_ms = t_本圈(d) - t_参考圈(d)。**正值 = 本圈在该距离段丢时间**，
     负值 = 本圈更快。公共距离取两圈较短者。
+
+    ref_t_rel_ms = 参考圈跑到该距离用的毫秒数——前端 X 轴同时标注
+    「位置(米)」和「参考圈到此处的时间」，用户才知道正负发生在哪。
     """
     if not cur_pts or not ref_pts:
-        return {"step": step, "grid": [], "diff_ms": []}
+        return {"step": step, "grid": [], "diff_ms": [], "ref_t_rel_ms": []}
     common = min(cur_pts[-1]["dist"], ref_pts[-1]["dist"])
     grid: list[float] = []
     d = 0.0
@@ -223,7 +226,8 @@ def time_diff(cur_pts: list[dict], ref_pts: list[dict],
     ref_t = [p["t_rel"] for p in ref_pts]
     diff = [round((_interp(cur_d, cur_t, d) - _interp(ref_d, ref_t, d)) * 1000, 1)
             for d in grid]
-    return {"step": step, "grid": grid, "diff_ms": diff}
+    ref_ms = [round(_interp(ref_d, ref_t, d) * 1000, 1) for d in grid]
+    return {"step": step, "grid": grid, "diff_ms": diff, "ref_t_rel_ms": ref_ms}
 
 
 # —— 峰谷检测 ——————————————————————————————
@@ -293,22 +297,41 @@ def find_peaks_valleys(pts: list[dict], window: int = 7,
 # —— 三色赛车线 ——————————————————————————————
 
 def race_line(pts: list[dict], brake_g: float = -0.25,
-              throttle_g: float = 0.12) -> dict:
+              throttle_g: float = 0.12, decimate: int = 6) -> dict:
     """参考圈赛车线：按纵向 G 分色。
 
     刹车(glong < brake_g) = 红 · 油门(> throttle_g) = 绿 · 其余 = 滑行(蓝)。
     返回 {"segments": [{"color": ..., "pts": [[x, z], ...]}]}
+
+    🔴 两个容易踩的坑（都实测踩过）：
+    1. **抽稀必须在分色之前对整条序列做**。之前是先分色、再在
+       dashboard 里对每段各自 `pts[::6]`——每段末尾到下一个边界的
+       点被丢掉，一圈上千个分色段就留下上千个肉眼可见的断隔，
+       「明明跑完一整圈，线却是斑驳的」。
+    2. **相邻两段必须共享边界点**（新段从上一段的末点接起），
+       否则换色处那一帧的弦谁都不画（canvas 分多次 stroke 时
+       段与段的衔接靠端点重合，不重合就是缺口）。
+    另外对 glong 做三点平滑：阈值附近的抖动会把一条线打成上千个小段。
     """
+    sub = pts[::decimate] if decimate and decimate > 1 else pts
+    gs = [p["glong"] for p in sub]
+    n = len(gs)
+    sm = gs if n < 3 else [(gs[max(0, i - 1)] + gs[i] + gs[min(n - 1, i + 1)]) / 3.0
+                           for i in range(n)]
     color_of = lambda g: ("brake" if g < brake_g
                           else "throttle" if g > throttle_g else "coast")
     segments: list[dict] = []
     cur_color, cur_pts = None, []
-    for p in pts:
-        c = color_of(p["glong"])
+    for p, g in zip(sub, sm):
+        c = color_of(g)
         if c != cur_color:
             if cur_pts:
                 segments.append({"color": cur_color, "pts": cur_pts})
-            cur_color, cur_pts = c, []
+                # 从上一段末点接起，保证换色处首尾相接
+                cur_pts = [cur_pts[-1]]
+            else:
+                cur_pts = []
+            cur_color = c
         cur_pts.append([p.get("x"), p.get("z")])
     if cur_pts:
         segments.append({"color": cur_color, "pts": cur_pts})
