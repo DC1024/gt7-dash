@@ -7401,10 +7401,11 @@ function render(s) {
 
   // 状态栏
   // 🔴 connected 由服务端按「状态文件 5 秒内有无更新」判定，
-  //    PS5 关机/退游戏后旧文件还在，必须靠服务端判过期。
+  //    PS5 关机 / 退游戏 / 游戏未进赛道（不发包）都会让旧文件过期，
+  //    必须靠服务端判过期。
   const dot = $('dot');
   if (s.connected) { dot.className = 'dot on'; $('status').textContent = '采集中'; }
-  else { dot.className = 'dot off'; $('status').textContent = '已断开（PS5 未开机或已退出游戏）'; }
+  else { dot.className = 'dot off'; $('status').textContent = '已断开（游戏未进入赛道）'; }
   // 菜单态（lap=65535）圈号/圈速都是无意义值，显示占位
   const inMenu = L.lap == null || L.lap >= 65000;
   $('lap').textContent = inMenu ? '--' : L.lap;
