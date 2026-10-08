@@ -1592,7 +1592,7 @@ function loadTrashSettings() {
         // 生成 'trashPost('' + t.name' 这种坏语法（整段脚本直接不执行）。
         var nm = String(t.name).replace(/"/g, '&quot;');
         var anom = t.anomalous ? '1' : '0';
-        var badge = t.anomalous ? ' <span class="anom-badge">异常</span>' : '';
+        var badge = t.anomalous ? ' <span class="anom-badge" title="异常场次：没有完成圈，或唯一圈不足 20 秒（菜单 / 停车场 / 刚点火的残片），会被自动归档到回收站">异常</span>' : '';
         return '<tr data-anom="' + anom + '"><td style="font-size:12px;font-family:var(--mono)">' + t.name + badge +
           '</td><td class="num">' + t.size_kb + ' KB</td><td class="num">' + t.modified +
           '</td><td class="num">' +
@@ -2012,13 +2012,17 @@ def build_sessions_page(hist: Path) -> str:
 </div>
 
 <div class="card">
-  <h2>回收站 <span id="trashSummary" style="float:right;font-weight:400;
+  <h2>回收站
+    <label style="float:right;font-weight:400;font-size:12px;cursor:pointer;margin-left:12px">
+      <input type="checkbox" id="anomTrashOnly" onchange="applyTrashFilters()"> 只看异常场次</label>
+    <span id="trashSummary" style="float:right;font-weight:400;
       font-size:12px;color:var(--muted)"></span></h2>
   <p style="font-size:12.5px;color:var(--muted)">
     删除的场次先移入 <b>data/_trash/</b>，超过保留期后由服务自动真删
-    （每小时检查一次，设 <b>0</b> 天 = 永不自动清理）；也可以在这里手动清理。</p>
-  <label style="font-size:12px;cursor:pointer;margin:2px 0 8px;display:inline-block">
-    <input type="checkbox" id="anomTrashOnly" onchange="applyTrashFilters()"> 只看异常场次</label>
+    （每小时检查一次，设 <b>0</b> 天 = 永不自动清理）；也可以在这里手动清理。<br>
+    带 <span class="anom-badge" style="margin-left:0">异常</span> 标记的是「没有完成圈，
+    或唯一圈不足 20 秒」的残片场次（菜单 / 停车场 / 刚点火）——它们会被自动归档到这里，
+    可恢复，也可彻底删除。</p>
   <div id="trashInfo" style="font-size:13px;margin:10px 0">加载中…</div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <label style="font-size:13px">保留天数：
