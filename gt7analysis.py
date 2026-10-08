@@ -136,7 +136,7 @@ def lap_samples(frames: list[dict]) -> list[dict]:
     """一圈的帧 → 累计距离采样点。
 
     每点：dist(米) / t_rel(圈内秒) / v(m/s) / speed_kph / throttle / brake /
-          glong(纵向G) / x / z。dt 异常（<=0 或 >1s）的区间不计距离。
+          glong(纵向G) / gmag(合成 G 大小) / x / z。dt 异常（<=0 或 >1s）的区间不计距离。
     """
     pts: list[dict] = []
     dist = 0.0
@@ -155,6 +155,10 @@ def lap_samples(frames: list[dict]) -> list[dict]:
             "throttle": f.get("throttle", 0.0),
             "brake": f.get("brake", 0.0),
             "glong": g[0] if len(g) > 0 else 0.0,
+            # 合成 G 大小（横向 + 纵向）：与记录器写赛道轨迹点的算法一致，
+            # 用来给「按 G 力着色」的赛车线上色。
+            "gmag": round(math.hypot(g[0] if len(g) > 0 else 0.0,
+                                     g[1] if len(g) > 1 else 0.0), 3),
             "x": f.get("car_x"), "z": f.get("car_z"),
         })
         prev = {"t": t, "v": v}
@@ -317,15 +321,16 @@ def _smooth3(xs: list[float]) -> list[float]:
 
 
 def race_line(pts: list[dict], decimate: int = 6, eps: float = 0.04) -> dict:
-    """参考圈赛车线：按**油门 / 刹车开度**上色（渐变）。
+    """参考圈赛车线：同一批点，**两套着色口径都带出来**。
 
-    刹车越重越红（粉→红），油门越深越绿（青→绿），都不踩 = 滑行。
-    颜色来自记录的踏板百分比本身，而不是纵向 G。
+    · 踏板口径（b / t）：刹车越重越红（粉→红），油门越深越绿（青→绿），都不踩 = 滑行。
+    · G 力口径（g）：合成 G 大小（横向+纵向），与实时仪表盘的「按 G 力着色」同一算法。
 
     返回 {"segments": [{"color": "brake|throttle|coast",
                         "pts": [[x, z], ...],
                         "b": [刹车开度 0~1, ...],   # 与 pts 一一对齐
-                        "t": [油门开度 0~1, ...]}]}
+                        "t": [油门开度 0~1, ...],
+                        "g": [合成 G 大小, ...]}]}
 
     🔴 两个容易踩的坑（都实测踩过）：
     1. **抽稀必须在分段之前对整条序列做**。之前是先分色、再在
@@ -336,6 +341,9 @@ def race_line(pts: list[dict], decimate: int = 6, eps: float = 0.04) -> dict:
        否则换色处那一帧的弦谁都不画（canvas 分多次 stroke 时
        段与段的衔接靠端点重合，不重合就是缺口）。
     另外对踏板值做三点平滑：逐点抖动会把一条线打成上千个小段。
+
+    ⚠️ 分段是按「踏板通道」切的；切到 G 力着色时前端会把同一条线整条重上色，
+       分段本身不影响 G 模式的观感（只是多几次 stroke）。
     """
     sub = pts[::decimate] if decimate and decimate > 1 else pts
     bs = _smooth3([_clamp01(p.get("brake")) for p in sub])
@@ -350,25 +358,41 @@ def race_line(pts: list[dict], decimate: int = 6, eps: float = 0.04) -> dict:
         return "coast"
 
     segments: list[dict] = []
-    cur_ch, cur_pts, cur_b, cur_t = None, [], [], []
+    cur_ch, cur_pts, cur_b, cur_t, cur_g = None, [], [], [], []
     for i, p in enumerate(sub):
         c = channel(bs[i], ts[i])
         if c != cur_ch:
             if cur_pts:
                 segments.append({"color": cur_ch, "pts": cur_pts,
-                                 "b": cur_b, "t": cur_t})
-                # 从上一段末点接起，保证换色处首尾相接（含踏板值）
-                cur_pts, cur_b, cur_t = [cur_pts[-1]], [cur_b[-1]], [cur_t[-1]]
+                                 "b": cur_b, "t": cur_t, "g": cur_g})
+                # 从上一段末点接起，保证换色处首尾相接（含各通道值）
+                cur_pts = [cur_pts[-1]]
+                cur_b, cur_t, cur_g = [cur_b[-1]], [cur_t[-1]], [cur_g[-1]]
             else:
-                cur_pts, cur_b, cur_t = [], [], []
+                cur_pts, cur_b, cur_t, cur_g = [], [], [], []
             cur_ch = c
         cur_pts.append([p.get("x"), p.get("z")])
         cur_b.append(round(bs[i], 3))
         cur_t.append(round(ts[i], 3))
+        cur_g.append(round(p.get("gmag") or 0.0, 3))
     if cur_pts:
         segments.append({"color": cur_ch, "pts": cur_pts,
-                         "b": cur_b, "t": cur_t})
+                         "b": cur_b, "t": cur_t, "g": cur_g})
     return {"segments": segments}
+
+
+def race_line_of_lap(frames: list[dict], lap_no: int,
+                     decimate: int = 6) -> dict:
+    """指定圈的赛车线（给「行车轨迹」卡片单独切圈用，不必重算整页分析）。
+
+    圈口径复用 clean_laps，与详情页其它分析同一套，避免圈号对不上。
+    """
+    laps = clean_laps(frames)
+    fs = laps.get(lap_no)
+    if not fs or len(fs) < 2:
+        return {"lap": lap_no, "segments": []}
+    return {"lap": lap_no, "segments": race_line(lap_samples(fs),
+                                                 decimate=decimate)["segments"]}
 
 
 # —— 门面 ——————————————————————————————
@@ -415,8 +439,12 @@ def match_pv_pairs(peaks_ref: list[dict], peaks_cur: list[dict],
 
 
 def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
-                    step: float = 10.0) -> dict:
-    """门面：分组 → 每圈采样 → 选参考圈（缺省=最快圈）→ 时间差 + 峰谷 + 赛车线。
+                    cur_lap_no: int | None = None, step: float = 10.0) -> dict:
+    """门面：分组 → 每圈采样 → 选参考圈/对比圈 → 时间差 + 峰谷 + 赛车线。
+
+    `ref_lap_no` 缺省 = 最快圈；`cur_lap_no` 缺省 = 最后一圈（圈号最大的有效圈）。
+    两者都允许由调用方（HTTP 查询参数 / UI 下拉）指定，这样用户可以
+    任选两圈对比，而不是只能拿最后一圈跟最快圈比。
 
     clean_laps 会剔除首/末假圈（前圈、完赛离场圈）与菜单态，
     否则 25s 的完赛余圈会被当成「最快圈」画出离场的小段赛车线。
@@ -446,13 +474,17 @@ def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
         })
     summary.sort(key=lambda s: s["lap"])
     fastest = min(summary, key=lambda s: s["duration_s"])["lap"]
-    # 指定的参考圈必须真实存在（URL 可能被手改成任意值），
-    # 否则回退到最快圈，避免 KeyError 把整个详情页打挂。
+    # 指定的圈号必须真实有效（URL 可能被手改成任意值），
+    # 否则回退到默认值，避免 KeyError 把整个详情页打挂。
     if ref_lap_no is None or ref_lap_no not in samples:
         ref_lap_no = fastest
-    cur_lap_no = max(samples)
+    if cur_lap_no is None or cur_lap_no not in samples:
+        cur_lap_no = max(samples)
+    # 参考圈与对比圈撞在一起时（用户手选了同一圈，或该场只有一圈被保留），
+    # 退到「另一圈」；实在没有别的圈就保持原样（单圈场次时间差自然是全 0）。
     if cur_lap_no == ref_lap_no and len(samples) > 1:
-        cur_lap_no = sorted(samples)[-2]
+        others = [n for n in sorted(samples) if n != ref_lap_no]
+        cur_lap_no = others[-1]
     r = time_diff(samples.get(cur_lap_no, []), samples[ref_lap_no], step)
     peaks_ref = find_peaks_valleys(samples[ref_lap_no])
     peaks_cur = (find_peaks_valleys(samples[cur_lap_no])

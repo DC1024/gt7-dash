@@ -303,11 +303,12 @@ def _load_frames(path: Path) -> tuple[dict, list]:
     return header, frames
 
 
-def compare_session(path: Path, ref_lap_no: int | None = None) -> dict[str, Any]:
+def compare_session(path: Path, ref_lap_no: int | None = None,
+                    cmp_lap_no: int | None = None) -> dict[str, Any]:
     """读场次 jsonl → 圈间对比分析（gt7analysis 纯函数库）。
 
-    `ref_lap_no` 可选：指定参考圈号（赛车线 / 对比基准）。
-    缺省由 gt7analysis 取最快圈。
+    `ref_lap_no` 可选：参考圈号（赛车线 / 对比基准），缺省取最快圈。
+    `cmp_lap_no` 可选：被对比的圈号，缺省取最后一圈。
 
     失败永远返回 {"error": ...} 而不是抛出——对比是增值功能，
     不能因为它挂掉影响详情页主体。
@@ -319,8 +320,28 @@ def compare_session(path: Path, ref_lap_no: int | None = None) -> dict[str, Any]
         # 赛车线抽稀在 gt7analysis.race_line 内部做（decimate=6）。
         # 🔴 不能在这里对每段各自 [::6]：分段后各自抽稀会把每段末尾
         #    到下一个边界的点丢掉，一圈上千个分色段留下上千个断隔。
-        r = gt7analysis.analyze_compare(frames, ref_lap_no=ref_lap_no)
+        r = gt7analysis.analyze_compare(frames, ref_lap_no=ref_lap_no,
+                                        cur_lap_no=cmp_lap_no)
         return r
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def race_line_session(path: Path, lap_no: int, decimate: int = 6) -> dict[str, Any]:
+    """只算某一圈的赛车线（「行车轨迹」卡片切圈用）。
+
+    为什么不复用 compare_session：那张卡要能独立换圈而不重算整页分析，
+    整页 compare 的输出（时间差曲线 / 峰谷配对 / 圈速表）在这个场景里全是
+    白算——一场 217k 帧的场次要几百毫秒。这里只做 clean_laps + 一圈采样。
+
+    🔴 与 compare_session 共用 _load_frames 的解析缓存，不额外读盘。
+    """
+    try:
+        _, all_frames = _load_frames(path)
+        frames = [f for f in all_frames if "lap" in f]
+        import gt7analysis
+        return gt7analysis.race_line_of_lap(frames, int(lap_no),
+                                            decimate=decimate)
     except Exception as e:
         return {"error": str(e)}
 
@@ -951,8 +972,9 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 ### 参数
 
 - `frames=N`：历史帧数，live 默认 120、上限 600；sessions 详情默认 0（不带回帧）
-- `ref_lap=N`（sessions 详情）：指定参考圈号做赛道线/时间差对比分析，
-  默认取最快圈；圈号不存在（如手改 URL）自动回退最快圈。
+- `ref_lap=N`（sessions 详情 / 详情页）：指定参考圈号做行车轨迹/时间差对比分析，
+  默认取最快圈；`cmp_lap=M`：指定被对比的圈，默认取最后一圈。
+  圈号不存在或非有效（如手改 URL）时静默回退默认值。
 - 返回 404 的情形：场次文件名不存在 / 非法路径
 
 ## 字段与单位约定（对外承诺，只加不改）
@@ -1032,7 +1054,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `gg_samples` | `[[横向g, 纵向g], ...]` 约 16Hz 采样的 G-G 散点 |
 
 > `path` 的点位格式在 v1 内**向后兼容地加长**过：早期版本只有 `[x, z, G]` 三个值，
-> 现在补到 7 个（多出的油门/刹车/圈号/速度用于画「参考圈赛车线」）。
+> 现在补到 7 个（多出的油门/刹车/圈号/速度用于画「行车轨迹」）。
 > 消费方请按长度判断，缺字段时把油门/刹车当 0 处理，不要假设一定有 7 个。
 
 ### `history[]`（每帧一条）
@@ -1049,6 +1071,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/series?lap=N&max_points=2400` | 整场（或第 N 圈）的**降采样**时序，用于画曲线 |
 | `GET /api/v1/sessions/<文件名>/frames?offset=0&limit=200&lap=N` | **分页**逐帧数据（`limit` 上限 1000），用于表格 |
 | `GET /api/v1/sessions/<文件名>/csv?lap=N` | 全量 CSV 下载（带 UTF-8 BOM，Excel 直接打开不乱码） |
+| `GET /api/v1/sessions/<文件名>/raceline?lap=N` | 第 N 圈的**行车轨迹**（踏板 + G 力两套着色通道）；`lap` 缺省 = 最快圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -1068,6 +1091,32 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 `total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、
 `sampled_frames`、`step`（抽稀步长）。
 
+## 单圈行车轨迹
+
+`GET /api/v1/sessions/<文件名>/raceline?lap=N` 只算**某一圈**的轨迹（缺省 `lap` = 最快圈，
+该场没有有效圈时返回 `404` + `{"error":"no valid lap"}`）。返回：
+
+| 字段 | 说明 |
+|---|---|
+| `lap` | 实际算的是第几圈 |
+| `segments[]` | 按踏板通道切好的线段数组，每段 `{"color", "pts", "b", "t", "g"}` |
+
+`pts` 是 `[[x, z], ...]`；`b` / `t` / `g` 与 `pts` **一一对齐**（长度相同），
+分别是刹车开度 0~1、油门开度 0~1、合成 G 大小（`hypot(横向G, 纵向G)`）。
+相邻两段首尾点重合（含各通道值），所以前端分多次 `stroke` 也不会有缺口。
+
+> 分段是按**踏板**口径切的（`b`/`t` 判红/绿/滑行）。想按 G 力着色时，把同一条线的
+> 所有点用 `g[]` 重上色即可——分段本身不影响 G 模式观感，只是多几次描边。
+
+## 圈间对比自选两圈
+
+`GET /session?file=…&ref_lap=N&cmp_lap=M` —— `ref_lap` 是参考圈（缺省最快圈），
+`cmp_lap` 是对比圈（缺省最后一圈）。两者都可手改，传入不存在或非有效的圈号会
+**静默回退**到缺省值，不会把详情页打挂；两者撞成同一圈时自动换到另一圈。
+
+⚠️ 时间差曲线是**按距离对齐**的，两圈圈长不同时曲线会截到短的那圈为止，因此
+曲线末端的时间差**不等于**两圈圈速之差。详情页在两圈圈长相差 > 2% 时给出提示。
+
 ## 使用示例
 
 ```bash
@@ -1081,9 +1130,13 @@ curl "http://localhost:8787/api/v1/laps"
 curl "http://localhost:8787/api/v1/sessions"
 curl "http://localhost:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jsonl"
 
-# 详情页分析（赛车线 / 时间差对比）；?ref_lap=N 指定参考圈（缺省=最快圈）
+# 详情页分析（行车轨迹 / 时间差对比）；?ref_lap=N 参考圈（缺省=最快圈）、?cmp_lap=M 对比圈（缺省=最后一圈）
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl"
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&ref_lap=3"
+curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&ref_lap=3&cmp_lap=7"
+
+# 单圈行车轨迹（踏板 + G 力两套着色通道）
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/raceline?lap=3"
 
 # 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"
@@ -1361,16 +1414,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 #    剔除 <20s 的残圈），而不是 analyze_compare 内部拿重采样
                 #    duration 再取 min——两者分母不同，会出现「表格标第 6 圈
                 #    最快、选择器却默认第 8 圈」的对不上。这里显式传 best_lap。
+                # ?cmp_lap=M 指定拿哪一圈跟参考圈比（缺省=最后一圈）。
                 ref_raw = query.get("ref_lap", [""])[0]
+                cmp_raw = query.get("cmp_lap", [""])[0]
                 stats = analyze_session(target)
                 try:
                     ref_lap_no = int(ref_raw) if ref_raw else None
                 except ValueError:
                     ref_lap_no = None
+                try:
+                    cmp_lap_no = int(cmp_raw) if cmp_raw else None
+                except ValueError:
+                    cmp_lap_no = None
                 if ref_lap_no is None:
                     ref_lap_no = (stats.get("best_lap") or {}).get("lap")
                 self._send_html(build_session_page(
-                    target, stats, ref_lap_no=ref_lap_no))
+                    target, stats, ref_lap_no=ref_lap_no,
+                    cmp_lap_no=cmp_lap_no))
 
             elif path == "/api/session":
                 name = query.get("file", [""])[0]
@@ -1450,8 +1510,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             elif path.startswith("/api/v1/sessions/") and (
                     path.endswith("/series") or path.endswith("/frames")
-                    or path.endswith("/csv")):
+                    or path.endswith("/csv") or path.endswith("/raceline")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
+                # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
+                #   不必重算整页对比分析）。
                 # 🔴 必须排在下面那条「通用 /api/v1/sessions/<名>」之前，
                 #    否则会被当成场次名吞掉。
                 seg = path.split("/")
@@ -1470,7 +1532,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     lap_no = None
                 if lap_no is not None and lap_no <= 0:
                     lap_no = None
-                if path.endswith("/csv"):
+                if path.endswith("/raceline"):
+                    if lap_no is None:
+                        # 不给 lap 就直接取最快圈，省得前端先问一次圈速表
+                        st = analyze_session(target)
+                        lap_no = (st.get("best_lap") or {}).get("lap")
+                    if lap_no is None:
+                        self._send_json({"error": "no valid lap", "lap": None,
+                                         "segments": []}, 404, cors=True)
+                        return
+                    self._send_json(race_line_session(target, lap_no), cors=True)
+                elif path.endswith("/csv"):
                     body = session_csv(target, lap_no=lap_no).encode("utf-8")
                     fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"
                     self.send_response(200)
@@ -1913,6 +1985,12 @@ function showLoad(msg) {{
   document.getElementById('loadMsg').textContent = msg || '加载中…';
   ov.style.display = 'flex';
 }}
+// 与 showLoad 配对：页面内异步操作（如按圈单独取行车轨迹）用它收遮罩。
+// 跳转式的加载不需要调它——页面一换遮罩自然没了。
+function hideLoad() {{
+  var ov = document.getElementById('loadOv');
+  if (ov) ov.style.display = 'none';
+}}
 </script>
 <div class="top">
   <a class="back" href="/">&larr; 返回仪表盘</a>
@@ -2080,49 +2158,65 @@ _COMPARE_TMPL = """
 .legend span { display:inline-flex; align-items:center; }
 .legend i { display:inline-block; width:16px; height:4px; border-radius:2px;
   margin-right:5px; }
+.lapbar { display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  margin:2px 0 8px; font-size:12.5px; color:var(--muted); }
+.lapbar label { display:inline-flex; align-items:center; gap:6px; }
+.lapbar select { font-size:12.5px; padding:4px 8px; border:1px solid var(--line);
+  border-radius:7px; background:var(--card); color:inherit; font-family:inherit; }
+.lapbar .side { font-weight:600; color:var(--fg); }
 </style>
 <div class="card">
-  <h2>圈间对比分析 <span id="cmpMeta" style="float:right;font-weight:400"></span></h2>
+  <h2>圈间对比分析</h2>
+  <div class="lapbar">
+    <label>参考圈 <select id="refLapSel" onchange="cmpLapChange()"></select></label>
+    <label>对比圈 <select id="cmpLapSel" onchange="cmpLapChange()"></select></label>
+    <span id="cmpSide" class="side"></span>
+    <span style="flex:1"></span>
+    <span id="cmpMeta"></span>
+  </div>
   <p style="font-size:12px;color:var(--muted);margin-bottom:6px">
-    曲线 = 最新圈相对参考圈的逐距离时间差：<b style="color:var(--bad)">正（上）= 丢时间</b>，
-    <b style="color:var(--ok)">负（下）= 更快</b>。参考圈默认取最快圈。</p>
+    曲线 = <b id="cmpLapName">对比圈</b>相对<b id="refLapName">参考圈</b>的逐距离时间差：
+    <b style="color:var(--bad)">正（上）= 丢时间</b>，
+    <b style="color:var(--ok)">负（下）= 更快</b>。两圈都可自选。</p>
   <p style="font-size:11.5px;color:var(--muted);margin-bottom:4px">
     横轴 = 圈内行驶距离（<b>0 = 起点线</b>），刻度下方的灰色时间是参考圈跑到该位置的时刻；
     红点 = 丢时间最多处，绿点 = 领先最多处。</p>
+  <p class="dim" id="cmpWarn" style="font-size:11.5px;margin:2px 0 4px;display:none"></p>
   <svg id="diffSvg" class="cmp-svg" viewBox="0 0 720 236"></svg>
 </div>
 <div class="card">
-  <h2>参考圈赛车线（第 <span id="rlLap">-</span> 圈）
-    <select id="lapSel" onchange="lapSelChange(this.value)"
-      style="float:right;font-weight:400;font-size:13px;padding:4px 8px;
-             border:1px solid var(--line);border-radius:7px;
-             background:var(--card);color:inherit;font-family:inherit"></select>
+  <h2>行车轨迹（第 <span id="rlLap">-</span> 圈）
+    <span style="float:right;display:flex;gap:8px;align-items:center;text-transform:none">
+      <select id="rlLapSel" onchange="rlLapChange(this.value)"
+        style="font-weight:400;font-size:12.5px;padding:4px 8px;
+               border:1px solid var(--line);border-radius:7px;
+               background:var(--card);color:inherit;font-family:inherit"></select>
+      <select id="rlModeSel" onchange="rlModeChange(this.value)"
+        style="font-weight:400;font-size:12.5px;padding:4px 8px;
+               border:1px solid var(--line);border-radius:7px;
+               background:var(--card);color:inherit;font-family:inherit">
+        <option value="pedal">按踏板着色（赛车线）</option>
+        <option value="g">按 G 力着色</option>
+      </select>
+    </span>
   </h2>
   <canvas id="raceLineCv" width="760" height="440"></canvas>
-  <div class="legend" style="justify-content:center;margin-top:6px">
-    <span><i style="width:30px;background:linear-gradient(90deg,#00bcd4,#00c853)"></i>油门（青 → 绿，越深越浓）</span>
-    <span><i style="width:30px;background:linear-gradient(90deg,#ff69b4,#ff2828)"></i>刹车（粉 → 红，越重越红）</span>
-    <span><i style="background:var(--accent)"></i>滑行</span>
-  </div>
-  <p class="dim" style="font-size:11.5px;margin-top:8px">
-    线色来自参考圈记录的<b>踏板开度百分比</b>：刹车踩得越重越偏红（轻点刹车偏粉），
-    油门踩得越深越偏绿（浅踩偏青）；两段踏板都不踩的滑行段用强调色。
-    可自选要看第几圈的赛车线。默认取最快圈；切换会刷新本页并把整页分析
-    （时间差曲线 / 峰谷表）都以所选圈为基准重算。</p>
+  <div class="legend" id="rlLegend" style="justify-content:center;margin-top:6px"></div>
+  <p class="dim" id="rlHint" style="font-size:11.5px;margin-top:8px"></p>
 </div>
 <div class="card">
   <h2>哪里快 / 哪里慢 —— 关键点对比</h2>
   <div id="pvSummary" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
   <table class="pv-table">
     <thead><tr><th>距离 (m)</th><th>关键点</th>
-      <th style="text-align:right">最新圈</th>
-      <th style="text-align:right">最快圈</th>
+      <th style="text-align:right" id="pvHeadCur">对比圈</th>
+      <th style="text-align:right" id="pvHeadRef">参考圈</th>
       <th style="text-align:right">差值</th></tr></thead>
     <tbody id="pvBody"></tbody>
   </table>
   <p class="dim" style="font-size:11.5px;margin-top:8px">
-    关键点 = 直道尾速（峰）与弯心速度（谷），按距离配对。差值 = 最新圈 − 最快圈：
-    <b style="color:var(--ok)">绿 +</b> 最新圈更快，
+    关键点 = 直道尾速（峰）与弯心速度（谷），按距离配对。差值 = 对比圈 − 参考圈：
+    <b style="color:var(--ok)">绿 +</b> 对比圈更快，
     <b style="color:var(--bad)">红 −</b> 更慢。</p>
 </div>
 <script>
@@ -2133,44 +2227,96 @@ const CMP = __DATA__;
     if (m) m.textContent = '圈数据不足，无法对比（至少跑完一圈的 30 帧）';
     return;
   }
-  document.getElementById('cmpMeta').textContent =
-    '参考圈：第 ' + CMP.ref_lap + ' 圈 · 对比：第 ' + CMP.cur_lap
-    + ' 圈 · 共分析 ' + CMP.laps_analyzed + ' 圈';
-  document.getElementById('rlLap').textContent = CMP.ref_lap;
-
-  // —— 参考圈选择器：列出所有有效圈，默认选中当前参考圈 ——
-  window.lapSelChange = function (v) {
-    const u = new URL(location.href);
-    u.searchParams.set('ref_lap', v);
-    showLoad('正在按第 ' + v + ' 圈重新分析…');
-    location.href = u.toString();
+  // 🔴 「最快」标注必须按真实圈速算，不能贴在当前参考圈上——
+  //    否则用户切到别的圈，选择器会把那一圈也叫「最快」（实测踩过）。
+  //    口径与左侧圈速表一致：≥20s 才算有效圈。
+  const SUMLAPS = CMP.lap_summary || [];
+  const VALIDLAPS = SUMLAPS.filter(s => s.duration_s >= 20);
+  const FASTEST = VALIDLAPS.length
+    ? VALIDLAPS.reduce((a, s) => s.duration_s < a.duration_s ? s : a).lap : null;
+  const lapDur = n => {
+    const s = SUMLAPS.filter(x => x.lap === n)[0];
+    return s ? s.duration_s : null;
   };
-  (function fillLapSel() {
-    const sel = document.getElementById('lapSel');
+  const lapDist = n => {
+    const s = SUMLAPS.filter(x => x.lap === n)[0];
+    return s ? s.distance_m : null;
+  };
+  function lapOpts(sel, selVal, role) {
     if (!sel) return;
-    const sum = CMP.lap_summary || [];
-    if (sum.length < 2) {          // 只有一圈时没必要选
-      sel.style.display = 'none';
-      return;
-    }
-    // 🔴 「最快」标注必须按真实圈速算，不能贴在当前参考圈上——
-    //    否则用户切到别的圈，选择器会把那一圈也叫「最快」（实测踩过）。
-    //    口径与左侧圈速表一致：≥20s 才算有效圈。
-    const valid = sum.filter(s => s.duration_s >= 20);
-    const fastestLap = valid.length
-      ? valid.reduce((a, s) => s.duration_s < a.duration_s ? s : a).lap : null;
-    sum.forEach(function (s) {
+    sel.innerHTML = '';
+    SUMLAPS.forEach(function (s) {
       const o = document.createElement('option');
       const tags = [];
-      if (s.lap === fastestLap) tags.push('最快');
-      if (s.lap === CMP.ref_lap && s.lap !== fastestLap) tags.push('参考圈');
+      if (s.lap === FASTEST) tags.push('最快');
+      if (s.lap === selVal && s.lap !== FASTEST) tags.push(role);
       o.value = s.lap;
       o.textContent = '第 ' + s.lap + ' 圈 · ' + s.duration_s.toFixed(1) + 's'
         + (tags.length ? '（' + tags.join('·') + '）' : '');
-      if (s.lap === CMP.ref_lap) o.selected = true;
+      if (s.lap === selVal) o.selected = true;
       sel.appendChild(o);
     });
-  })();
+  }
+
+  function refreshCmpLabels() {
+    const rl = CMP.ref_lap, cl = CMP.cur_lap;
+    const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+    set('refLapName', '第 ' + rl + ' 圈');
+    set('cmpLapName', '第 ' + cl + ' 圈');
+    set('pvHeadRef', '参考圈 第 ' + rl + ' 圈');
+    set('pvHeadCur', '对比圈 第 ' + cl + ' 圈');
+    const rd = lapDur(rl), cd = lapDur(cl);
+    const side = document.getElementById('cmpSide');
+    if (side && rd != null && cd != null) {
+      const diff = cd - rd;
+      side.innerHTML = '第 ' + cl + ' 圈比第 ' + rl + ' 圈 '
+        + (diff <= 0 ? '<span style="color:var(--ok)">快 '
+          : '<span style="color:var(--bad)">慢 ')
+        + Math.abs(diff).toFixed(3) + 's</span>';
+    }
+    const meta = document.getElementById('cmpMeta');
+    if (meta) {
+      meta.textContent = '共分析 ' + CMP.laps_analyzed + ' 圈';
+    }
+    // 🔴 两圈圈长差别大时要明说。时间差曲线是按**距离**对齐的，
+    //    只画到两圈中较短的那条；圈长差得多时，曲线末端的正负号完全
+    //    可能与「总圈速差」相反——不提示的话用户会以为数据算错了。
+    const warn = document.getElementById('cmpWarn');
+    if (warn) {
+      const rd2 = lapDist(rl), cd2 = lapDist(cl);
+      if (rd2 && cd2 && Math.abs(rd2 - cd2) / Math.max(rd2, cd2) > 0.01) {
+        warn.style.display = 'block';
+        warn.innerHTML = '⚠️ 两圈<b>圈长不同</b>（第 ' + rl + ' 圈 '
+          + Math.round(rd2) + 'm，第 ' + cl + ' 圈 ' + Math.round(cd2)
+          + 'm）：曲线是按距离对齐的，只画到较短的那一圈，'
+          + '所以曲线末端的高低可能与上面的<b>总圈速差</b>不一致。';
+      } else {
+        warn.style.display = 'none';
+      }
+    }
+  }
+  refreshCmpLabels();
+
+  // —— 参考圈 / 对比圈选择器：改任意一个都带两个参数刷新本页 ——
+  // 时间差曲线、峰谷配对、赛车线都依赖「哪两圈」，只能在服务端重算。
+  window.cmpLapChange = function () {
+    const rs = document.getElementById('refLapSel');
+    const cs = document.getElementById('cmpLapSel');
+    const u = new URL(location.href);
+    if (rs) u.searchParams.set('ref_lap', rs.value);
+    if (cs) u.searchParams.set('cmp_lap', cs.value);
+    showLoad('正在按第 ' + (rs ? rs.value : '?') + ' 圈 vs 第 '
+      + (cs ? cs.value : '?') + ' 圈重新分析…');
+    location.href = u.toString();
+  };
+  lapOpts(document.getElementById('refLapSel'), CMP.ref_lap, '参考圈');
+  lapOpts(document.getElementById('cmpLapSel'), CMP.cur_lap, '对比圈');
+  const refSelEl = document.getElementById('refLapSel');
+  const cmpSelEl = document.getElementById('cmpLapSel');
+  if (SUMLAPS.length < 2) {        // 只有一圈时没必要选
+    if (refSelEl) refSelEl.style.display = 'none';
+    if (cmpSelEl) cmpSelEl.style.display = 'none';
+  }
 
   // —— 时间差曲线（带坐标参考：X=圈内距离+参考圈时刻，Y=毫秒） ——
   const d = CMP.time_diff, svg = document.getElementById('diffSvg');
@@ -2250,11 +2396,13 @@ const CMP = __DATA__;
     svg.innerHTML = html;
   }
 
-  // —— 踏板渐变赛车线 ——
-  // 线色直接来自记录的油门 / 刹车开度百分比：刹车「粉→红」（踩得越重越红），
-  // 油门「青→绿」（踩得越深越绿），两个都不踩 = 滑行（用强调色）。
-  // 后端 race_line 已按通道切段，并把每点的开度 b[] / t[] 与 pts[] 一一对齐；
-  // 这里逐「子线段」取两端开度均值插值上色，于是得到连续渐变而不是三块死色。
+  // —— 行车轨迹（两套着色口径）——
+  // 「按踏板着色」：线色来自记录的油门 / 刹车开度百分比，刹车「粉→红」、
+  //   油门「青→绿」、都不踩 = 滑行。后端 race_line 已按通道切段，并把每点的
+  //   开度 b[] / t[] 与 pts[] 一一对齐；这里逐「子线段」取两端均值插值上色，
+  //   于是得到连续渐变而不是三块死色。
+  // 「按 G 力着色」：线色来自合成 G 大小（横向 + 纵向），与实时仪表盘
+  //   「按 G 力着色」同一套配色 —— 直观看哪里最吃抓地力。
   //
   // 画成 drawRaceLineInto(cv, W, H) 是为了「点击放大」能按放大后的真实像素
   // 重画——把原来的位图拉大只会糊。
@@ -2274,12 +2422,110 @@ const CMP = __DATA__;
     if (ch === 'throttle') return mix(CYAN, GREEN, k);
     return cvar('--accent');
   };
+  // 🔴 G 力配色与实时仪表盘页的 gColor() 必须逐字一致（蓝→绿→橙→红，0~3g），
+  //    否则同一辆车在实时页和历史页会是两种配色。改了记得两边一起改
+  //    （tests/test_color_sync.py 会拦）。
+  function gColor(g) {
+    const t = Math.min(Math.max(g, 0) / 3, 1);
+    const lerp = (a, b, k) => a + (b - a) * k;
+    let r, gr, b;
+    if (t < 0.34) {
+      const k = t / 0.34;
+      r = lerp(13, 25, k); gr = lerp(110, 135, k); b = lerp(253, 84, k);
+    } else if (t < 0.67) {
+      const k = (t - 0.34) / 0.33;
+      r = lerp(25, 253, k); gr = lerp(135, 126, k); b = lerp(84, 20, k);
+    } else {
+      const k = (t - 0.67) / 0.33;
+      r = lerp(253, 220, k); gr = lerp(126, 53, k); b = lerp(20, 69, k);
+    }
+    return 'rgb(' + (r | 0) + ',' + (gr | 0) + ',' + (b | 0) + ')';
+  }
+
+  // 状态：着色模式（记进 localStorage，属于显示偏好）、当前圈、当前段数据
+  const RL_LAPS = (CMP.lap_summary || []).map(s => s.lap);
+  let rlMode = 'pedal';
+  try { if (localStorage.getItem('gt7_rl_mode') === 'g') rlMode = 'g'; } catch (e) {}
+  let rlLap = CMP.ref_lap;
+  let rlSegs = (CMP.race_line || {}).segments || [];
+
+  const PEDAL_LEGEND = '<span><i style="width:30px;background:linear-gradient(90deg,#00bcd4,#00c853)"></i>'
+    + '油门（青 → 绿，越深越浓）</span>'
+    + '<span><i style="width:30px;background:linear-gradient(90deg,#ff69b4,#ff2828)"></i>'
+    + '刹车（粉 → 红，越重越红）</span>'
+    + '<span><i style="background:var(--accent)"></i>滑行</span>';
+  const G_LEGEND = '<span><i style="width:64px;background:linear-gradient(90deg,'
+    + 'rgb(13,110,253),rgb(25,135,84) 34%,rgb(253,126,20) 67%,rgb(220,53,69))"></i>'
+    + '低 G → 高 G（0g → 3g+）</span>';
+  const PEDAL_HINT = '线色来自该圈记录的<b>踏板开度百分比</b>：刹车踩得越重越偏红'
+    + '（轻点刹车偏粉），油门踩得越深越偏绿（浅踩偏青）；两段踏板都不踩的'
+    + '滑行段用强调色。';
+  const G_HINT = '线色来自该圈记录的<b>合成 G 力大小</b>（横向 + 纵向）：'
+    + '0g 偏蓝、约 1.5g 转绿、3g 以上转红。弯心横向 G 高、直道低，'
+    + '一眼看出哪里最吃抓地力。与实时仪表盘的「按 G 力着色」是同一套配色。';
+
+  function refreshRlUI() {
+    const lg = document.getElementById('rlLegend');
+    if (lg) lg.innerHTML = rlMode === 'g' ? G_LEGEND : PEDAL_LEGEND;
+    const hn = document.getElementById('rlHint');
+    if (hn) hn.innerHTML = (rlMode === 'g' ? G_HINT : PEDAL_HINT)
+      + ' 上方可切<b>看第几圈的轨迹</b>（默认跟随参考圈）。';
+    const lb = document.getElementById('rlLap');
+    if (lb) lb.textContent = rlLap;
+    const ms = document.getElementById('rlModeSel');
+    if (ms) ms.value = rlMode;
+  }
+
+  window.rlModeChange = function (v) {
+    rlMode = (v === 'g') ? 'g' : 'pedal';
+    try { localStorage.setItem('gt7_rl_mode', rlMode); } catch (e) {}
+    refreshRlUI();
+    drawRaceLineInto(cv, cv.width, cv.height);
+  };
+
+  window.rlLapChange = function (v) {
+    const n = parseInt(v, 10) || 0;
+    if (!n || n === rlLap) return;
+    rlLap = n;
+    // 只取这一圈的赛车线，不刷新整页 —— 走 /raceline，
+    // 免得为了换个圈的轨迹把整场 200k 帧的对比分析重算一遍。
+    if (typeof showLoad === 'function') showLoad('正在读取第 ' + n + ' 圈的轨迹…');
+    const url = '/api/v1/sessions/' + encodeURIComponent(CMP.file || '')
+      + '/raceline?lap=' + n;
+    fetch(url).then(r => r.json()).then(function (d) {
+      rlSegs = (d && !d.error) ? (d.segments || []) : [];
+      refreshRlUI();
+      drawRaceLineInto(cv, cv.width, cv.height);
+      if (typeof hideLoad === 'function') hideLoad();
+    }).catch(function () {
+      rlSegs = [];
+      refreshRlUI();
+      drawRaceLineInto(cv, cv.width, cv.height);
+      if (typeof hideLoad === 'function') hideLoad();
+    });
+  };
+
+  (function fillRlLapSel() {
+    const sel = document.getElementById('rlLapSel');
+    if (!sel) return;
+    if (RL_LAPS.length < 2) { sel.style.display = 'none'; return; }
+    sel.innerHTML = RL_LAPS.map(function (n) {
+      return '<option value="' + n + '"' + (n === rlLap ? ' selected' : '')
+        + '>第 ' + n + ' 圈</option>';
+    }).join('');
+  })();
 
   function drawRaceLineInto(canvas, W, H) {
     const ctx = canvas.getContext('2d');
-    const segs = (CMP.race_line || {}).segments || [];
     ctx.clearRect(0, 0, W, H);
-    if (!segs.length) return;
+    const segs = rlSegs;
+    if (!segs.length) {
+      ctx.fillStyle = cvar('--muted');
+      ctx.font = '13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('这一圈没有可用的轨迹数据', W / 2, H / 2);
+      return;
+    }
     let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
     segs.forEach(s => s.pts.forEach(p => {
       if (p[0] == null) return;
@@ -2295,15 +2541,20 @@ const CMP = __DATA__;
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     ctx.lineWidth = Math.max(3.2, W / 240);
     segs.forEach(s => {
-      const b = s.b || [], t = s.t || [];
+      const b = s.b || [], t = s.t || [], g = s.g || [];
       for (let i = 1; i < s.pts.length; i++) {
         const a = s.pts[i - 1], c = s.pts[i];
         if (a[0] == null || c[0] == null) continue;
-        // 子线段强度 = 两端开度均值：刹车段读 b[]，油门段读 t[]
-        let k = 0;
-        if (s.color === 'brake') k = ((b[i - 1] || 0) + (b[i] || 0)) / 2;
-        else if (s.color === 'throttle') k = ((t[i - 1] || 0) + (t[i] || 0)) / 2;
-        ctx.strokeStyle = segColor(s.color, k);
+        if (rlMode === 'g') {
+          // G 模式与通道无关，整条线按合成 G 重上色
+          ctx.strokeStyle = gColor(((g[i - 1] || 0) + (g[i] || 0)) / 2);
+        } else {
+          // 子线段强度 = 两端开度均值：刹车段读 b[]，油门段读 t[]
+          let k = 0;
+          if (s.color === 'brake') k = ((b[i - 1] || 0) + (b[i] || 0)) / 2;
+          else if (s.color === 'throttle') k = ((t[i - 1] || 0) + (t[i] || 0)) / 2;
+          ctx.strokeStyle = segColor(s.color, k);
+        }
         ctx.beginPath();
         ctx.moveTo(px(a[0]), py(a[1]));
         ctx.lineTo(px(c[0]), py(c[1]));
@@ -2312,12 +2563,13 @@ const CMP = __DATA__;
     });
   }
 
+  refreshRlUI();
   drawRaceLineInto(cv, cv.width, cv.height);
 
-  // 详情页的赛车线也能点击放大（与仪表盘用同一套放大组件）
+  // 详情页的行车轨迹也能点击放大（与仪表盘用同一套放大组件）
   if (window.registerZoom) {
     registerZoom('raceLine', {
-      title: '参考圈赛车线', kind: 'canvas', ar: 760 / 440,
+      title: '行车轨迹', kind: 'canvas', ar: 760 / 440,
       draw: function (c, W, H) { drawRaceLineInto(c, W, H); }
     });
     makeZoomable(cv, 'raceLine');
@@ -2329,7 +2581,7 @@ const CMP = __DATA__;
   }
 
   // —— 关键点对比表（服务端已按圈内相对位置配好对）——
-  // 口径：差值 = 最新圈 − 最快圈。正 = 最新圈更快（绿），负 = 更慢（红）。
+  // 口径：差值 = 对比圈 − 参考圈。正 = 对比圈更快（绿），负 = 更慢（红）。
   const rows = CMP.pv_pairs || [];
   const kindTxt = k => k === 'peak' ? '直道尾速' : '弯心速度';
   const dTxt = d => (d > 0 ? '+' : '') + d.toFixed(1);
@@ -2960,13 +3212,19 @@ def build_sessions_page(hist: Path) -> str:
     return _page_shell("历史场次", body)
 
 
-def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None) -> str:
+def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
+                       cmp_lap_no: int | None = None) -> str:
     """单场次详情：把离线统计展示成人能读的页面。"""
     import html as _html
     try:
-        cmp_data = compare_session(path, ref_lap_no=ref_lap_no)
+        cmp_data = compare_session(path, ref_lap_no=ref_lap_no,
+                                   cmp_lap_no=cmp_lap_no)
     except Exception:
         cmp_data = {}
+    if isinstance(cmp_data, dict):
+        # 前端「行车轨迹」卡片要按圈单独拉赛车线（不重算整页），得知道是哪一场。
+        # 塞进 CMP 里比再加一个字符串占位符省事，也不会被 JSON 转义搞坏。
+        cmp_data["file"] = path.name
     cmp_json = json.dumps(cmp_data, ensure_ascii=False).replace("</", "<\\/")
 
     if "error" in stats:
@@ -4412,7 +4670,7 @@ function pedalColor(b, t, coastCol) {
 // 🔴 旧场次/旧接收器只有 [x, z, gmag] 三个值，缺失的踏板按 0 处理，
 //    此时 pedal 模式等价于整条线都是滑行色——不能因此报错或画不出图。
 //
-// mapLapNo：0 = 画整场累积轨迹；N = 只画第 N 圈（这就是「参考圈赛车线」）。
+// mapLapNo：0 = 画整场累积轨迹；N = 只画第 N 圈（这就是「行车轨迹」按圈看）。
 // 它是每场重来的运行时状态，刻意不写进偏好（换一场圈号就无意义了）。
 let mapLapNo = 0;
 function mapPoint(p, i) {
@@ -4433,7 +4691,7 @@ function drawMapInto(cv, W, H, rawPath, mode, lapNo) {
   const PAD = Math.round(W * 0.026) + 6;
   const info = $('mapinfo');
 
-  // 选圈时只画那一圈（这就是「参考圈赛车线」）；否则画整场累积轨迹
+  // 选圈时只画那一圈（这就是「行车轨迹」的单圈视图）；否则画整场累积轨迹
   let pts = (rawPath || []).map(mapPoint);
   if (lapNo) pts = pts.filter(p => p.lap === lapNo);
   if (pts.length < 2) {
@@ -4518,7 +4776,7 @@ function refreshMapLegend() {
       '<span><i style="background:var(--accent)"></i>滑行</span>';
     if (hint) hint.textContent = '线色来自逐帧记录的踏板开度百分比：刹车踩得越重越红，' +
       '油门踩得越深越绿，两个都不踩的滑行段用强调色。选「整场」看本次全部行驶轨迹；' +
-      '选某一圈就得到那一圈的「参考圈赛车线」——用来复盘自己每一脚的给油/刹车。';
+      '选某一圈就得到那一圈的行车轨迹——用来复盘自己每一脚的给油/刹车。';
   } else {
     lg.innerHTML =
       '<span><i style="background:#0d6efd"></i>低 G</span>' +

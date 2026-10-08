@@ -115,7 +115,7 @@
 | `gg_samples` | `[[横向g, 纵向g], ...]` 约 16Hz 采样的 G-G 散点 |
 
 > `path` 的点位格式在 v1 内**向后兼容地加长**过：早期版本只有 `[x, z, G]` 三个值，
-> 现在补到 7 个（多出的油门/刹车/圈号/速度用于画「参考圈赛车线」）。
+> 现在补到 7 个（多出的油门/刹车/圈号/速度用于画「行车轨迹」）。
 > 消费方请按长度判断，缺字段时把油门/刹车当 0 处理，不要假设一定有 7 个。
 
 ### `history[]`（每帧一条）
@@ -132,6 +132,7 @@
 | `GET /api/v1/sessions/<文件名>/series?lap=N&max_points=2400` | 整场（或第 N 圈）的**降采样**时序，用于画曲线 |
 | `GET /api/v1/sessions/<文件名>/frames?offset=0&limit=200&lap=N` | **分页**逐帧数据（`limit` 上限 1000），用于表格 |
 | `GET /api/v1/sessions/<文件名>/csv?lap=N` | 全量 CSV 下载（带 UTF-8 BOM，Excel 直接打开不乱码） |
+| `GET /api/v1/sessions/<文件名>/raceline?lap=N` | 第 N 圈的**行车轨迹**（踏板 + G 力两套着色通道）；`lap` 缺省 = 最快圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -151,6 +152,32 @@
 `total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、
 `sampled_frames`、`step`（抽稀步长）。
 
+## 单圈行车轨迹
+
+`GET /api/v1/sessions/<文件名>/raceline?lap=N` 只算**某一圈**的轨迹（缺省 `lap` = 最快圈，
+该场没有有效圈时返回 `404` + `{"error":"no valid lap"}`）。返回：
+
+| 字段 | 说明 |
+|---|---|
+| `lap` | 实际算的是第几圈 |
+| `segments[]` | 按踏板通道切好的线段数组，每段 `{"color", "pts", "b", "t", "g"}` |
+
+`pts` 是 `[[x, z], ...]`；`b` / `t` / `g` 与 `pts` **一一对齐**（长度相同），
+分别是刹车开度 0~1、油门开度 0~1、合成 G 大小（`hypot(横向G, 纵向G)`）。
+相邻两段首尾点重合（含各通道值），所以前端分多次 `stroke` 也不会有缺口。
+
+> 分段是按**踏板**口径切的（`b`/`t` 判红/绿/滑行）。想按 G 力着色时，把同一条线的
+> 所有点用 `g[]` 重上色即可——分段本身不影响 G 模式观感，只是多几次描边。
+
+## 圈间对比自选两圈
+
+`GET /session?file=…&ref_lap=N&cmp_lap=M` —— `ref_lap` 是参考圈（缺省最快圈），
+`cmp_lap` 是对比圈（缺省最后一圈）。两者都可手改，传入不存在或非有效的圈号会
+**静默回退**到缺省值，不会把详情页打挂；两者撞成同一圈时自动换到另一圈。
+
+⚠️ 时间差曲线是**按距离对齐**的，两圈圈长不同时曲线会截到短的那圈为止，因此
+曲线末端的时间差**不等于**两圈圈速之差。详情页在两圈圈长相差 > 2% 时给出提示。
+
 ## 使用示例
 
 ```bash
@@ -164,9 +191,13 @@ curl "http://localhost:8787/api/v1/laps"
 curl "http://localhost:8787/api/v1/sessions"
 curl "http://localhost:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jsonl"
 
-# 详情页分析（赛车线 / 时间差对比）；?ref_lap=N 指定参考圈（缺省=最快圈）
+# 详情页分析（行车轨迹 / 时间差对比）；?ref_lap=N 参考圈（缺省=最快圈）、?cmp_lap=M 对比圈（缺省=最后一圈）
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl"
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&ref_lap=3"
+curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&ref_lap=3&cmp_lap=7"
+
+# 单圈行车轨迹（踏板 + G 力两套着色通道）
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/raceline?lap=3"
 
 # 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"
