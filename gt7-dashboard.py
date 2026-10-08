@@ -428,6 +428,43 @@ def _best_lap_of(path: Path) -> float | None:
     return best
 
 
+def _is_anomalous(best) -> bool:
+    """异常场次：没有任何完成圈（best=None），或唯一圈 <20s（本应用口径 <20s 不算有效圈）。"""
+    return best is None or (isinstance(best, (int, float)) and best < 20)
+
+
+def _recording_active(history_dir: Path) -> bool:
+    """借状态文件判断此刻是否正在录制，避免在 list_sessions 时把进行中的比赛误移进回收站。"""
+    st = history_dir / "status.json"
+    if not st.is_file():
+        return False
+    try:
+        p = json.loads(st.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not p.get("recording"):
+        return False
+    ts = p.get("t")
+    if not isinstance(ts, (int, float)):
+        return False
+    # 状态文件 20Hz 更新；10s 内无更新说明数据流已断（车关机/断开）
+    return (time.time() - float(ts)) < 10.0
+
+
+def _move_session_to_trash(f: Path, history_dir: Path) -> bool:
+    """把单场 jsonl 移入 _trash，成功返回 True（回收站已有同名 / 失败返回 False）。"""
+    trash = history_dir / "_trash"
+    dest = trash / f.name
+    if dest.exists():
+        return False
+    try:
+        trash.mkdir(exist_ok=True)
+        f.rename(dest)
+        return True
+    except OSError:
+        return False
+
+
 DEFAULT_NAME_TEMPLATE = "{车型} {时间} {最快圈}"
 
 
@@ -470,6 +507,9 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     tpl = load_settings(history_dir).get(
         "session_name_template", DEFAULT_NAME_TEMPLATE)
     sessions = []
+    # 是否正在录制（一次判定，循环内复用）——用于保护活场不被自动归档
+    live = _recording_active(history_dir)
+    now = time.time()
     for f in sorted(history_dir.glob("*.jsonl"), reverse=True)[:limit]:
         try:
             stat = f.stat()
@@ -483,6 +523,13 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
             time_str = (f"{ts[4:6]}-{ts[6:8]} {tod[:2]}:{tod[2:4]}"
                         if len(ts) >= 8 and len(tod) >= 4 else "")
             best = _best_lap_of(f)
+            anomalous = _is_anomalous(best)
+            # 异常场次（菜单/停车场/刚点火残片：无完成圈或唯一圈 <20s）直接归档到
+            # 回收站，可恢复；但「正在录制且文件近 20s 内被写入」的活场不挪动，
+            # 否则会把刚开跑、还没跑完一圈的比赛误判并移位。
+            if anomalous and not (live and (now - stat.st_mtime) < 20.0):
+                if _move_session_to_trash(f, history_dir):
+                    continue
             entry = {
                 "file": f.name,
                 "timestamp": parts[0] if parts else "",
@@ -494,11 +541,7 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                 ),
                 "car_name": car_name,
                 "best_lap_s": best,
-                # 异常场次：没有任何完成圈（best=None），或唯一圈 <20s
-                # （本应用口径 <20s 不算有效圈）。这类是菜单/停车场/刚点火的
-                # 残片，可一键清掉，但又怕误删正在跑的场——所以只标记 + 提供
-                # 「只看异常」筛选 + 一键清理到回收站（可恢复），不自动删。
-                "anomalous": best is None or (isinstance(best, (int, float)) and best < 20),
+                "anomalous": anomalous,
                 "time_str": time_str,
                 # —— 用户标注 ——
                 "favorite": bool(m.get("favorite")),
@@ -733,7 +776,9 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 （`favorite: bool`、`custom_name: string`），收藏的场次排在最前。
 列表每项还带 `car_name`（车型短名，从 `cars.csv` 查 ShortName，查不到为空串）。
 `anomalous: bool` 表示异常场次（没有任何完成圈 / 唯一圈 <20s，多为菜单、停车场、
-刚点火的残片），历史场次页会打「异常」徽标并提供「清理异常场次 → 回收站」入口。
+刚点火的残片）。这类场次在「历史场次」页加载时会**自动归档到下方回收站**（可恢复，
+保留期内可一键恢复），因此主列表里通常看不到它们；回收站卡片内可勾选「只看异常场次」
+单独筛出这些异常项。进行中的活场不会被误移（靠 status.json 的录制状态保护）。
 
 ### 参数
 
@@ -1223,11 +1268,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 for tf in sorted(tfiles, key=lambda x: x.name, reverse=True):
                     try:
                         st = tf.stat()
+                        tb = _best_lap_of(tf)
                         trash_items.append({
                             "name": tf.name,
                             "size_kb": round(st.st_size / 1024, 1),
                             "modified": datetime.fromtimestamp(
                                 st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                            "anomalous": _is_anomalous(tb),
                         })
                     except OSError:
                         continue
@@ -1544,13 +1591,16 @@ function loadTrashSettings() {
         // 这段 JS 又是被 Python 三引号字符串包着的，单反斜杠会被 Python 先吃掉，
         // 生成 'trashPost('' + t.name' 这种坏语法（整段脚本直接不执行）。
         var nm = String(t.name).replace(/"/g, '&quot;');
-        return '<tr><td style="font-size:12px;font-family:var(--mono)">' + t.name +
+        var anom = t.anomalous ? '1' : '0';
+        var badge = t.anomalous ? ' <span class="anom-badge">异常</span>' : '';
+        return '<tr data-anom="' + anom + '"><td style="font-size:12px;font-family:var(--mono)">' + t.name + badge +
           '</td><td class="num">' + t.size_kb + ' KB</td><td class="num">' + t.modified +
           '</td><td class="num">' +
           '<button class="sbtn" data-trash="' + nm + '" data-act="restore">↩ 恢复</button>' +
           '<button class="sbtn" data-trash="' + nm + '" data-act="delete">✕ 彻底删除</button>' +
           '</td></tr>';
       }).join('') + '</table>';
+    applyTrashFilters();
   });
 }
 document.getElementById('trashList').addEventListener('click', function (e) {
@@ -1608,25 +1658,14 @@ function saveRetention() {
 loadTrashSettings();
 function applySessFilters() {
   var fav = document.getElementById('favOnly').checked;
-  var anom = document.getElementById('anomOnly').checked;
   document.querySelectorAll('#sessTable tr[data-fav]').forEach(function (tr) {
-    var okFav = !fav || tr.dataset.fav === '1';
-    var okAnom = !anom || tr.dataset.anom === '1';
-    tr.style.display = (okFav && okAnom) ? '' : 'none';
+    tr.style.display = (!fav || tr.dataset.fav === '1') ? '' : 'none';
   });
 }
-function cleanAnom() {
-  var rows = Array.prototype.slice.call(
-    document.querySelectorAll('#sessTable tr[data-anom="1"]'));
-  if (!rows.length) { alert('当前没有异常场次'); return; }
-  var names = rows.map(function (r) { return r.dataset.file; }).filter(Boolean);
-  if (!confirm('将 ' + names.length + ' 个异常场次移入回收站？\\n（保留期内可恢复）')) return;
-  var done = 0;
-  names.forEach(function (f) {
-    fetch('/api/v1/sessions/' + encodeURIComponent(f) + '/delete', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
-    }).then(function () { if (++done === names.length) location.reload(); })
-      .catch(function () { if (++done === names.length) location.reload(); });
+function applyTrashFilters() {
+  var anom = document.getElementById('anomTrashOnly').checked;
+  document.querySelectorAll('#trashList tr[data-anom]').forEach(function (tr) {
+    tr.style.display = (!anom || tr.dataset.anom === '1') ? '' : 'none';
   });
 }
 function sessDel(file) {
@@ -1941,17 +1980,11 @@ def build_sessions_page(hist: Path) -> str:
     body = f"""
 <div class="card">
   <h2>共 {len(sessions)} 个场次
-    <label style="float:right;font-weight:400;font-size:12px;cursor:pointer;margin-left:10px">
-      <input type="checkbox" id="anomOnly" onchange="applySessFilters()"> 只看异常场次
-    </label>
     <label style="float:right;font-weight:400;font-size:12px;cursor:pointer">
       <input type="checkbox" id="favOnly" onchange="applySessFilters()"> 只看收藏 ★
     </label></h2>
-  <div style="margin:2px 0 8px">
-    <button class="sbtn" style="border-color:var(--bad);color:var(--bad)"
-      onclick="cleanAnom()">🧹 清理异常场次 → 回收站</button>
-    <span id="anomHint" style="font-size:12px;color:var(--muted);margin-left:6px"></span>
-  </div>
+  <p style="font-size:12.5px;color:var(--muted);margin:-4px 0 8px">
+    异常场次（菜单/停车场/刚点火残片：无完成圈或唯一圈 &lt;20s）会在加载时自动归档到下方「回收站」，可恢复。</p>
   <table id="sessTable">
     <tr><th>场次</th><th>车型</th><th>采集时间</th>
         <th style="text-align:right">大小</th>
@@ -1984,6 +2017,8 @@ def build_sessions_page(hist: Path) -> str:
   <p style="font-size:12.5px;color:var(--muted)">
     删除的场次先移入 <b>data/_trash/</b>，超过保留期后由服务自动真删
     （每小时检查一次，设 <b>0</b> 天 = 永不自动清理）；也可以在这里手动清理。</p>
+  <label style="font-size:12px;cursor:pointer;margin:2px 0 8px;display:inline-block">
+    <input type="checkbox" id="anomTrashOnly" onchange="applyTrashFilters()"> 只看异常场次</label>
   <div id="trashInfo" style="font-size:13px;margin:10px 0">加载中…</div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <label style="font-size:13px">保留天数：
