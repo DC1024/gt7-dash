@@ -3891,6 +3891,14 @@ applyPrefs();             // 再把主题/单位/图表偏好应用到页面上
 def main() -> int:
     global PAGE, HUB
 
+    # Windows 控制台默认 GBK 编码，遇到 ⚠/emoji 会 UnicodeEncodeError 直接崩溃
+    # （打包成 exe 后尤其明显）。放宽为「不可编码字符用 ? 代替」即可避免。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
     p = argparse.ArgumentParser(description="GT7 遥测 Web 仪表盘")
     p.add_argument("-p", "--port", type=int, default=8787, help="监听端口，默认 8787")
     p.add_argument("--bind", default="0.0.0.0", help="绑定地址，默认 0.0.0.0")

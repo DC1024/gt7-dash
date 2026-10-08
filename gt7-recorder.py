@@ -1627,6 +1627,15 @@ def now_is_set(x: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    # Windows 控制台默认 GBK 编码，遇到 ⚠/emoji（帮助文本与日志里都有）会
+    # UnicodeEncodeError 直接崩溃；打包成 exe 时尤其致命。放宽为「不可编码
+    # 字符用 ? 代替」，只影响显示，不影响功能。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
     p = argparse.ArgumentParser(
         description="GT7 遥测接收服务 —— 常驻监听并按场次落盘",
         formatter_class=argparse.RawDescriptionHelpFormatter,
