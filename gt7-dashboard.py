@@ -1726,6 +1726,9 @@ def _events_compute(det, path: Path, grouped: dict, memo: dict,
                     "src": "slip",
                 })
     events.sort(key=lambda e: (e["lap"], e["t_rel"]))
+    # 每圈时长（秒）：前端给时间条定刻度用（条的全宽 = 该圈时长）
+    lap_durs = {int(ln): round(fs[-1].get("t") - fs[0].get("t"), 3)
+                for ln, fs in grouped.items() if len(fs) >= 2}
     calib_out = {k: calib.get(k) for k in
                  ("available", "front_m", "rear_m", "ratio", "ok", "reason")}
     if calib_out.get("front_m") is not None:
@@ -1736,6 +1739,7 @@ def _events_compute(det, path: Path, grouped: dict, memo: dict,
         "calibration": calib_out,
         "laps": (sorted(int(n) for n in grouped.keys())
                  if lap_no is None else [int(lap_no)]),
+        "lap_durs": lap_durs,
         "lap_scope": int(lap_no) if lap_no else 0,
         "events": events,
         "type_names": _EVENT_TYPE_NAMES,
@@ -4600,6 +4604,221 @@ _ANALYSIS_TMPL = r"""
 """
 
 
+# 场次详情页的「驾驶事件时间线」卡片。
+#
+# 数据来自 /api/v1/sessions/<名>/events（冷路径 ~10s，服务端记忆化），
+# 与 sectors/slip 一样**展开时才取**。渲染三块：类型计数条、逐圈时间条
+# （事件为彩色线段）、明细表。点时间条线段或表格行 → telePinAt(lap, t_rel)
+# 让遥测卡切圈并钉住十字光标（联动接口在 _TELEMETRY_TMPL 里）。
+_EVENTS_TMPL = r"""
+<div class="card" id="cardEvents">
+  <h2>驾驶事件时间线
+    <span style="float:right;display:flex;gap:8px;align-items:center;text-transform:none">
+      <span id="evMeta" style="font-weight:400;color:var(--muted)"></span>
+      <select id="evLapSel" onchange="evPick(this.value)"
+        style="font-weight:400;font-size:12px;padding:3px 7px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"></select>
+    </span>
+  </h2>
+  <div id="evBody"><p class="an-note">正在检测事件…（首次约 10 秒）</p></div>
+</div>
+
+<script>
+// ---------- 场次详情页 · 驾驶事件时间线 ----------
+(function () {
+  var FILE = '__FILE__';
+  var API = '/api/v1/sessions/' + encodeURIComponent(FILE);
+  var EV = null, evLap = 0;
+  var TYPE_C = {
+    collision: '#dc3545', spin: '#e8590c', off_track: '#f08c00',
+    hard_braking: '#0d6efd', heavy_throttle: '#198754', tyre_abuse: '#7048e8'
+  };
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function tname(t) {
+    return (EV && EV.type_names && EV.type_names[t]) || t;
+  }
+  function tcol(t) { return TYPE_C[t] || '#888'; }
+  function f2(v) { return (+v).toFixed(2); }
+
+  function typeCounts(evts) {
+    var m = {};
+    for (var i = 0; i < evts.length; i++) {
+      m[evts[i].type] = (m[evts[i].type] || 0) + 1;
+    }
+    return m;
+  }
+
+  function renderTypes(evts) {
+    var m = typeCounts(evts);
+    var keys = Object.keys(m).sort(function (a, b) { return m[b] - m[a]; });
+    if (!keys.length) {
+      return '<p class="an-note">这一圈<b>没有检测到事件</b>——阈值保守，'
+        + '宁可漏报不误报；调整 <code>gt7-event-detector.py</code> 的 '
+        + 'Thresholds 后重启生效。</p>';
+    }
+    var mx = 1;
+    for (var k = 0; k < keys.length; k++) mx = Math.max(mx, m[keys[k]]);
+    var h = '<div class="an-bars">';
+    for (var i = 0; i < keys.length; i++) {
+      var c = tcol(keys[i]);
+      h += '<div class="an-bar-row"><span class="an-bar-lab">'
+        + '<i class="an-sw" style="background:' + c + '"></i>' + esc(tname(keys[i]))
+        + '</span><span class="an-bar"><i style="width:'
+        + (m[keys[i]] / mx * 100).toFixed(1) + '%;background:' + c + '"></i></span>'
+        + '<span class="an-bar-sum">' + m[keys[i]] + ' 次</span></div>';
+    }
+    return h + '</div>';
+  }
+
+  // 逐圈时间条：条全宽 = 该圈时长，事件画成彩色线段（点击 → 遥测联动）
+  function renderLanes(evts) {
+    var durs = (EV && EV.lap_durs) || {};
+    var byLap = {};
+    for (var i = 0; i < evts.length; i++) {
+      (byLap[evts[i].lap] = byLap[evts[i].lap] || []).push(evts[i]);
+    }
+    var lapNos = Object.keys(byLap).map(Number).sort(function (a, b) { return a - b; });
+    if (!lapNos.length) return '';
+    var h = '';
+    for (var li = 0; li < lapNos.length; li++) {
+      var lap = lapNos[li];
+      var dur = durs[lap] || 1;
+      var list = byLap[lap];
+      h += '<div class="an-bar-row"><span class="an-bar-lab">第 ' + lap
+        + ' 圈 <span class="an-d">' + f2(dur) + 's</span></span>'
+        + '<span class="an-bar ev-lane">';
+      for (var j = 0; j < list.length; j++) {
+        var e = list[j];
+        var l = Math.min(100, e.t_rel / dur * 100);
+        var w = Math.max(0.6, Math.min(100 - l, (e.t_end_rel - e.t_rel) / dur * 100));
+        h += '<i class="ev-seg" style="left:' + l.toFixed(2) + '%;width:'
+          + w.toFixed(2) + '%;background:' + tcol(e.type)
+          + '" title="' + esc(tname(e.type) + ' · ' + f2(e.t_rel) + 's · '
+            + Math.round(e.confidence * 100) + '%')
+          + '" onclick="evPin(' + lap + ',' + e.t_rel + ')"></i>';
+      }
+      h += '</span><span class="an-bar-sum">' + list.length + ' 次</span></div>';
+    }
+    return h;
+  }
+
+  function evRow(e) {
+    var ev = e.evidence || {};
+    var parts = [];
+    for (var k in ev) {
+      if (Object.prototype.hasOwnProperty.call(ev, k)) {
+        parts.push(esc(k) + ' <b>' + esc(JSON.stringify(ev[k])) + '</b>');
+      }
+    }
+    return '<tr class="ev-row" onclick="evPin(' + e.lap + ',' + e.t_rel + ')">'
+      + '<td class="num">第 ' + e.lap + ' 圈</td>'
+      + '<td class="num">' + f2(e.t_rel) + '–' + f2(e.t_end_rel) + 's</td>'
+      + '<td><i class="an-sw" style="background:' + tcol(e.type)
+      + '"></i>' + esc(tname(e.type))
+      + (e.src && e.src !== 'telemetry'
+        ? ' <span class="an-d">(' + esc(e.src) + ')</span>' : '')
+      + '</td>'
+      + '<td class="num">' + Math.round(e.confidence * 100) + '%</td>'
+      + '<td class="ev-ev">' + parts.join(' · ') + '</td>'
+      + '<td class="an-d">' + esc(e.hint || '') + '</td></tr>';
+  }
+
+  function renderEvents() {
+    var box = el('evBody'), meta = el('evMeta');
+    if (!EV) return;
+    var evts = (EV.events || []).filter(function (e) {
+      return !evLap || e.lap === evLap;
+    });
+    if (meta) {
+      meta.textContent = evLap ? ('第 ' + evLap + ' 圈 · ' + evts.length + ' 个事件')
+        : ('全部 ' + (EV.laps || []).length + ' 圈 · ' + evts.length + ' 个事件');
+    }
+    var h = '<div class="an-stats">';
+    var c = EV.calibration || {};
+    h += '<div class="an-stat"><span>标定半径（前 / 后）</span>'
+      + '<b>' + (c.available ? ((+c.front_m).toFixed(4) + ' / '
+        + (+c.rear_m).toFixed(4) + ' m') : '兜底值') + '</b>'
+      + '<em>' + esc(c.reason || '滑移率用带符号定义，与 /slip 同源') + '</em></div>';
+    h += '</div>';
+    h += renderTypes(evts);
+    h += '<p class="an-note">时间条上每段是一种事件（<b>点一下</b>会跳到遥测曲线'
+      + '对应时刻并钉住十字光标）；src = geometry 的出界由走线偏差判定，'
+      + 'slip 是偏差不可信时的兜底。</p>';
+    h += renderLanes(evts);
+    if (evts.length) {
+      h += '<div class="an-wrap"><table class="an-table"><thead><tr>'
+        + '<th>圈</th><th>时刻（圈内秒）</th><th>类型</th><th>置信度</th>'
+        + '<th>证据</th><th>提示</th></tr></thead><tbody>'
+        + evts.map(evRow).join('') + '</tbody></table></div>';
+    }
+    box.innerHTML = h;
+  }
+
+  window.evPick = function (v) {
+    evLap = parseInt(v, 10) || 0;
+    renderEvents();
+  };
+  // 遥测卡联动入口（telePinAt 在 _TELEMETRY_TMPL 里定义）
+  window.evPin = function (lap, tRel) {
+    if (window.telePinAt) window.telePinAt(lap, tRel);
+  };
+
+  function fillLapSel() {
+    var sel = el('evLapSel');
+    if (!sel || !EV) return;
+    var h = '<option value="0">全部圈</option>';
+    var ls = EV.laps || [];
+    for (var i = ls.length - 1; i >= 0; i--) {
+      h += '<option value="' + ls[i] + '">第 ' + ls[i] + ' 圈</option>';
+    }
+    sel.innerHTML = h;
+  }
+
+  function evFetchFail() {
+    var meta = el('evMeta'), box = el('evBody');
+    if (meta) meta.textContent = '读取失败';
+    if (box) box.innerHTML = '<p class="an-note">事件数据请求失败（见控制台）。</p>';
+  }
+
+  function boot() {
+    fetch(API + '/events' + (evLap ? '?lap=' + evLap : ''))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        EV = d;
+        // 检测器文件缺失 / 无帧：整卡隐藏，不给空表
+        if (!EV || EV.available === false) {
+          var card = el('cardEvents');
+          if (card) card.style.display = 'none';
+          return;
+        }
+        fillLapSel();
+        // 🔴 与 _ANALYSIS_TMPL 同源：取数失败与渲染失败分开处理
+        renderEvents();
+      }, evFetchFail);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else { boot(); }
+})();
+</script>
+<style>
+.ev-lane { position: relative; min-height: 16px; }
+.ev-seg { position: absolute; top: 2px; height: 12px; border-radius: 2px;
+  cursor: pointer; opacity: .85; }
+.ev-seg:hover { opacity: 1; box-shadow: 0 0 0 2px var(--card); }
+.ev-row { cursor: pointer; }
+.ev-row:hover td { background: rgba(128,128,128,.07) !important; }
+.ev-ev { max-width: 420px; white-space: normal !important; font-size: 11.5px;
+  color: var(--muted); }
+.ev-ev b { color: var(--text); font-family: var(--mono); font-weight: 500; }
+</style>
+"""
+
+
 # 场次详情页的「遥测数据」卡片：逐帧原始数据可视化 + 分页表 + CSV 导出。
 #
 # 背景：接收器本来就逐帧把四十几个字段写进了 jsonl，但旧版详情页只把它
@@ -4717,6 +4936,8 @@ _TELEMETRY_TMPL = r"""
   var pageSize = 200, pageOff = 0, curLap = 0, rows = [], laps = [], ready = false;
   // 十字光标要用与曲线完全相同的 Y 换算，所以把每个分面的量程/像素范围存下来
   var scales = [], geom = null, cxRow = null, cxPinned = false;
+  // 事件时间线卡的联动钉点：telePinAt 设进来，series 到手后消费掉（见 loadSeries）
+  var pendingPin = null;
 
   function gv(n, fb) {
     var v = getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -5005,6 +5226,37 @@ _TELEMETRY_TMPL = r"""
     loadTable();
   };
 
+  // 事件时间线卡 → 遥测曲线的联动入口：切到事件所在圈（t_rel 与
+  // /series?lap=N 同一基准，都是圈内秒），等 series 到手后钉住十字光标。
+  // lapT0 = 该圈起点相对场次起点的秒数：整场视图下 series 的 t 从场次
+  // 起点算，需要把圈内秒换算过去（laps 由 loadSeries 填充）。
+  window.telePinAt = function (lap, tRel) {
+    lap = parseInt(lap, 10) || 0;
+    var lapT0 = null;
+    for (var i = 0; i < laps.length; i++) {
+      if (laps[i].lap === lap) { lapT0 = laps[i].t0; break; }
+    }
+    pendingPin = { lap: lap, t: tRel, lapT0: lapT0 };
+    if (curLap !== lap) {
+      curLap = lap;
+      pageOff = 0;
+      loadSeries();
+      loadTable();
+    } else {
+      // 已在目标圈：直接用现有 rows 钉（loadSeries 里那支不会走）
+      pendingPin = null;
+      if (rows.length && geom) {
+        var tt = tRel;
+        if (!curLap && lapT0 != null) tt = lapT0 + tRel;
+        cxRow = nearestRow(tt);
+        cxPinned = true;
+        drawCursor(geom.PADL + geom.PW
+          * (rows[cxRow][IDX.t] - geom.t0) / geom.span);
+        renderReadout();
+      }
+    }
+  };
+
   function loadSeries() {
     ready = false;
     renderChart();
@@ -5042,6 +5294,20 @@ _TELEMETRY_TMPL = r"""
       var csv = el('teleCsv');
       if (csv) csv.href = API + '/csv' + (curLap ? '?lap=' + curLap : '');
       renderChart();
+      // 事件时间线卡的联动：series 落地后把十字光标钉到指定时刻。
+      // 🔴 必须在这里做而不是 telePinAt 里直接设 cxRow——切圈后 rows 还没到。
+      if (pendingPin) {
+        var pin = pendingPin; pendingPin = null;
+        if (!pin.lap || pin.lap === curLap) {
+          var tt = pin.t;
+          if (!curLap && pin.lapT0 != null) tt = pin.lapT0 + pin.t;
+          cxRow = nearestRow(tt);
+          cxPinned = true;
+          drawCursor(geom ? geom.PADL + geom.PW
+            * (rows[cxRow][IDX.t] - geom.t0) / geom.span : 0);
+          renderReadout();
+        }
+      }
     }).catch(function () {
       ready = true;
       rows = [];
@@ -5307,11 +5573,16 @@ window.trackRen = function (id) {{
         or str(hdr.get('circuit') or 'unknown')
     return _page_shell(f"场次 · {_html.escape(page_title)}",
                        body + _COMPARE_TMPL.replace('__DATA__', cmp_json)
-                       # 三张分析卡排在「遥测数据」之前：先给结论（走线偏哪、胎怎么被
-                       # 糟蹋的、能快多少），原始逐帧数据垫底。数据走 XHR 异步取，
-                       # 不占首屏渲染时间。
+                       # 四张分析卡排在「遥测数据」之前：先给结论（走线偏哪、胎怎么被
+                       # 糟蹋的、能快多少、发生过什么），原始逐帧数据垫底。数据走
+                       # XHR 异步取，不占首屏渲染时间。
                        + _DEVIATION_TMPL.replace('__FILE__', js_file)
                        + _ANALYSIS_TMPL.replace('__FILE__', js_file)
+                       # 事件时间线在遥测卡之前：它的「点事件 → 十字光标」联动
+                       # 要求 _TELEMETRY_TMPL 的 telePinAt 在点击时已可用——
+                       # 两个 IIFE 都是 DOMContentLoaded 前定义，顺序只影响
+                       # 卡片视觉位置，不影响函数可用性。
+                       + _EVENTS_TMPL.replace('__FILE__', js_file)
                        + _TELEMETRY_TMPL.replace('__FILE__', js_file))
 
 

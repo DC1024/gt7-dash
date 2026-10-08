@@ -131,6 +131,10 @@ class Thresholds:
     # 车头（car_z）和车尾（car_x）同时落后参考 → 说明在被超
     overtake_margin: float = 0.0022
 
+    # 大油门出弯：出弯速度区间的全油门
+    heavy_throttle_min_speed: float = 60.0    # km/h
+    heavy_throttle_max_speed: float = 150.0   # km/h；上限把直道全油门排除在外
+
     # 采样率（GT7 广播约 60Hz，这里按 60Hz 处理）
     sample_hz: float = 60.0
 
@@ -409,13 +413,19 @@ class EventDetector:
         return out
 
     def detect_impact(self, samples: list[Sample]) -> list[Event]:
-        """碰撞：瞬时强纵向减速。"""
+        """碰撞：**没踩刹车**时的瞬时强纵向减速。
+
+        🔴 判据里必须有「brake 浅」这一条：GT7 极限重刹能到 −3.3g
+           （实测本场 hard_braking 最低 −4.36g），只看 G 值会把每次
+           重刹都当碰撞（实测 1098 次误报）。碰撞的物理特征是「玩家
+           没在刹车，速度却在骤降」——撞墙 / 追尾 / 被撞。
+        """
         out = []
         th = self.th.impact_long_g
         i = 1
         while i < len(samples):
             s = samples[i]
-            if longitudinal_g(s) < th:
+            if longitudinal_g(s) < th and s.brake < 0.35:
                 # 前后各 0.2s 作窗口
                 pre = max(0, i - int(0.2 * self.th.sample_hz))
                 post = min(len(samples) - 1, i + int(0.2 * self.th.sample_hz))
@@ -518,11 +528,18 @@ class EventDetector:
         return out
 
     def detect_heavy_throttle(self, samples: list[Sample]) -> list[Event]:
-        """大油门出弯：低速段全油门。"""
+        """大油门出弯：出弯速度区间内的持续全油门。
+
+        🔴 速度必须有**上限**：只设 60kph 下限时，直道全油门（可到
+           250kph+、每圈几十段）全部命中，实测一场 704 次——时间线
+           被淹没，事件失去信息量。加上限后才是「出弯油门点」。
+        """
         out = []
         runs = filter_sustained(
             samples,
-            lambda s: s.throttle > 0.95 and s.speed_kph > 60 and s.gear >= 2,
+            lambda s: (s.throttle > 0.95
+                       and self.th.heavy_throttle_min_speed < s.speed_kph
+                       < self.th.heavy_throttle_max_speed and s.gear >= 2),
             min_duration=0.5,
             sample_hz=self.th.sample_hz,
         )
