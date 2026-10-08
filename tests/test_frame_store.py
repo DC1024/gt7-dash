@@ -12,6 +12,8 @@
   · 全流程不能读到未存储的字段（读了会被记进 MISSED_FIELDS）
 """
 import json
+import threading
+import time
 import tracemalloc
 
 import pytest
@@ -312,6 +314,64 @@ class TestSentinel:
         assert (latest["lap"], latest["num_cars"], latest["quali_pos"]) == (0, 0, 0)
         # 归一只能作用在**副本**上：hub 自己缓存的原始帧必须保持原样
         assert hub._latest["num_cars"] == 65535
+
+
+class TestMemoConcurrency:
+    """store._memo 跨请求共享（缓存的 store 会被多个线程同时用）。
+
+    读-改-写不加锁：轻则一个慢接口被并发打进来时烧两遍 CPU（/events 冷 9s），
+    重则 dict 在迭代中被另一个线程改（RuntimeError / 读到半成品条目）。
+    """
+
+    def test_命中时不重复计算(self, dash):
+        store = dash.FrameStore.empty()
+        calls = []
+        assert store.memo_compute("k", lambda: calls.append(1) or [1, 2, 3]) \
+            == [1, 2, 3]
+        assert store.memo_compute("k", lambda: calls.append(1) or [1, 2, 3]) \
+            == [1, 2, 3]
+        assert len(calls) == 1
+
+    def test_同一_key_并发只算一次(self, dash):
+        """8 个线程同时要同一个 key：fn 只能跑一次。"""
+        store = dash.FrameStore.empty()
+        n, nlock = [0], threading.Lock()
+
+        def fn():
+            with nlock:
+                n[0] += 1
+            time.sleep(0.05)      # 放大「正在算」的窗口，把竞态逼出来
+            return {"v": 42}
+
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(
+            store.memo_compute("k", fn))) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert len(out) == 8
+        assert all(o == {"v": 42} for o in out)
+        assert n[0] == 1         # 🔴 无锁 / 锁粒度不对时这里会是 8
+
+    def test_不同_key_互不阻塞(self, dash):
+        """正在算慢 key 时，另一个 key 不该被堵住（否则 /events 会卡住 /series）。"""
+        store = dash.FrameStore.empty()
+        store.memo_compute("fast", lambda: 1)     # 先缓存住快 key
+        done = threading.Event()
+
+        def slow():
+            done.wait(2.0)
+            return "slow"
+
+        t = threading.Thread(target=lambda: store.memo_compute("slow", slow))
+        t.start()
+        time.sleep(0.05)                          # 确保慢 key 已进入 fn()
+        t0 = time.time()
+        assert store.memo_compute("fast", lambda: 0) == 1
+        assert time.time() - t0 < 0.5             # 读别的 key 不该排队等 2 秒
+        done.set()
+        t.join()
 
 
 class TestLiveCarUnits:

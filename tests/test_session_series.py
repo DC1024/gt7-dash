@@ -155,3 +155,52 @@ class TestFrameRow:
     def test_real_lap_numbers_untouched(self, dash):
         for n in (0, 1, 2, 17, 64999):
             assert dash._frame_row({"t": 0, "lap": n}, 0.0)[9] == n
+
+
+class TestColsParam:
+    """?cols= 按需取列。
+
+    🔴 取子集时**不能顺手 round**：float64 的 json.dumps 是最短往返表示，
+       本来就无损；一旦 round 就把精度削掉了（这是这条路唯一能出错的地方）。
+    """
+
+    def test_不传就是全列(self, dash):
+        assert dash._parse_cols(None) == (None, None)
+        assert dash._parse_cols("") == (None, None)
+        assert dash._parse_cols("  ") == (None, None)
+
+    def test_按请求顺序挑列(self, dash):
+        sel, err = dash._parse_cols("spd,t,rpm")
+        assert err is None
+        assert sel == [1, 0, 2]
+
+    def test_未知列名报错而不是静默忽略(self, dash):
+        sel, err = dash._parse_cols("t,boom")
+        assert sel is None
+        assert "boom" in err
+        assert "未知列名" in err
+
+    def test_series_只返回要的列_且数值一字不差(self, dash, sess):
+        full = dash.session_series(sess, max_points=500)
+        sel, _ = dash._parse_cols("t,spd")
+        part = dash.session_series(sess, max_points=500, sel=sel)
+        assert part["cols"] == ["t", "spd"]
+        assert len(part["rows"]) == len(full["rows"])
+        for a, b in zip(part["rows"], full["rows"]):
+            assert a == [b[0], b[1]], "挑出来的值必须和全量逐位相同"
+
+    def test_frames_与_csv_同样生效(self, dash, sess):
+        sel, _ = dash._parse_cols("rpm,gear")
+        fr = dash.session_frames(sess, limit=5, sel=sel)
+        assert fr["cols"] == ["rpm", "gear"]
+        assert all(len(r) == 2 for r in fr["rows"])
+
+        lines = dash.session_csv(sess, lap_no=1, sel=sel).strip().split("\n")
+        assert lines[0] == "转速(rpm),档位"
+        assert all(l.count(",") == 1 for l in lines[1:])
+
+    def test_csv_全量表头不变(self, dash, sess):
+        """不传 cols 时表头必须和以前逐字一样（老脚本在按表头解析）。"""
+        head = dash.session_csv(sess).split("\n")[0]
+        assert head == ("时间(s),速度(km/h),转速(rpm),油门(%),刹车(%),档位,"
+                        "横向G,纵向G,油量(%),圈号")

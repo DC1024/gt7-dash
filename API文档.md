@@ -25,6 +25,7 @@
 | POST | `/api/v1/trash/purge` | 清空回收站（彻底删除全部） |
 | POST | `/api/v1/trash/<文件名>/restore` | 从回收站恢复场次到列表 |
 | POST | `/api/v1/trash/<文件名>/delete` | 彻底删除回收站中的单个场次 |
+| POST | `/api/v1/settings/archive-after` | 设置自动归档保留天数，body `{"value": 30}`（0=不自动归档；归档为无损 `.jsonl.gz`） |
 | GET | `/api/v1/docs` | 本文档 |
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
@@ -37,6 +38,7 @@
 - `ref_lap=N`（sessions 详情 / 详情页）：指定参考圈号做行车轨迹/时间差对比分析，
   默认取最快圈；`cmp_lap=M`：指定被对比的圈，默认取最后一圈。
   圈号不存在或非有效（如手改 URL）时静默回退默认值。
+- `cols=t,spd,rpm`（`/series` / `/frames` / `/csv`）：按需只取指定通道省流量；列名取自这些接口返回的 `cols` 字段。未知列名直接 400（附 `allowed` 列表），不静默少给几列；不传 = 全列（向后兼容）。
 - 返回 404 的情形：场次文件名不存在 / 非法路径
 
 ## 字段与单位约定（对外承诺，只加不改）
@@ -143,6 +145,7 @@
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
+| `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -427,3 +430,19 @@ curl -o lap3.csv "http://localhost:8787/api/v1/sessions/SESSION.jsonl/csv?lap=3"
 - `history` 的条数上限 600；`path`/`gg` 上限 4000/1200 点
 - `frames` 的 `limit` 上限 1000；`series` 的 `max_points` 上限 6000
 - 服务器单线程 HTTP，请勿高频轮询（≥100ms 间隔为宜）
+
+## 传输与归档
+
+### 响应压缩与连接复用
+- **gzip 压缩**：客户端带 `Accept-Encoding: gzip` 时，正文（JSON / HTML / 页面）自动压缩（level 6）；附件类下载（CSV、`/download`）**不压缩**，避免浏览器把文件存成 `.gz`。可用 `--no-gzip` 启动参数关掉（排障 / 抓包看明文）。
+- **HTTP/1.1 keep-alive**：默认连接复用；客户端可发 `Connection: close` 显式关闭。多请求场景（如详情页并行取数）较无 keep-alive 提速约 10×。
+
+### 圈间对比轻量接口 `/compare`
+`GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M`（可加 `&race_line=0`）返回 `compare_session` 同款结构，**不含**占 73% 体积的 `race_line`（行车轨迹卡会自己另行取 `/raceline`）。详情页切参考圈 / 对比圈时只取这一份并重画依赖它的三块，不刷新整页（整页重来约 196KB / 720ms，XHR 约 8KB / 590ms），且不闪屏。
+
+### 存储归档（无损）
+- 老场次自动 gzip 压缩为 `<名>.jsonl.gz`（体积约 1/8~1/10，**无损、字节可还原**），后台静默进行，不阻塞列表页；正在录制（文件近 20s 内有写入）的活场不归档。
+- `GET /api/v1/sessions` 每条带 `archived: bool` 字段标明是否已压缩。
+- 自动归档保留期：`POST /api/v1/settings/archive-after {"value": 30}`（天，0=不自动归档，上限 3650）。
+- 访问归档场次无需改 URL：`/session`、`/api/v1/sessions/<名>`、`/series`、`/csv` 等都会用 `resolve_session` 自动兜底成 `.jsonl.gz`；`/download` 与 CSV 导出会自动带 `.gz` 后缀。
+- 收藏 / 自定义名 / 赛道库映射都以**未压缩基名** `X.jsonl` 为键，归档只换后缀不丢标注。

@@ -43,9 +43,11 @@ GT7 遥测 Web 仪表盘
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -402,7 +404,8 @@ class FrameStore(Sequence):
     """
 
     __slots__ = ("header", "n", "fields", "_num", "_arr", "_bool", "_tbl",
-                 "_txi", "_null", "_absent", "_col", "_pres", "_memo")
+                 "_txi", "_null", "_absent", "_col", "_pres", "_memo",
+                 "_memo_lock", "_memo_keys")
 
     def __init__(self, header: dict, n: int, num: dict, arr: dict, bl: dict,
                  tbl: dict, txi: dict, null: dict, absent: dict,
@@ -418,7 +421,44 @@ class FrameStore(Sequence):
         self._null = null
         self._absent = absent
         self._memo: dict = {}
+        # 🔴 _memo 是**跨请求共享**的（缓存的 store 会被多个线程同时用），
+        #    读-改-写必须加锁，见 memo_compute。
+        self._memo_lock = threading.Lock()
+        self._memo_keys: dict = {}
         self._col, self._pres = self._build_index()
+
+    def memo_compute(self, key, fn):
+        """按 key 记忆化 `fn()` 的结果（线程安全版）。
+
+        ThreadingHTTPServer 是多线程的：/sectors 冷 0.4s、/events 冷 9s，
+        两个请求同时打进来会各算一遍；更糟的是 dict 的读-改-写本身不原子，
+        并发下可能读到半成品条目。
+
+        🔴 用**按 key 一把锁**而不是全局一把：
+           · 同一个 key 并发 ⇒ 第二个线程等第一个算完直接拿结果，
+             不会把 9 秒的事件检测烧两遍（1 核小机器上这是能不能扛住的区别）。
+           · 不同 key 互不阻塞 ⇒ 正在算 /events 时不该把读 valid_laps
+             的 /series 一起堵死 9 秒。
+        """
+        with self._memo_lock:
+            hit = self._memo.get(key)
+            if hit is not None:
+                return hit
+            kl = self._memo_keys.get(key)
+            if kl is None:
+                kl = self._memo_keys[key] = threading.Lock()
+        with kl:
+            with self._memo_lock:
+                hit = self._memo.get(key)
+            if hit is not None:
+                return hit
+            val = fn()
+            with self._memo_lock:
+                cur = self._memo.get(key)
+                if cur is None:
+                    self._memo[key] = val
+                    return val
+                return cur        # 理论上到不了：同一 key 已串行
 
     @classmethod
     def empty(cls, header: dict | None = None) -> "FrameStore":
@@ -496,12 +536,8 @@ class FrameStore(Sequence):
            __iter__ 重入 130 万次 0.63s + Frame.__init__ 0.15s），
            整页 /session 慢 8%。收敛成一次后，后续遍历退化为纯 list 迭代。
         """
-        m = self._memo
-        v = m.get("frames")
-        if v is None:
-            v = [Frame(self, i) for i in range(self.n)]
-            m["frames"] = v
-        return v
+        return self.memo_compute(
+            "frames", lambda: [Frame(self, i) for i in range(self.n)])
 
     def lap_frames(self) -> list["Frame"]:
         """含 lap 字段的帧（保持原顺序）。
@@ -511,12 +547,8 @@ class FrameStore(Sequence):
            217k 个 Frame 对象）；现在整场只算一次，后续请求 O(1) 取用。
            clean_laps 也喂它，两者共享同一批 Frame 对象，不额外占内存。
         """
-        m = self._memo
-        v = m.get("lap_frames")
-        if v is None:
-            v = [f for f in self.frames() if "lap" in f]
-            m["lap_frames"] = v
-        return v
+        return self.memo_compute(
+            "lap_frames", lambda: [f for f in self.frames() if "lap" in f])
 
     def _missing(self, k: str):
         """本场次该字段确实存在，但列式存储里没留它的列 —— 是存储清单漏了。
@@ -569,6 +601,65 @@ class FrameStore(Sequence):
         return tb[xi[i]]
 
 
+# —— 归档：老场次就地压缩成 .jsonl.gz ——
+#
+# 60Hz × 52 个字段 ≈ 240 MB/小时，一两天就能把盘吃光。归档的办法不是降采样
+# （丢帧不可逆，遥测的原始价值就没了），而是**就地 gzip**：jsonl 是重复度极高
+# 的纯文本，实测 255 MB → 30 MB 左右，且解压后逐字节相同。
+#
+# 🔴 名字保持 `X.jsonl.gz` 而不是改名：收藏、自定义名、赛道库、书签里存的
+#    都是 `X.jsonl`，所以访问一个已被归档的场次时要用 resolve_session 兜住。
+SESSION_SUFFIXES = (".jsonl", ".jsonl.gz")
+
+
+def is_session_file(p: Path) -> bool:
+    n = str(getattr(p, "name", p))
+    return n.endswith(".jsonl") or n.endswith(".jsonl.gz")
+
+
+def session_stem(name: str) -> str:
+    """去掉场次后缀（.jsonl 或 .jsonl.gz）—— 导出 CSV 时当基名用。"""
+    n = str(name)
+    for s in (".jsonl.gz", ".jsonl"):
+        if n.endswith(s):
+            return n[:-len(s)]
+    return Path(n).stem
+
+
+def open_session(path: Path, mode: str = "r"):
+    """按后缀决定要不要解压：.gz 走 gzip.open，其余就是普通文本。"""
+    p = Path(path)
+    if p.name.endswith(".gz"):
+        return gzip.open(p, mode.replace("b", "") + "t",
+                         encoding="utf-8", errors="replace")
+    return p.open(mode, encoding="utf-8", errors="replace")
+
+
+def resolve_session(target: Path) -> Path:
+    """把「请求的场次路径」落到真实存在的文件上。
+
+    归档后磁盘上只有 `X.jsonl.gz`，但书签 / 收藏 / 赛道库里存的还是 `X.jsonl`，
+    直接判 exists() 会 404。这里补一次 .gz 尝试。
+    """
+    if target.exists():
+        return target
+    gz = Path(str(target) + ".gz")
+    return gz if gz.exists() else target
+
+
+def glob_sessions(history_dir: Path) -> list[Path]:
+    """场次文件（含已归档的 .jsonl.gz），按名字倒序 = 时间倒序。"""
+    seen: dict[str, Path] = {}
+    for pat in ("*.jsonl", "*.jsonl.gz"):
+        for f in history_dir.glob(pat):
+            # 同一个场次若两份都在（归档中途被打断），以未压缩的那份为准
+            key = session_stem(f.name)
+            if key not in seen or not f.name.endswith(".gz"):
+                seen[key] = f
+    return sorted(seen.values(), key=lambda p: session_stem(p.name),
+                  reverse=True)
+
+
 def _parse_frames(path: Path) -> tuple[dict, FrameStore]:
     """把场次 jsonl 解析成 header + FrameStore（列式，单遍流式读取）。
 
@@ -608,7 +699,7 @@ def _parse_frames(path: Path) -> tuple[dict, FrameStore]:
         if flags[key] is None:
             flags[key] = isinstance(v, int)
 
-    with path.open(encoding="utf-8", errors="replace") as fh:
+    with open_session(path) as fh:          # .jsonl.gz 归档也能读
         for line in fh:
             if not line.strip():
                 continue
@@ -821,7 +912,7 @@ def _first_car_code(path: Path) -> int:
     （car_code 或为 0），此处尽力而为，没读到返回 0。
     """
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
+        with open_session(path, "r") as fh:   # 归档后的 .jsonl.gz 一样读
             fh.readline()                     # 跳过 header
             for _ in range(40):               # 最多看 40 帧
                 line = fh.readline()
@@ -865,7 +956,7 @@ def _best_lap_of(path: Path) -> float | None:
             best = round(t_prev - t0, 3)
 
     try:
-        with path.open("r", encoding="utf-8") as fh:
+        with open_session(path, "r") as fh:
             fh.readline()                       # header 行
             for line in fh:
                 try:
@@ -925,6 +1016,105 @@ def _move_session_to_trash(f: Path, history_dir: Path) -> bool:
         return False
 
 
+# 归档用**最快档**：一场 250MB，level 9 要几十秒，而 level 1 的压缩比
+# 只差一两个百分点（jsonl 的冗余主要在重复的键名上，一档就吃掉了）。
+_ARCHIVE_LEVEL = 1
+_ARCHIVE_CHUNK = 1 << 20
+
+
+def archive_session(f: Path) -> bool:
+    """把一场就地压缩成 `X.jsonl.gz`（无损），成功返回 True。
+
+    🔴 先写 `.gz.tmp` 再 `os.replace`：压缩一场要几秒，中途崩了不能留下
+       半截 .gz 让人以为归档成功了（那是**数据丢失**级别的错觉）。
+    🔴 压完确认真的变小了才删原件 —— 否则宁可保持原样。
+    🔴 删原件前把该场次的解析缓存清掉：缓存条目的键是老路径，留着会让
+       后续请求去读一个已经不存在的文件。
+    """
+    f = Path(f)
+    if f.name.endswith(".gz") or not f.exists():
+        return False
+    gz = Path(str(f) + ".gz")
+    if gz.exists():
+        return False
+    tmp = Path(str(gz) + ".tmp")
+    try:
+        src_size = f.stat().st_size
+        with f.open("rb") as src, \
+                gzip.open(tmp, "wb", compresslevel=_ARCHIVE_LEVEL) as dst:
+            shutil.copyfileobj(src, dst, _ARCHIVE_CHUNK)
+        if not tmp.exists() or tmp.stat().st_size >= src_size:
+            tmp.unlink(missing_ok=True)
+            return False
+        os.replace(tmp, gz)
+        with _CACHE_LOCK:
+            _FRAMES_CACHE.pop(str(f), None)
+            _FRAMES_CACHE.pop(str(gz), None)
+        f.unlink()
+        return True
+    except (OSError, EOFError, gzip.BadGzipFile):
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+_ARCHIVE_SWEEP_LOCK = threading.Lock()
+_ARCHIVE_SWEEPING = False
+
+
+def _kick_archive_sweep(history_dir: Path, live: bool) -> None:
+    """在后台线程跑一次归档巡检（不阻塞列表页，也不并发跑第二遍）。"""
+    global _ARCHIVE_SWEEPING
+    days = load_settings(history_dir).get("archive_after_days", 1)
+    try:
+        days = float(days or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days <= 0 or _ARCHIVE_SWEEPING:
+        return
+
+    def _run():
+        global _ARCHIVE_SWEEPING
+        try:
+            sweep_archive(history_dir, days, live=live)
+        finally:
+            _ARCHIVE_SWEEPING = False
+
+    _ARCHIVE_SWEEPING = True
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def sweep_archive(history_dir: Path, days: float,
+                  live: bool = False) -> int:
+    """把超过 `days` 天没动过的场次压成 .jsonl.gz，返回本次归档了几场。
+
+    🔴 正在录制的那场绝不碰（近 20s 内还有写入）：记录器还在往里追加，
+       压出来是半截，而且 .jsonl 被删后记录器会写进一个不存在的文件。
+    🔴 days <= 0 = 不自动归档（只想手动归档时用）。
+    """
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400.0
+    done = 0
+    with _ARCHIVE_SWEEP_LOCK:
+        for f in glob_sessions(history_dir):
+            if f.name.endswith(".gz"):
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if st.st_mtime > cutoff:
+                continue
+            if live and (time.time() - st.st_mtime) < 20.0:
+                continue
+            if archive_session(f):
+                done += 1
+    return done
+
+
 DEFAULT_NAME_TEMPLATE = "{车型} {时间} {最快圈}"
 
 
@@ -974,11 +1164,17 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     # 是否正在录制（一次判定，循环内复用）——用于保护活场不被自动归档
     live = _recording_active(history_dir)
     now = time.time()
-    for f in sorted(history_dir.glob("*.jsonl"), reverse=True)[:limit]:
+    # 归档（老场次压缩成 .jsonl.gz）在**后台**跑：压一场 250MB 要几秒，
+    # 放进列表页的请求里会让页面卡住。
+    _kick_archive_sweep(history_dir, live)
+    for f in glob_sessions(history_dir)[:limit]:
         try:
             stat = f.stat()
-            parts = f.stem.split("_", 2)
-            m = meta.get(f.name) or {}
+            parts = session_stem(f.name).split("_", 2)
+            # 🔴 收藏 / 改名 / 赛道库的键都是**未压缩**那个名字（X.jsonl）——
+            #    归档只是换了后缀，用真名去查会查不到，收藏和自定义名就丢了。
+            canon = session_stem(f.name) + ".jsonl"
+            m = meta.get(canon) or meta.get(f.name) or {}
             import gt7analysis
             car_name = gt7analysis.car_name_of(_first_car_code(f), csv_path)
             # 文件名里的时间戳 → 短格式「10-08 00:27」
@@ -1007,12 +1203,15 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                 "best_lap_s": best,
                 "anomalous": anomalous,
                 "time_str": time_str,
+                # 已归档 = 磁盘上是 .jsonl.gz（无损，只是占地方小了 ~8 倍）
+                "archived": f.name.endswith(".gz"),
                 # —— 用户标注 ——
                 "favorite": bool(m.get("favorite")),
                 "custom_name": m.get("custom_name") or "",
             }
             # 赛道自动识别结果（缓存命中才有；未识别为空串）
-            th = _lib["sessions"].get(f.name) or {}
+            th = _lib["sessions"].get(canon) or _lib["sessions"].get(f.name) \
+                or {}
             tid = th.get("track_id")
             entry["track_name"] = _track_names.get(tid, "") if tid else ""
             entry["track_id"] = tid if tid else None
@@ -1117,6 +1316,33 @@ def analyze_session(path: Path) -> dict[str, Any]:
 #    场次算统计，这里只是对同一份帧做抽稀/切片。
 #    单场 jsonl 能到 250MB，再读第二遍纯属浪费。
 _SERIES_COLS = ["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]
+# CSV 表头（与 _SERIES_COLS 逐位对应）。?cols= 也要能只出对应几列的表头。
+_SERIES_HEAD = ["时间(s)", "速度(km/h)", "转速(rpm)", "油门(%)", "刹车(%)",
+                "档位", "横向G", "纵向G", "油量(%)", "圈号"]
+
+
+def _parse_cols(raw) -> tuple[list[int] | None, str | None]:
+    """解析 `?cols=t,spd,rpm`，返回（要保留的列下标, 错误信息）。
+
+    🔴 未知列名**直接报错**而不是静默忽略：调用方写错名字却拿到一份「少了
+       几列」的数据，比拿到 400 难排查得多——它看起来是成功的。
+    🔴 不传 / 空串 = 全列（向后兼容，前端自己就是这么用的）。
+    """
+    if not raw or not str(raw).strip():
+        return None, None
+    want = [c.strip() for c in str(raw).split(",") if c.strip()]
+    if not want:
+        return None, None
+    idx = {c: i for i, c in enumerate(_SERIES_COLS)}
+    bad = [c for c in want if c not in idx]
+    if bad:
+        return None, f"cols 里有未知列名：{', '.join(bad)}"
+    return [idx[c] for c in want], None
+
+
+def _pick(row: list, sel: list[int] | None) -> list:
+    """按 sel 挑列。sel 为 None = 全列（不给 ?cols= 时的老行为）。"""
+    return row if sel is None else [row[i] for i in sel]
 
 
 def _fuel_pct(f: dict) -> float | None:
@@ -1269,26 +1495,23 @@ def _valid_laps(path: Path) -> tuple[list[dict], dict, float]:
     _, store = _load_frames(path)
     if not store:
         return [], {}, 0.0
-    memo = store._memo
-    hit = memo.get("valid_laps")
-    if hit is not None:
-        return hit
-    t0 = store[0].get("t") or 0.0
-    import gt7analysis
-    grouped = gt7analysis.clean_laps(store.lap_frames())
-    laps = []
-    for no, fs in sorted(grouped.items()):
-        if len(fs) < 2:
-            continue
-        laps.append({
-            "lap": no,
-            "t0": round((fs[0].get("t") or 0.0) - t0, 3),
-            "dur": round((fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0), 3),
-            "frames": len(fs),
-        })
-    out = (laps, grouped, t0)
-    memo["valid_laps"] = out
-    return out
+    def _compute():
+        t0 = store[0].get("t") or 0.0
+        import gt7analysis
+        grouped = gt7analysis.clean_laps(store.lap_frames())
+        laps = []
+        for no, fs in sorted(grouped.items()):
+            if len(fs) < 2:
+                continue
+            laps.append({
+                "lap": no,
+                "t0": round((fs[0].get("t") or 0.0) - t0, 3),
+                "dur": round((fs[-1].get("t") or 0.0)
+                             - (fs[0].get("t") or 0.0), 3),
+                "frames": len(fs),
+            })
+        return (laps, grouped, t0)
+    return store.memo_compute("valid_laps", _compute)
 
 
 def _scope_t0(scope: list[dict], session_t0: float, lap_no: int | None) -> float:
@@ -1304,11 +1527,14 @@ def _scope_t0(scope: list[dict], session_t0: float, lap_no: int | None) -> float
 
 
 def session_series(path: Path, lap_no: int | None = None,
-                   max_points: int = 2400) -> dict[str, Any]:
+                   max_points: int = 2400,
+                   sel: list[int] | None = None) -> dict[str, Any]:
     """整场（或指定一圈）的降采样时序 + 圈边界，供详情页画全通道曲线。
 
     抽稀用固定 stride 而不是简单截断——30 万帧的场次截前 2400 帧
     只能看到开场 40 秒，曲线完全没意义。
+
+    `sel` = `?cols=` 挑出来的列下标（None = 全列）。
     """
     try:
         laps, grouped, sess_t0 = _valid_laps(path)
@@ -1327,12 +1553,12 @@ def session_series(path: Path, lap_no: int | None = None,
     t0 = _scope_t0(scope, sess_t0, lap_no)
     step = max(1, int(math.ceil(len(scope) / max(1, max_points))))
     row = _row_builder(store, t0)
-    rows = [row(f) for f in scope[::step]]
+    rows = [_pick(row(f), sel) for f in scope[::step]]
     # 抽稀会漏掉最后一帧，补上——否则曲线右端「差一截」，看着像数据断了
     if scope and (len(scope) - 1) % step:
-        rows.append(row(scope[-1]))
+        rows.append(_pick(row(scope[-1]), sel))
     return {
-        "cols": _SERIES_COLS,
+        "cols": _SERIES_COLS if sel is None else [_SERIES_COLS[i] for i in sel],
         "rows": rows,
         "lap": lap_no or 0,
         "laps": laps,
@@ -1347,7 +1573,8 @@ def session_series(path: Path, lap_no: int | None = None,
 
 
 def session_frames(path: Path, offset: int = 0, limit: int = 200,
-                   lap_no: int | None = None) -> dict[str, Any]:
+                   lap_no: int | None = None,
+                   sel: list[int] | None = None) -> dict[str, Any]:
     """逐帧数据分页。limit 硬上限 1000——别让人一页拉爆浏览器。"""
     try:
         _, grouped, sess_t0 = _valid_laps(path)
@@ -1362,25 +1589,26 @@ def session_frames(path: Path, offset: int = 0, limit: int = 200,
     page = fr[offset:offset + limit]
     row = _row_builder(store, t0)
     return {
-        "cols": _SERIES_COLS,
-        "rows": [row(f) for f in page],
+        "cols": _SERIES_COLS if sel is None else [_SERIES_COLS[i] for i in sel],
+        "rows": [_pick(row(f), sel) for f in page],
         "offset": offset, "limit": limit, "total": total,
         "lap": lap_no or 0,
     }
 
 
-def session_csv(path: Path, lap_no: int | None = None) -> str:
+def session_csv(path: Path, lap_no: int | None = None,
+                sel: list[int] | None = None) -> str:
     """逐帧数据导成 CSV（Excel / pandas 可直接打开）。"""
     _, grouped, sess_t0 = _valid_laps(path)
     _, store = _load_frames(path)
     fr = (grouped.get(lap_no) or []) if lap_no else store.lap_frames()
     t0 = _scope_t0(fr, sess_t0, lap_no)
-    head = ("时间(s),速度(km/h),转速(rpm),油门(%),刹车(%),档位,"
-            "横向G,纵向G,油量(%),圈号")
-    out = [head]
+    head = (_SERIES_HEAD if sel is None
+            else [_SERIES_HEAD[i] for i in sel])
+    out = [",".join(head)]
     row = _row_builder(store, t0)
     for f in fr:
-        r = row(f)
+        r = _pick(row(f), sel)
         out.append(",".join("" if v is None else str(v) for v in r))
     return "\n".join(out) + "\n"
 
@@ -1405,14 +1633,10 @@ def session_sectors(path: Path, n_sectors: int = 4) -> dict[str, Any]:
     _, store = _load_frames(path)
     if not store:
         return {"error": "no frames", "laps": [], "reliable": False}
-    memo = store._memo
-    key = ("sectors", n_sectors)
-    hit = memo.get(key)
-    if hit is None:
+    def _compute():
         import gt7analysis
-        hit = gt7analysis.sector_times(grouped, n_sectors=n_sectors)
-        memo[key] = hit
-    return hit
+        return gt7analysis.sector_times(grouped, n_sectors=n_sectors)
+    return store.memo_compute(("sectors", n_sectors), _compute)
 
 
 def session_slip(path: Path, max_per_lap: int = 120) -> dict[str, Any]:
@@ -1433,14 +1657,10 @@ def session_slip(path: Path, max_per_lap: int = 120) -> dict[str, Any]:
     _, store = _load_frames(path)
     if not store:
         return {"available": False, "reason": "no frames"}
-    memo = store._memo
-    key = ("slip", max_per_lap)
-    hit = memo.get(key)
-    if hit is None:
+    def _compute():
         import gt7analysis
-        hit = gt7analysis.wheel_slip(grouped, max_per_lap=max_per_lap)
-        memo[key] = hit
-    return hit
+        return gt7analysis.wheel_slip(grouped, max_per_lap=max_per_lap)
+    return store.memo_compute(("slip", max_per_lap), _compute)
 
 
 def session_deviation(path: Path, ref_lap: int | None = None,
@@ -1496,16 +1716,14 @@ def session_deviation(path: Path, ref_lap: int | None = None,
     if not store:
         return {"error": "no frames", "reliable": False, "line": [],
                 "grid_m": [], "segments": [], "ref_line": []}
-    memo = store._memo
-    key = ("deviation", int(ref_lap), int(cmp_lap), step)
-    hit = memo.get(key)
-    if hit is None:
+    def _compute():
         import gt7analysis
-        hit = gt7analysis.track_deviation(
+        return gt7analysis.track_deviation(
             gt7analysis.lap_samples(grouped[int(ref_lap)]),
             gt7analysis.lap_samples(grouped[int(cmp_lap)]),
             step=step)
-        memo[key] = hit
+    hit = store.memo_compute(("deviation", int(ref_lap), int(cmp_lap), step),
+                             _compute)
     # 每次返回都补这两个字段（让前端切圈时知道参考圈 / 对比圈当前是几号），
     # 同时把可圈清单给前端做下拉用。
     hit = dict(hit)
@@ -1549,13 +1767,10 @@ def session_track(path: Path) -> dict[str, Any]:
     _, store = _load_frames(path)
     if not store:
         return {"error": "no frames"}
-    memo = store._memo
-    key = ("fingerprint",)
-    fp = memo.get(key)
-    if fp is None:
+    def _compute():
         import gt7analysis
-        fp = gt7analysis.track_fingerprint(grouped)
-        memo[key] = fp
+        return gt7analysis.track_fingerprint(grouped)
+    fp = store.memo_compute(("fingerprint",), _compute)
     if "error" in fp:
         # 没有可用圈：不落库，也不报成页面错误——识别是增值功能
         return {"error": fp["error"], "identified": False}
@@ -1675,16 +1890,14 @@ def _dist_to_t(pts: list[dict], dist: float) -> float:
     return pts[k - 1]["t"] + (pts[k]["t"] - pts[k - 1]["t"]) * frac
 
 
-def _events_compute(det, path: Path, grouped: dict, memo: dict,
+def _events_compute(det, path: Path, grouped: dict, store: "FrameStore",
                     lap_no: int | None) -> dict[str, Any]:
     """session_events 的慢路径（结果由调用方记忆化）。"""
     import gt7analysis
 
     # —— 标定半径（与 /slip 共用一次标定，记忆化到同一份 memo）——
-    calib = memo.get("radii")
-    if calib is None:
-        calib = gt7analysis.calibrate_wheel_radii(grouped)
-        memo["radii"] = calib
+    calib = store.memo_compute(
+        ("radii",), lambda: gt7analysis.calibrate_wheel_radii(grouped))
     radii = None
     if calib.get("available"):
         radii = (calib["front_m"], calib["rear_m"])
@@ -1801,12 +2014,9 @@ def session_events(path: Path, lap_no: int | None = None) -> dict[str, Any]:
     _, store = _load_frames(path)
     if not store:
         return {"available": False, "reason": "no frames"}
-    memo = store._memo
-    key = ("events", lap_no)
-    hit = memo.get(key)
-    if hit is None:
-        hit = _events_compute(det, path, grouped, memo, lap_no)
-        memo[key] = hit
+    hit = store.memo_compute(
+        ("events", lap_no), lambda: _events_compute(det, path, grouped, store,
+                                                    lap_no))
     hit = dict(hit)
     hit["laps_list"] = [int(x["lap"]) for x in laps_list]
     return hit
@@ -1949,13 +2159,8 @@ def session_pitstops(path: Path) -> dict[str, Any]:
     _, store = _load_frames(path)
     if not store:
         return {"available": False, "reason": "no frames"}
-    memo = store._memo
-    key = ("pitstops",)
-    hit = memo.get(key)
-    if hit is None:
-        hit = _pit_compute(path, grouped, laps_list)
-        memo[key] = hit
-    return hit
+    return store.memo_compute(
+        ("pitstops",), lambda: _pit_compute(path, grouped, laps_list))
 
 
 # ---------------------------------------------------------------------------
@@ -2106,6 +2311,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | POST | `/api/v1/trash/purge` | 清空回收站（彻底删除全部） |
 | POST | `/api/v1/trash/<文件名>/restore` | 从回收站恢复场次到列表 |
 | POST | `/api/v1/trash/<文件名>/delete` | 彻底删除回收站中的单个场次 |
+| POST | `/api/v1/settings/archive-after` | 设置自动归档保留天数，body `{"value": 30}`（0=不自动归档；归档为无损 `.jsonl.gz`） |
 | GET | `/api/v1/docs` | 本文档 |
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
@@ -2122,6 +2328,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 - `ref_lap=N`（sessions 详情 / 详情页）：指定参考圈号做行车轨迹/时间差对比分析，
   默认取最快圈；`cmp_lap=M`：指定被对比的圈，默认取最后一圈。
   圈号不存在或非有效（如手改 URL）时静默回退默认值。
+- `cols=t,spd,rpm`（`/series` / `/frames` / `/csv`）：按需只取指定通道省流量；列名取自这些接口返回的 `cols` 字段。未知列名直接 400（附 `allowed` 列表），不静默少给几列；不传 = 全列（向后兼容）。
 - 返回 404 的情形：场次文件名不存在 / 非法路径
 
 ## 字段与单位约定（对外承诺，只加不改）
@@ -2228,6 +2435,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
+| `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -2512,7 +2720,32 @@ curl -o lap3.csv "http://localhost:8787/api/v1/sessions/SESSION.jsonl/csv?lap=3"
 - `history` 的条数上限 600；`path`/`gg` 上限 4000/1200 点
 - `frames` 的 `limit` 上限 1000；`series` 的 `max_points` 上限 6000
 - 服务器单线程 HTTP，请勿高频轮询（≥100ms 间隔为宜）
+
+## 传输与归档
+
+### 响应压缩与连接复用
+- **gzip 压缩**：客户端带 `Accept-Encoding: gzip` 时，正文（JSON / HTML / 页面）自动压缩（level 6）；附件类下载（CSV、`/download`）**不压缩**，避免浏览器把文件存成 `.gz`。可用 `--no-gzip` 启动参数关掉（排障 / 抓包看明文）。
+- **HTTP/1.1 keep-alive**：默认连接复用；客户端可发 `Connection: close` 显式关闭。多请求场景（如详情页并行取数）较无 keep-alive 提速约 10×。
+
+### 圈间对比轻量接口 `/compare`
+`GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M`（可加 `&race_line=0`）返回 `compare_session` 同款结构，**不含**占 73% 体积的 `race_line`（行车轨迹卡会自己另行取 `/raceline`）。详情页切参考圈 / 对比圈时只取这一份并重画依赖它的三块，不刷新整页（整页重来约 196KB / 720ms，XHR 约 8KB / 590ms），且不闪屏。
+
+### 存储归档（无损）
+- 老场次自动 gzip 压缩为 `<名>.jsonl.gz`（体积约 1/8~1/10，**无损、字节可还原**），后台静默进行，不阻塞列表页；正在录制（文件近 20s 内有写入）的活场不归档。
+- `GET /api/v1/sessions` 每条带 `archived: bool` 字段标明是否已压缩。
+- 自动归档保留期：`POST /api/v1/settings/archive-after {"value": 30}`（天，0=不自动归档，上限 3650）。
+- 访问归档场次无需改 URL：`/session`、`/api/v1/sessions/<名>`、`/series`、`/csv` 等都会用 `resolve_session` 自动兜底成 `.jsonl.gz`；`/download` 与 CSV 导出会自动带 `.gz` 后缀。
+- 收藏 / 自定义名 / 赛道库映射都以**未压缩基名** `X.jsonl` 为键，归档只换后缀不丢标注。
 """
+
+
+# —— 响应压缩 ——
+# 60Hz 遥测的 JSON 冗余极大（重复的键名、成串的数字），series 147 KB / csv 10.6 MB
+# 全是明文，实测压缩比 5~10 倍。代价是 CPU：level 6 压 1 MB 约 10ms 量级，
+# 对一台还要收 60Hz UDP 的小机器来说，level 9 不值那点收益。
+_GZIP_MIN_BYTES = 1024      # 小于 1 KB 压了也省不了多少，白花 CPU
+_GZIP_LEVEL = 6
+_GZIP_ENABLED = True        # --no-gzip 关掉（排障 / 抓包时看明文）
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -2524,14 +2757,74 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # 用类变量做默认值兜底，main() 会覆盖 server 实例上的值。
     history_dir: str = "./data"
 
+    # —— 传输层 ——
+    # HTTP/1.1 ⇒ keep-alive：实时页 10Hz 轮询不再每次重开 TCP 连接。
+    # 🔴 代价是每条响应必须有**准确**的 Content-Length，否则客户端会一直
+    #    等剩下的字节（表现为页面转圈不结束）——所以压缩与长度必须同一处算。
+    protocol_version = "HTTP/1.1"
+    # 空闲连接占着一条线程（ThreadingHTTPServer 每连接一线程）；
+    # 浏览器最多开 6 条，没超时的话关掉的标签页会一直留着线程。
+    # 300s 既够长（不会打断 10MB CSV 的慢速下发），又能收回死连接。
+    timeout = 300
+
     # -- 工具 -------------------------------------------------------------
 
-    def _send_json(self, obj: Any, code: int = 200, cors: bool = False) -> None:
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    def _accepts_gzip(self) -> bool:
+        """客户端是否接受 gzip（`Accept-Encoding: gzip`，含 q=0 的拒绝）。
+
+        只认 **gzip**（不认 deflate / br），因为我们只会发 gzip；
+        把 q=0 当成"别压"，否则给明确拒绝的客户端压了等于发乱码。
+        """
+        if not _GZIP_ENABLED:
+            return False
+        enc = (self.headers.get("Accept-Encoding") or "").lower()
+        for tok in enc.split(","):
+            tok = tok.strip()
+            if not tok.startswith("gzip"):
+                continue
+            q = 1.0
+            if ";q=" in tok:
+                try:
+                    q = float(tok.split(";q=", 1)[1].strip())
+                except ValueError:
+                    q = 0.0
+            return q > 0
+        return False
+
+    def _send_body(self, body: bytes, ctype: str, code: int = 200,
+                   cors: bool = False,
+                   extra: list[tuple[str, str]] | None = None,
+                   attach: bool = False) -> None:
+        """所有响应体的唯一出口：在这里一处决定 gzip 与 Content-Length。
+
+        🔴 顺序不能反：先压、再按**压完**的长度写 Content-Length。
+           写成压缩前的长度，HTTP/1.1 长连接下客户端会一直等剩下的字节。
+
+        🔴 附件（Content-Disposition）不压：浏览器对下载的处理各不相同，
+           有的存成 .gz 再让你自己解压，Excel 更是直接看不懂。
+        """
+        hdrs: list[tuple[str, str]] = []
+        if (not attach and len(body) >= _GZIP_MIN_BYTES
+                and self._accepts_gzip()):
+            z = gzip.compress(body, compresslevel=_GZIP_LEVEL)
+            # 压了反而更大（本来就随机的数）就别压
+            if len(z) < len(body):
+                body = z
+                hdrs.append(("Content-Encoding", "gzip"))
+                # 缓存（哪怕是我们自己发的 no-store，中间代理也可能看这个）
+                hdrs.append(("Vary", "Accept-Encoding"))
+        if extra:
+            hdrs.extend(extra)
+        # 客户端要求关闭（或本来就是 HTTP/1.0）时回一个 Connection: close，
+        # 别让对端傻等——长连接下"什么时候结束"只能靠 Content-Length 或这一条。
+        if self.close_connection:
+            hdrs.append(("Connection", "close"))
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in hdrs:
+            self.send_header(k, v)
         if cors:      # 公开 API v1 带跨域头，第三方网页可直接调用
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -2539,16 +2832,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, obj: Any, code: int = 200, cors: bool = False) -> None:
+        self._send_body(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                        "application/json; charset=utf-8", code, cors)
+
     def _send_text(self, text: str, code: int = 200, cors: bool = False) -> None:
-        body = text.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/markdown; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        if cors:
-            self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_body(text.encode("utf-8"),
+                        "text/markdown; charset=utf-8", code, cors)
 
     def do_OPTIONS(self) -> None:
         """CORS 预检。"""
@@ -2560,13 +2850,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send_html(self, html: str, code: int = 200) -> None:
-        body = html.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_body(html.encode("utf-8"),
+                        "text/html; charset=utf-8", code)
 
     # -- 场次管理（收藏 / 改名 / 删除）------------------------------------
     # jsonl 是不可变原始数据：收藏与改名写进 sessions_meta.json 边车文件，
@@ -2608,6 +2893,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
             save_settings(hist, s)
             self._send_json({"ok": True, "trash_retention_days": v,
                              "hint": "已生效，下次清理（每小时检查一次）按新保留期执行"},
+                            cors=True)
+            return
+
+        # —— 归档保留期：POST /api/v1/settings/archive-after {"value": 天数} ——
+        if parsed.path == "/api/v1/settings/archive-after":
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except Exception:
+                body = {}
+            try:
+                v = float(body.get("value"))
+            except (TypeError, ValueError):
+                self._send_json({"error": "value 必须是数字（天数，0=不自动归档）"},
+                                400, cors=True)
+                return
+            if not (0 <= v <= 3650):
+                self._send_json({"error": "天数需在 0~3650 之间"}, 400, cors=True)
+                return
+            s = load_settings(hist)
+            s["archive_after_days"] = v
+            save_settings(hist, s)
+            self._send_json({"ok": True, "archive_after_days": v,
+                             "hint": "已生效；归档是无损压缩（.jsonl → .jsonl.gz）"},
                             cors=True)
             return
 
@@ -2653,8 +2963,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             name, action = Path(tseg[4]).name, tseg[5]
             target = (trash / name).resolve()
+            target = resolve_session(target)   # 归档后被删进回收站的是 .gz
             if (not str(target).startswith(str(trash)) or not target.exists()
-                    or target.suffix != ".jsonl"):
+                    or not is_session_file(target)):
                 self._send_json({"error": "回收站里没有这个文件", "file": name},
                                 404, cors=True)
                 return
@@ -2719,14 +3030,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
         target = (hist / name).resolve()
+        # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
+        target = resolve_session(target)
         if (not str(target).startswith(str(hist)) or not target.exists()
-                or target.suffix != ".jsonl"):
+                or not is_session_file(target)):
             self._send_json({"error": "session not found", "file": name},
                             404, cors=True)
             return
 
         meta = load_session_meta(hist)
-        entry = meta.setdefault(name, {})
+        # 🔴 键一律用**未压缩**的那个名字（X.jsonl）：归档只换后缀，收藏和
+        #    自定义名不能因为归档就消失。老数据的键本来就是这个，兼容。
+        canon = session_stem(name) + ".jsonl"
+        entry = meta.setdefault(canon, {})
 
         if action == "rename":
             new = str(body.get("value") or "").strip()[:60]
@@ -2736,10 +3052,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
             entry["custom_name"] = new
         elif action == "favorite":
             entry["favorite"] = bool(body.get("value"))
+        elif action == "archive":
+            # 手动归档：就地压成 .jsonl.gz（无损）。压一场 250MB 要几秒，
+            # 所以这里不做后台线程——用户点了就是想要它现在发生。
+            if target.name.endswith(".gz"):
+                self._send_json({"ok": True, "action": action, "file": name,
+                                 "already": True, "hint": "这一场已经归档过了"},
+                                cors=True)
+                return
+            if _recording_active(hist) and \
+                    (time.time() - target.stat().st_mtime) < 20.0:
+                self._send_json({"error": "这一场正在录制，结束后再归档"},
+                                400, cors=True)
+                return
+            ok = archive_session(target)
+            self._send_json({"ok": ok, "action": action, "file": name,
+                             "hint": "已压缩为 .jsonl.gz" if ok
+                                     else "归档失败（见服务端日志）"}, cors=True)
+            return
         elif action == "delete":
             trash = hist / "_trash"
             trash.mkdir(exist_ok=True)
-            target.rename(trash / name)      # 移入回收目录，可找回
+            # 🔴 用 target.name 而不是 name：归档后的真名带 .gz
+            target.rename(trash / target.name)      # 移入回收目录，可找回
+            meta.pop(canon, None)
             meta.pop(name, None)
             save_session_meta(hist, meta)
             self._send_json({"ok": True, "deleted": name,
@@ -2797,8 +3133,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 target = (hist / name).resolve()
+                target = resolve_session(target)     # 归档后只有 X.jsonl.gz
                 # 目录穿越防护
-                if not str(target).startswith(str(hist)) or not target.exists():
+                if (not str(target).startswith(str(hist))
+                        or not target.exists() or not is_session_file(target)):
                     self._send_html("<h1>文件不存在或非法路径</h1>", 404)
                     return
                 # 参考圈选择器：?ref_lap=N 指定赛车线看第几圈，缺省=最快圈。
@@ -2832,7 +3170,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # 防目录穿越
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 target = (hist / name).resolve()
-                if not str(target).startswith(str(hist)) or not target.exists():
+                target = resolve_session(target)     # 归档后只有 X.jsonl.gz
+                if (not str(target).startswith(str(hist))
+                        or not target.exists() or not is_session_file(target)):
                     self._send_json({"error": "文件不存在或非法路径"}, 404)
                     return
                 self._send_json(analyze_session(target))
@@ -2900,15 +3240,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 name = Path(seg[4]).name if len(seg) == 6 else ""
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 target = (hist / name).resolve()
+                # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
+                target = resolve_session(target)
                 if (not str(target).startswith(str(hist)) or not target.exists()
-                        or target.suffix != ".jsonl"):
+                        or not is_session_file(target)):
                     self._send_json({"error": "session not found", "file": name},
                                     404, cors=True)
                     return
                 self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
+                # 🔴 归档后下载到的是 .jsonl.gz：文件名和 MIME 都得说实话，
+                #    否则用户拿到一个叫 .jsonl 的 gzip 文件（打不开且不知道为什么）。
+                gzed = target.name.endswith(".gz")
+                self.send_header(
+                    "Content-Type",
+                    "application/gzip" if gzed else "application/octet-stream")
                 self.send_header("Content-Disposition",
-                                 f'attachment; filename="{name}"')
+                                 f'attachment; filename="{target.name}"')
+                # 🔴 HTTP/1.1 + keep-alive：原始 jsonl 有几百 MB，不能读进内存
+                #    再压，所以这条**不 gzip**，但 Content-Length 必须是真实
+                #    字节数（否则客户端不知道下载何时结束）。
                 self.send_header("Content-Length", str(target.stat().st_size))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -2925,7 +3275,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     or path.endswith("/csv") or path.endswith("/raceline")
                     or path.endswith("/sectors") or path.endswith("/slip")
                     or path.endswith("/deviation") or path.endswith("/track")
-                    or path.endswith("/events") or path.endswith("/pitstops")):
+                    or path.endswith("/events") or path.endswith("/pitstops")
+                    or path.endswith("/compare")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
@@ -2940,8 +3291,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 name = Path(seg[4]).name if len(seg) == 6 else ""
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 target = (hist / name).resolve()
+                # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
+                target = resolve_session(target)
                 if (not str(target).startswith(str(hist)) or not target.exists()
-                        or target.suffix != ".jsonl"):
+                        or not is_session_file(target)):
                     self._send_json({"error": "session not found", "file": name},
                                     404, cors=True)
                     return
@@ -2952,6 +3305,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     lap_no = None
                 if lap_no is not None and lap_no <= 0:
                     lap_no = None
+                # ?cols=t,spd,rpm —— 只挑需要的通道（/series /frames /csv 用）。
+                # 写错列名直接 400，而不是静默少给几列。
+                sel, cols_err = _parse_cols(query.get("cols", [""])[0])
+                if cols_err:
+                    self._send_json({"error": cols_err, "allowed": _SERIES_COLS},
+                                    400, cors=True)
+                    return
                 if path.endswith("/raceline"):
                     if lap_no is None:
                         # 不给 lap 就直接取最快圈，省得前端先问一次圈速表
@@ -2999,19 +3359,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                     cors=True)
                 elif path.endswith("/pitstops"):
                     self._send_json(session_pitstops(target), cors=True)
+                elif path.endswith("/compare"):
+                    # 圈间对比（时间差曲线 + 关键点配对）：详情页切参考圈/对比圈
+                    # 时**只**取这一份，不刷新整页 —— 整页重来要把 200k 帧的
+                    # 统计、圈速表、四张分析卡一起重算一遍。
+                    try:
+                        rl2 = int(query.get("ref_lap", ["0"])[0]) or None
+                    except ValueError:
+                        rl2 = None
+                    try:
+                        cl2 = int(query.get("cmp_lap", ["0"])[0]) or None
+                    except ValueError:
+                        cl2 = None
+                    if rl2 is None:
+                        rl2 = (analyze_session(target).get("best_lap")
+                               or {}).get("lap")
+                    out = compare_session(target, ref_lap_no=rl2,
+                                          cmp_lap_no=cl2)
+                    # race_line 占整份响应的 73%（实测 98.6 KB 里 72.2 KB），
+                    # 而切圈后「行车轨迹」卡本来就要自己去 /raceline 取新的一圈
+                    # ——带上它等于白传一份马上就被覆盖的数据。
+                    if query.get("race_line", ["1"])[0] in ("0", "false", "no"):
+                        out.pop("race_line", None)
+                    self._send_json(out, cors=True)
                 elif path.endswith("/csv"):
-                    body = session_csv(target, lap_no=lap_no).encode("utf-8")
-                    fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"
-                    self.send_response(200)
-                    # Excel 打开 UTF-8 CSV 需要 BOM，否则中文表头会乱码
-                    self.send_header("Content-Type",
-                                     "text/csv; charset=utf-8")
-                    self.send_header("Content-Disposition",
-                                     f'attachment; filename="{fn}"')
-                    self.send_header("Content-Length", str(len(body) + 3))
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(b"\xef\xbb\xbf" + body)
+                    body = session_csv(target, lap_no=lap_no,
+                                       sel=sel).encode("utf-8")
+                    # 归档后真名带 .gz，但导出的 CSV 该用**场次基名**
+                    fn = session_stem(name) + (f"_lap{lap_no}" if lap_no
+                                               else "") + ".csv"
+                    # Excel 打开 UTF-8 CSV 需要 BOM，否则中文表头会乱码。
+                    # attach=True：附件不 gzip（浏览器/Excel 对压缩下载的处理
+                    # 五花八门，有的直接存成 .gz）。
+                    self._send_body(b"\xef\xbb\xbf" + body,
+                                    "text/csv; charset=utf-8", 200, cors=True,
+                                    extra=[("Content-Disposition",
+                                            f'attachment; filename="{fn}"')],
+                                    attach=True)
                 elif path.endswith("/frames"):
                     try:
                         off = int(query.get("offset", ["0"])[0])
@@ -3023,7 +3407,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         lim = 200
                     self._send_json(
                         session_frames(target, offset=off, limit=lim,
-                                       lap_no=lap_no), cors=True)
+                                       lap_no=lap_no, sel=sel), cors=True)
                 else:
                     try:
                         mx = int(query.get("max_points", ["2400"])[0])
@@ -3031,7 +3415,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         mx = 2400
                     self._send_json(
                         session_series(target, lap_no=lap_no,
-                                       max_points=max(200, min(mx, 6000))),
+                                       max_points=max(200, min(mx, 6000)),
+                                       sel=sel),
                         cors=True)
 
             elif path.startswith("/api/v1/sessions/"):
@@ -3039,8 +3424,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 name = Path(path.rsplit("/", 1)[-1]).name
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 target = (hist / name).resolve()
+                # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
+                target = resolve_session(target)
                 if (not str(target).startswith(str(hist)) or not target.exists()
-                        or target.suffix != ".jsonl"):
+                        or not is_session_file(target)):
                     self._send_json({"error": "session not found", "name": name},
                                     404, cors=True)
                     return
@@ -3679,7 +4066,9 @@ _COMPARE_TMPL = r"""
     <b style="color:var(--bad)">红 −</b> 更慢。</p>
 </div>
 <script>
-const CMP = __DATA__;
+// 🔴 var（不是 const）：切参考圈/对比圈时整份数据会被换掉重画，
+//    所以这份引用必须是可变的。
+var CMP = __DATA__;
 (function () {
   if (!CMP || CMP.error || !CMP.laps_analyzed) {
     const m = document.getElementById('cmpMeta');
@@ -3756,18 +4145,8 @@ const CMP = __DATA__;
   }
   refreshCmpLabels();
 
-  // —— 参考圈 / 对比圈选择器：改任意一个都带两个参数刷新本页 ——
-  // 时间差曲线、峰谷配对、赛车线都依赖「哪两圈」，只能在服务端重算。
-  window.cmpLapChange = function () {
-    const rs = document.getElementById('refLapSel');
-    const cs = document.getElementById('cmpLapSel');
-    const u = new URL(location.href);
-    if (rs) u.searchParams.set('ref_lap', rs.value);
-    if (cs) u.searchParams.set('cmp_lap', cs.value);
-    showLoad('正在按第 ' + (rs ? rs.value : '?') + ' 圈 vs 第 '
-      + (cs ? cs.value : '?') + ' 圈重新分析…');
-    location.href = u.toString();
-  };
+  // 参考圈 / 对比圈选择器本身在这里填充；切换的动作（cmpLapChange）定义在
+  // 本 IIFE 末尾——它要等 drawCmpDiff / drawCmpPv / rlLapChange 都就位。
   lapOpts(document.getElementById('refLapSel'), CMP.ref_lap, '参考圈');
   lapOpts(document.getElementById('cmpLapSel'), CMP.cur_lap, '对比圈');
   const refSelEl = document.getElementById('refLapSel');
@@ -3778,6 +4157,8 @@ const CMP = __DATA__;
   }
 
   // —— 时间差曲线（带坐标参考：X=圈内距离+参考圈时刻，Y=毫秒） ——
+  // 抽成函数：切换参考圈 / 对比圈时**只重画这一段**，不刷新整页。
+  window.drawCmpDiff = function () {
   const d = CMP.time_diff, svg = document.getElementById('diffSvg');
   if (d.grid && d.grid.length > 1) {
     const W = 720, H = 236;
@@ -3854,6 +4235,8 @@ const CMP = __DATA__;
     svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
     svg.innerHTML = html;
   }
+  };
+  drawCmpDiff();
 
   // —— 行车轨迹（两套着色口径）——
   // 「按踏板着色」：线色来自记录的油门 / 刹车开度百分比，刹车「粉→红」、
@@ -4041,10 +4424,12 @@ const CMP = __DATA__;
 
   // —— 关键点对比表（服务端已按圈内相对位置配好对）——
   // 口径：差值 = 对比圈 − 参考圈。正 = 对比圈更快（绿），负 = 更慢（红）。
-  const rows = CMP.pv_pairs || [];
+  // 同样抽成函数：切圈时随 CMP 一起重画。
   const kindTxt = k => k === 'peak' ? '直道尾速' : '弯心速度';
   const dTxt = d => (d > 0 ? '+' : '') + d.toFixed(1);
   const dColor = d => d > 0.05 ? 'var(--ok)' : (d < -0.05 ? 'var(--bad)' : 'var(--muted)');
+  window.drawCmpPv = function () {
+  const rows = CMP.pv_pairs || [];
   document.getElementById('pvBody').innerHTML = rows.map(p =>
     '<tr><td>' + p.distance + '</td>'
     + '<td>' + kindTxt(p.kind) + '</td>'
@@ -4070,6 +4455,57 @@ const CMP = __DATA__;
       + (worst.delta < 0 ? chip(worst) : '');
     sum.style.display = sum.innerHTML ? 'flex' : 'none';
   }
+  };
+  drawCmpPv();
+
+  // —— 切参考圈 / 对比圈：只取 compare 这一份，就地重画 ——
+  // 🔴 以前这里是「带着两个参数重新导航」= 整页刷新：整页要把 200k 帧的
+  //    统计、圈速表、四张分析卡全部重算，切一次圈等好几秒（实测热缓存
+  //    720ms / 196 KB）。实际上变的只有「哪两圈」，所以只换 CMP 并重画
+  //    依赖它的三块即可（8 KB / 590ms，且不闪屏）。
+  //    ⚠️ 别改回整页刷新——tests/test_compare_xhr.py 会拦。
+  window.cmpLapChange = function () {
+    const rs = document.getElementById('refLapSel');
+    const cs = document.getElementById('cmpLapSel');
+    const rv = rs ? rs.value : '', cvv = cs ? cs.value : '';
+    const u = new URL(location.href);
+    if (rs) u.searchParams.set('ref_lap', rv);
+    if (cs) u.searchParams.set('cmp_lap', cvv);
+    if (typeof showLoad === 'function') {
+      showLoad('正在按第 ' + rv + ' 圈 vs 第 ' + cvv + ' 圈重新分析…');
+    }
+    // race_line=0：那份数据占响应的 73%，而下面 rlLapChange 会自己取新的一圈
+    fetch('/api/v1/sessions/' + encodeURIComponent(CMP.file || '')
+          + '/compare?ref_lap=' + encodeURIComponent(rv)
+          + '&cmp_lap=' + encodeURIComponent(cvv) + '&race_line=0')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || d.error) {
+          if (typeof hideLoad === 'function') hideLoad();
+          var m = document.getElementById('cmpMeta');
+          if (m) m.textContent = (d && d.error) || '读取失败';
+          return;
+        }
+        // 新这份没带 race_line（省流量），但别把已有的那份弄丢 ——
+        // 万一 /raceline 那次取失败，画面上还有上一圈的线可看。
+        if (!d.race_line && CMP.race_line) d.race_line = CMP.race_line;
+        CMP = d;
+        // 地址栏跟着变：刷新 / 收藏 / 分享链接还能拿到当前这两圈
+        try { history.replaceState(null, '', u.toString()); } catch (e) {}
+        refreshCmpLabels();
+        drawCmpDiff();
+        drawCmpPv();
+        // 行车轨迹「默认跟随参考圈」，参考圈变了它也跟着换
+        if (window.rlLapChange) window.rlLapChange(rv);
+        // 走线偏差卡的参考圈也跟着走（它自己那张卡是异步取的）
+        if (window.dvSetRef) window.dvSetRef(parseInt(rv, 10) || 0);
+        if (typeof hideLoad === 'function') hideLoad();
+      }, function () {
+        if (typeof hideLoad === 'function') hideLoad();
+        var m2 = document.getElementById('cmpMeta');
+        if (m2) m2.textContent = '读取失败';
+      });
+  };
 })();
 </script>
 """
@@ -4317,6 +4753,21 @@ _DEVIATION_TMPL = r"""
     }
     drawDeviation();
   }
+
+  // 参考圈被别处（圈间对比卡的「参考圈」下拉）改了 → 用它重取。
+  // 走线偏差默认以参考圈为基准，两张卡必须同一个值，否则用户会以为
+  // 「偏差是按第 3 圈算的」而曲线其实是第 5 圈的。
+  window.dvSetRef = function (n) {
+    var v = parseInt(n, 10) || 0;
+    if (!v || (DV && v === DV.ref_lap)) return;
+    var meta = el('dvMeta');
+    if (meta) meta.textContent = '计算中…';
+    fetch(API + '/deviation?ref_lap=' + v + '&cmp_lap=' + dvLapNo)
+      .then(function (r) { return r.json(); })
+      .then(function (d) { DV = d; renderDv(); }, function () {
+        if (meta) meta.textContent = '读取失败';
+      });
+  };
 
   // lap 选择：参考圈固定 = 最快圈（服务端定的），只让用户换对比圈。
   window.dvPick = function (v) {
@@ -7979,7 +8430,7 @@ makeZoomable($('chart'), 'chart');
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    global PAGE, HUB
+    global PAGE, HUB, _GZIP_ENABLED
 
     # Windows 控制台默认 GBK 编码，遇到 ⚠/emoji 会 UnicodeEncodeError 直接崩溃
     # （打包成 exe 后尤其明显）。放宽为「不可编码字符用 ? 代替」即可避免。
@@ -8000,7 +8451,11 @@ def main() -> int:
         "-s", "--status", default="./data/status.json",
         help="接收器写的状态文件路径，默认 ./data/status.json",
     )
+    p.add_argument("--no-gzip", action="store_true",
+                   help="关闭响应 gzip（抓包/排障时看明文）")
     args = p.parse_args()
+
+    _GZIP_ENABLED = not args.no_gzip
 
     PAGE = build_page()
 
