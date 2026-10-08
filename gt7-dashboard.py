@@ -7437,6 +7437,39 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .cgrid .card.editmode > h2::before { content:'⠿ '; color:var(--muted); }
 @media(max-width:820px){ .cgrid{grid-template-columns:1fr}
   .cgrid .card.span2{grid-column:auto} }
+/* ---------- 赛道工程师卡片 ---------- */
+#c-coach h2 { display:flex; align-items:center; gap:8px; }
+#c-coach h2 .cspacer { flex:1; }
+#coachDot { width:7px; height:7px; border-radius:50%; background:var(--muted);
+  flex-shrink:0; margin:0; }
+#coachDot.on { background:var(--ok); box-shadow:0 0 0 3px rgba(63,185,80,.18); }
+#coachDot.off { background:var(--warn); }
+#coachMute { border:1px solid var(--line); background:transparent;
+  color:var(--muted); border-radius:6px; padding:2px 8px; cursor:pointer;
+  font-family:inherit; font-size:11px; letter-spacing:.3px;
+  text-transform:none; font-weight:400; }
+#coachMute.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
+.coach-row { display:flex; justify-content:space-between; font-size:13px;
+  padding:5px 0; border-bottom:1px solid var(--line); }
+.coach-row:last-of-type { border-bottom:none; }
+.coach-row span { color:var(--muted); }
+.coach-row b { font-family:var(--mono); font-weight:500; }
+/* delta：负 = 比参考快（绿），正 = 丢时间（红）。与圈速表的时间差同色。 */
+.coach-row b.neg { color:var(--ok); }
+.coach-row b.pos { color:var(--bad); }
+#coSay { margin-top:9px; padding:9px 11px; border-radius:8px;
+  background:rgba(var(--accent-rgb),.09);
+  border:1px solid rgba(var(--accent-rgb),.22);
+  font-size:15px; font-weight:600; line-height:1.4;
+  min-height:38px; display:flex; align-items:center; }
+#coSay.idle { background:transparent; border-style:dashed;
+  border-color:var(--line); color:var(--muted); font-weight:400; font-size:12px; }
+#coHist { margin-top:8px; max-height:116px; overflow-y:auto; }
+#coHist div { font-size:12px; color:var(--muted); padding:3px 0;
+  border-bottom:1px dashed var(--line); }
+#coHist div:last-child { border-bottom:none; }
+#coHist i { font-style:normal; font-family:var(--mono); font-size:10px;
+  color:var(--accent); margin-right:5px; }
 /* 🔴 布局编辑时卡片必须抬到遮罩之上：
    布局面板是模态弹窗（z-index:50，全屏遮罩），卡片原本被压在下面——
    看得见（遮罩半透明）但摸不着：按下/拖动全落在遮罩上，
@@ -7870,6 +7903,20 @@ th { color:var(--muted); font-weight:500; }
 
 <div id="main" style="display:none">
   <div id="cardGrid" class="cgrid">
+    <div class="card span2" id="c-coach">
+      <h2>赛道工程师
+        <span id="coachDot" title="连接状态"></span>
+        <span class="cspacer"></span>
+        <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">语音：关</button>
+      </h2>
+      <div class="coach-row"><span>参考圈</span><b id="coRef">--</b></div>
+      <div class="coach-row"><span>本圈位置</span><b id="coS">--</b></div>
+      <div class="coach-row"><span>对比参考圈</span><b id="coDelta">--</b></div>
+      <div class="coach-row"><span>下一个刹车点</span><b id="coBrake">--</b></div>
+      <div id="coSay" class="idle">赛道工程师未启动</div>
+      <div id="coHist"></div>
+    </div>
+
     <div class="card" id="c-rpm">
       <h2>转速与速度</h2>
       <div class="dials">
@@ -9066,6 +9113,148 @@ poll();
 setInterval(poll, 100);   // 10Hz 轮询；G 力球靠 rAF 在两次轮询之间平滑插值
 ggLoop();                 // 启动 G 力球动画（自带 requestAnimationFrame 循环）
 
+// ---------- 赛道工程师（gt7-coach）：状态卡片 + 语音播报 ----------
+// 跑在**另一个进程**，跨源取数靠对方给 CORS 头。它挂了/没起/地址不对，
+// 都只能影响这一张卡 —— 绝不能让主仪表盘跟着出问题。所以全是双参数 then + 退避。
+//
+// 🔴 地址默认不能是「本页主机 + 8788」：常见部署是仪表盘在服务器
+//    （比如 192.168.43.18:8787），而赛道工程师要跑在**玩家电脑**上
+//    （扬声器在旁边）。所以按 ?coach= → localStorage → 同主机 :8788 依次取，
+//    并且允许点一下卡片上的提示就地改地址、记住。
+const COACH_KEY = 'gt7_coach_url';
+const COACH_POLL_MS = 200;
+let coachUrl = (function(){
+  const q = new URLSearchParams(location.search).get('coach');
+  if (q) return q.replace(/\/+$/, '');
+  try { const v = localStorage.getItem(COACH_KEY); if (v) return v.replace(/\/+$/, ''); }
+  catch (e) { /* 隐私模式下 localStorage 会抛，忽略 */ }
+  if (!location.hostname) return 'http://127.0.0.1:8788';
+  return location.protocol + '//' + location.hostname + ':8788';
+})();
+// 默认不发声：① 浏览器要求先有一次用户手势才允许自动播放；
+//              ② 别在用户没准备的时候突然出声。点一下按钮即开启。
+let coachSpeakOn = false;
+let coachRetry = COACH_POLL_MS;
+let coachSig = '';        // 已播报过的内容指纹（去重）
+
+function coachSay(text){
+  if (!coachSpeakOn || !text || !window.speechSynthesis) return;
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'zh-CN'; u.rate = 1.15;
+    speechSynthesis.speak(u);
+  } catch (e) { /* 播报失败绝不影响取数 */ }
+}
+
+function renderCoach(d){
+  coachRetry = COACH_POLL_MS;
+  $('coachDot').className = 'on';
+  const s = d.stats || {};
+  $('coRef').textContent = d.ref_ready
+    ? ((s.ref_source === 'profile' ? '车载 60Hz' : '自攒 10Hz')
+       + ' · 第 ' + d.ref_lap + ' 圈')
+    : '建立中…';
+  $('coS').textContent = (d.s_m == null) ? '--'
+    : (Math.round(d.s_m) + ' / ' + Math.round(d.ref_len_m || 0) + ' m');
+  const dv = d.delta_s, el = $('coDelta');
+  if (dv == null) { el.textContent = '--'; el.className = ''; }
+  else {
+    el.textContent = (dv > 0 ? '+' : '') + dv.toFixed(2) + ' s';
+    el.className = dv > 0 ? 'pos' : 'neg';   // 正=丢时间 红，负=更快 绿
+  }
+  $('coBrake').textContent = (d.next_brake_s == null) ? '--'
+    : (Math.round(d.next_brake_m) + ' m / ' + d.next_brake_s.toFixed(1) + ' s');
+
+  const say = (d.say && d.say.length) ? d.say[0] : null;
+  const box = $('coSay');
+  if (say) {
+    box.className = ''; box.textContent = say.text;
+    // 播报只念**本次新产生**的那一条：/state 是电平接口，它会一直返回
+    // 同一条，不去重就会每 200ms 念一遍。
+    const sig = say.key + '|' + say.text + '|' + d.lap;
+    if (sig !== coachSig) { coachSig = sig; coachSay(say.text); }
+  } else if (!d.ref_ready) {
+    box.className = 'idle';
+    box.textContent = d.connected
+      ? '正在建立参考圈：跑完一整圈后才开始给建议'
+      : '等待遥测数据…';
+  } else {
+    // 没新话可说时显示最近说过的那句（灰底），而不是留空 ——
+    // 留空会让人以为卡片坏了。
+    const last = (d.spoken && d.spoken.length) ? d.spoken[0].text : '';
+    box.className = 'idle';
+    box.textContent = last || '目前没有要提醒的';
+  }
+
+  $('coHist').innerHTML = (d.spoken || []).slice(0, 8).map(function(h){
+    return '<div><i>' + (h.key || '').split('@')[0] + '</i>' + h.text + '</div>';
+  }).join('');
+}
+
+function renderCoachOff(){
+  $('coachDot').className = 'off';
+  $('coRef').textContent = '--';
+  $('coS').textContent = '--';
+  $('coDelta').textContent = '--'; $('coDelta').className = '';
+  $('coBrake').textContent = '--';
+  const box = $('coSay');
+  box.className = 'idle';
+  box.textContent = '赛道工程师未启动（' + coachUrl + '）· 点这里改地址';
+  box.style.cursor = 'pointer';
+  box.title = '点击填写赛道工程师的地址，例如 http://localhost:8788';
+  $('coHist').innerHTML = '';
+  // 指数退避：没装/没起的时候别每 200ms 打一个空端口
+  coachRetry = Math.min(coachRetry * 2, 15000);
+}
+
+// 就地改地址：填对了就记住（localStorage），下次打开不用再填。
+// 做成"点提示文字"而不是加一个设置项 —— 这张卡的常态是能用，
+// 设置入口不该占常驻空间。
+function askCoachUrl(){
+  const v = prompt('赛道工程师的地址（通常跑在玩家电脑上）：', coachUrl);
+  if (!v) return;
+  const url = v.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(url)) { alert('要带 http:// 或 https://'); return; }
+  coachUrl = url;
+  try { localStorage.setItem(COACH_KEY, url); } catch (e) { /* 忽略 */ }
+  coachRetry = COACH_POLL_MS;
+  $('coSay').style.cursor = '';
+  $('coSay').title = '';
+  pollCoach();
+}
+
+function pollCoach(){
+  fetch(coachUrl + '/api/v1/coach/state')
+    .then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    // 🔴 双参数 then，不是 .then(ok).catch(bad)。
+    //    单参数写法会把 renderCoach 里的任何异常也当成"取不到数"，
+    //    于是整张卡静默显示成"未启动" —— 页面正常、卡没了、console 无线索。
+    .then(renderCoach, renderCoachOff)
+    .then(function(){ setTimeout(pollCoach, coachRetry); },
+          function(){ setTimeout(pollCoach, coachRetry); });
+}
+
+(function initCoachCard(){
+  const btn = $('coachMute');
+  if (!window.speechSynthesis) {
+    btn.textContent = '语音不可用';
+    btn.disabled = true;
+  } else {
+    btn.onclick = function(){
+      coachSpeakOn = !coachSpeakOn;
+      btn.textContent = '语音：' + (coachSpeakOn ? '开' : '关');
+      btn.className = coachSpeakOn ? 'on' : '';
+      // 顺便给个即时反馈（也确认音色/音量是通的）
+      if (coachSpeakOn) coachSay('语音已开启');
+    };
+  }
+  $('coSay').onclick = askCoachUrl;
+  pollCoach();
+})();
+
 // ---------- 布局系统：卡片显隐 / 半宽整行 / 拖拽排序 / 多布局保存 ----------
 // 存 localStorage（每个浏览器各一份）——布局是视觉偏好，跟屏幕尺寸相关，
 // 本来就应该按设备存；也避免给服务端加写入接口。
@@ -9074,7 +9263,7 @@ const CARD_TITLES = {
   'c-rpm':'转速与速度', 'c-pedal':'踏板与 G 力', 'c-lap':'圈速与能量',
   'c-gball':'G 力球', 'c-gg':'G-G 图', 'c-map':'行车轨迹',
   'c-chart':'实时曲线', 'c-wheel':'四轮状态',
-  'c-engine':'引擎健康', 'c-race':'比赛信息',
+  'c-engine':'引擎健康', 'c-race':'比赛信息', 'c-coach':'赛道工程师',
 };
 const DEFAULT_CARDS = [
   {id:'c-rpm',  span:1, show:true},
