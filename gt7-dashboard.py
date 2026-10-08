@@ -283,8 +283,8 @@ _FRAMES_CACHE: dict[str, tuple[float, int, dict, "FrameStore"]] = {}
 _CACHE_LOCK = threading.RLock()
 
 # —— 逐帧字段里「全库真正会读」的那些 ——
-# 实测一场 217475 帧的场次有 52 个逐帧字段，但代码从头到尾只读了下面 15 个。
-# 剩下 37 个（tyre_press / seq / position / hand_brake / susp_height …）
+# 实测一场 217475 帧的场次有 52 个逐帧字段，但代码真正会读的只有下面 16 个。
+# 剩下 36 个（tyre_press / seq / position / hand_brake / susp_height …）
 # 全库没有一处读，存进内存纯属白占 —— 而内存正是原来的瓶颈。
 #
 # 🔴 以后要读新字段，必须加进 _FRAME_COL_KIND，否则读到的是 None。
@@ -298,6 +298,10 @@ _FRAME_COL_KIND: dict[str, str] = {
     "car_x": "n", "car_z": "n",
     "gas_level": "n", "gas_capacity": "n", "car_code": "n",
     "g_force": "a",
+    # 四轮角速度（rad/s，顺序 前左/前右/后左/后右）。
+    # 只有它是「车轮实际转多快」的唯一来源 —— 车身速度传感器测不出空转和抱死，
+    # 轮胎滑移检测（gt7analysis.wheel_slip）全靠它。一场 217k 帧多占约 7 MB。
+    "wheel_rads": "a",
     "has_coords": "b",
     "layout": "s",
 }
@@ -1308,6 +1312,64 @@ def session_csv(path: Path, lap_no: int | None = None) -> str:
     return "\n".join(out) + "\n"
 
 
+def session_sectors(path: Path, n_sectors: int = 4) -> dict[str, Any]:
+    """分段计时 / 理论最快圈。
+
+    分段边界按**距离**等分（不是时间等分）—— 只有把边界钉在同一段路上，
+    跨圈的段用时才可比。理论最快圈 = 各段全场最小用时之和。
+
+    🔴 结果按场次记忆化。本场 217k 帧实测 0.39s，而它只取决于文件内容；
+       详情页那张卡片每次展开都调它，不记忆就是纯浪费。
+
+    🔴 异常圈过滤在 gt7analysis.sector_times 里做，别在这里"优化"掉：
+       不过滤会得到 +8.48% 的假空间，过滤后才是真实的 +0.71%。
+    """
+    n_sectors = max(2, min(int(n_sectors or 4), 10))
+    try:
+        _, grouped, _ = _valid_laps(path)
+    except Exception as e:
+        return {"error": str(e), "laps": [], "reliable": False}
+    _, store = _load_frames(path)
+    if not store:
+        return {"error": "no frames", "laps": [], "reliable": False}
+    memo = store._memo
+    key = ("sectors", n_sectors)
+    hit = memo.get(key)
+    if hit is None:
+        import gt7analysis
+        hit = gt7analysis.sector_times(grouped, n_sectors=n_sectors)
+        memo[key] = hit
+    return hit
+
+
+def session_slip(path: Path, max_per_lap: int = 120) -> dict[str, Any]:
+    """轮胎滑移（空转 / 抱死）检测，基于四轮角速度。
+
+    半径自标定、前后轴分别标定；缺 wheel_rads 的老场次返回 available=False
+    （前端据此整卡隐藏，不要显示空表）。
+
+    🔴 结果按场次记忆化。本场实测 0.53s。注意它比 /sectors 更贵，因为要
+       逐帧走一遍全部帧；而返回的 series 体积由**圈数**封顶（23×120 点），
+       不随帧数膨胀。
+    """
+    max_per_lap = max(20, min(int(max_per_lap or 120), 600))
+    try:
+        _, grouped, _ = _valid_laps(path)
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+    _, store = _load_frames(path)
+    if not store:
+        return {"available": False, "reason": "no frames"}
+    memo = store._memo
+    key = ("slip", max_per_lap)
+    hit = memo.get(key)
+    if hit is None:
+        import gt7analysis
+        hit = gt7analysis.wheel_slip(grouped, max_per_lap=max_per_lap)
+        memo[key] = hit
+    return hit
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -1561,6 +1623,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/frames?offset=0&limit=200&lap=N` | **分页**逐帧数据（`limit` 上限 1000），用于表格 |
 | `GET /api/v1/sessions/<文件名>/csv?lap=N` | 全量 CSV 下载（带 UTF-8 BOM，Excel 直接打开不乱码） |
 | `GET /api/v1/sessions/<文件名>/raceline?lap=N` | 第 N 圈的**行车轨迹**（踏板 + G 力两套着色通道）；`lap` 缺省 = 最快圈 |
+| `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
+| `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -1579,6 +1643,77 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 `series` 额外返回 `laps[]`（每圈 `lap` / `t0` / `dur` / `frames`）、
 `total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、
 `sampled_frames`、`step`（抽稀步长）。
+
+## 分段计时与轮胎滑移
+
+这两张卡片回答的是「我还能快多少」和「我的胎是怎么被糟蹋的」。
+两个接口都只依赖场次文件内容，服务端按场次记忆化，所以重复请求几乎零成本
+（实测首次 0.39s / 0.53s，命中缓存后 4ms / 6ms）。
+
+### `GET /api/v1/sessions/<文件名>/sectors?n=4` —— 分段计时 / 理论最快圈
+
+每圈按**距离**等分成 `n` 段（不是按时间等分：只有把段边界钉在同一段路上，
+跨圈的段用时才可比），插值出各段用时；每段取所有**可信圈**里的最快值求和，
+就是「理论最快圈」。
+
+| 字段 | 说明 |
+|---|---|
+| `n_sectors` / `tol` / `dist_tol` | 段数 / 圈速容差（0.05）/ 圈长容差（0.03） |
+| `ref_dist_m` | 圈长中位数，圈长与它比对判断是否跑满整圈 |
+| `actual_best_lap` / `actual_best_s` | 实际最快圈号 / 圈速 |
+| `theoretical_best_s` | 理论最快圈（各段最快用时之和） |
+| `potential_gain_s` / `potential_gain_pct` | 潜在空间 = 实际最快 − 理论最快 |
+| `best_each_s[]` | 每段的场次最快用时 |
+| `counted_laps[]` | 参与计算理论值的可信圈 |
+| `partial_laps[]` | 圈长偏离中位数 >`dist_tol` 的圈，不给 `deltas` |
+| `reliable` / `note` | 理论值是否可信；不可信时 `note` 写明原因 |
+| `laps[]` | 逐圈 `{lap, total_s, dist_m, sectors[], counted, is_best, partial, deltas[]}` |
+
+两条口径必须**先过滤再计算**，否则数字会骗人：
+
+- **异常圈**：冲出赛道 / 进站 / 打转的圈里，某一小段可能"恰好很快"，把理论值
+  拉到不真实地低。实测同一场 23 圈不过滤得到 `+8.48%` 的假空间，只留
+  ≤最快圈×1.05 的 5 圈才是真实的 `+0.71%`。所以 `reliable` 只在可信圈
+  ≥2 个时为 `true`，否则宁可空着也不给一个会骗人的数字。
+- **残缺圈**：段边界按各圈**自己的**圈长等分，只有跑满整圈的圈边界才对得齐。
+  实测第 1 圈只有 6129.6m（最快圈 6937.8m，录像从半圈处开始），它的第 1 段
+  插出 25.2s，比全场最快的 33.2s 还"快" 8 秒 —— 纯属边界错位。更要紧的是
+  圈长偏短的圈**总时长也偏短，完全可能被选成 `actual_best`**，所以这一步
+  排在选最快圈**之前**，不只是从统计圈里剔掉。
+
+> `theoretical_best_s < actual_best_s` 是**正常**的，不要当 bug「修」成相等。
+> 残余偏差：同为完整圈时圈长仍有约 ±0.3% 的差（本次 5 个可信圈 6936~6960m），
+> 段边界会错开十几米，理论值可能乐观 0.1~0.3s —— 所以 `dist_m` 要展示出来，
+> 让人看得见可比性。
+
+### `GET /api/v1/sessions/<文件名>/slip?max_points=120` —— 轮胎滑移
+
+只有四轮角速度（`wheel_rads`）能反映「车轮实际转多快」，车身速度传感器
+测不出空转和抱死。滑移率 `s = (ω·R − v) / v`：`s > 0` 轮子转得比车快
+（空转），`s < 0` 转得比车慢（抱死）。
+
+半径**自标定**，不依赖任何外部参数：自由滚动帧上 `ω·R ≈ v`，于是
+`R = Σ(v·ω) / Σ(ω²)`（对 R 的最小二乘解）。**前后轴必须分别标定** ——
+实测 R前 0.3391m / R后 0.3435m（比值 0.987）；若假设同半径，滑移率会被
+整体偏置约 1.3%，而抱死的典型信号本身只有百分之几，偏置不可忽略。
+
+| 字段 | 说明 |
+|---|---|
+| `available` | 缺 `wheel_rads` 的老场次为 `false`，前端据此整卡隐藏 |
+| `calibration` | `{front_m, rear_m, ratio, free_frames, free_pct, ok, reason, free_slip_front, free_slip_rear}` |
+| `laps[]` | 逐圈 `{lap, frames, front, rear, lockup_frames, wheelspin_frames}`；`front`/`rear` 为 `{min, p05, p50, p95, max}` |
+| `lockup` / `wheelspin` | `{events, frames, worst[]}`；`worst[]` 最多 5 条 `{lap, t_rel, slip, speed_kph, throttle, brake, frames}` |
+| `series` | 逐圈降采样曲线 `{t[], front[], rear[], speed_kph[], throttle[], brake[]}`，每圈 ≤`max_points` 点 |
+
+- 事件按**连续帧**聚成一次（否则一次抱死会被算成 60 次），且至少 2 帧才算一次。
+- 踏板要到位：抱死要求 `brake > 0.85`，空转要求 `throttle > 0.95`。
+- `calibration.ok` 是自洽性检查：标定后自由滚动帧的滑移均值应接近 0
+  （实测 −0.0001 / +0.0000）。偏得远说明标定被污染（自由滚动帧太少，
+  或油门/刹车阈值没生效），此时 `reason` 写明原因。
+- 自由滚动帧的噪声底 `|s| ≈ 0.0005`，而事件峰值从 `−1.000`（四轮全锁，
+  ω 精确为 0）到 `+7.98`（低速全油门空转），阈值因此不敏感。
+- ⚠️ 曲线是抽稀的，**1~2 帧的尖峰会漏掉**（抱死常常就这么短）——
+  峰值一律从 `worst[]` 读，别从曲线读。
 
 ## 单圈行车轨迹
 
@@ -2002,10 +2137,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             elif path.startswith("/api/v1/sessions/") and (
                     path.endswith("/series") or path.endswith("/frames")
-                    or path.endswith("/csv") or path.endswith("/raceline")):
+                    or path.endswith("/csv") or path.endswith("/raceline")
+                    or path.endswith("/sectors") or path.endswith("/slip")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
+                # 外加 /sectors（分段计时 + 理论最快圈）与 /slip（轮胎滑移）：
+                #   两张分析卡片各自展开时才取，同样不拖累整页渲染。
                 # 🔴 必须排在下面那条「通用 /api/v1/sessions/<名>」之前，
                 #    否则会被当成场次名吞掉。
                 seg = path.split("/")
@@ -2034,6 +2172,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                          "segments": []}, 404, cors=True)
                         return
                     self._send_json(race_line_session(target, lap_no), cors=True)
+                elif path.endswith("/sectors"):
+                    try:
+                        ns = int(query.get("n", ["4"])[0])
+                    except ValueError:
+                        ns = 4
+                    self._send_json(
+                        session_sectors(target, n_sectors=ns), cors=True)
+                elif path.endswith("/slip"):
+                    try:
+                        mp = int(query.get("max_points", ["120"])[0])
+                    except ValueError:
+                        mp = 120
+                    self._send_json(
+                        session_slip(target, max_per_lap=mp), cors=True)
                 elif path.endswith("/csv"):
                     body = session_csv(target, lap_no=lap_no).encode("utf-8")
                     fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"
@@ -2636,7 +2788,9 @@ function sessDel(file) {
 """
 
 
-_COMPARE_TMPL = """
+# 用 r""" 包起来：块内 JS 正则带反斜杠（/\.?0+$/），非 raw 字符串会被 Python
+# 当转义处理，抛 SyntaxWarning: invalid escape sequence '\.'。
+_COMPARE_TMPL = r"""
 <style>
 .cmp-svg { width:100%; height:auto; display:block; background:rgba(128,128,128,.06);
   border-radius:8px; }
@@ -3103,6 +3257,473 @@ const CMP = __DATA__;
       + (worst.delta < 0 ? chip(worst) : '');
     sum.style.display = sum.innerHTML ? 'flex' : 'none';
   }
+})();
+</script>
+"""
+
+
+# 场次详情页的两张「真的能帮到开车」的分析卡片。
+#
+# 与「遥测数据」一样不内嵌数据：/sectors 要 0.39s、/slip 要 0.53s（本机 217k 帧），
+# 内嵌会把首屏拖垮。改成页面渲染完后异步各取一次，服务端按场次记忆化，
+# 之后再切段数 / 切圈几乎零成本。
+#
+# 两张卡片的分工：
+#   分段计时 —— 回答「我还能快多少」，结论是理论最快圈与潜在空间；
+#   轮胎滑移 —— 回答「胎是怎么被糟蹋的」，结论是空转/抱死的时刻与车速。
+#
+# 🔴 用 r""" 而不是 """：内嵌 JS 里的正则反斜杠不会被 Python 转义吃掉
+#    （_COMPARE_TMPL 就是这里踩过，留下一条 SyntaxWarning）。
+_ANALYSIS_TMPL = r"""
+<style>
+.an-stats { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+.an-stat { flex:1 1 150px; border:1px solid var(--line); border-radius:8px;
+  padding:7px 11px; background:rgba(128,128,128,.05); }
+.an-stat span { display:block; font-size:11px; color:var(--muted); }
+.an-stat b { display:block; font-family:var(--mono); font-size:17px;
+  font-weight:600; margin-top:2px; }
+.an-stat em { display:block; font-style:normal; font-size:11px;
+  color:var(--muted); margin-top:1px; }
+.an-bars { margin:2px 0 12px; }
+.an-bar-row { display:flex; align-items:center; gap:9px; margin-bottom:5px; }
+.an-bar-lab { flex:0 0 190px; font-size:11.5px; color:var(--muted); }
+.an-bar { flex:1; height:16px; background:rgba(128,128,128,.14);
+  border-radius:4px; overflow:hidden; display:flex; }
+.an-bar i { height:100%; display:block; }
+.an-bar-sum { flex:0 0 82px; text-align:right; font-family:var(--mono);
+  font-size:12px; }
+.an-note { font-size:11.5px; color:var(--muted); margin:6px 0; line-height:1.65; }
+.an-note b { color:var(--text); }
+.an-wrap { max-height:430px; overflow:auto; border:1px solid var(--line);
+  border-radius:8px; margin-top:8px; }
+.an-table { width:100%; border-collapse:collapse; font-size:12px; }
+.an-table th, .an-table td { padding:4px 8px; border-bottom:1px solid var(--line);
+  white-space:nowrap; }
+.an-table th { position:sticky; top:0; background:var(--card); color:var(--muted);
+  font-weight:500; font-size:11px; z-index:1; }
+.an-table td.num { font-family:var(--mono); }
+.an-table tbody tr:hover td { background:rgba(128,128,128,.07); }
+.an-table tr.an-uncounted td { opacity:.5; }
+.an-table tr.an-partial td { opacity:.4; }
+.an-table tr.an-hot td { background:rgba(220,53,69,.07); }
+.an-d { font-size:10px; opacity:.9; }
+.an-tag { font-size:9.5px; color:var(--warn); border:1px solid var(--warn);
+  border-radius:3px; padding:0 3px; }
+.an-legend { display:flex; gap:16px; font-size:12px; color:var(--muted);
+  justify-content:center; flex-wrap:wrap; margin-top:4px; }
+.an-legend span { display:inline-flex; align-items:center; }
+.an-legend i { display:inline-block; width:16px; height:4px;
+  border-radius:2px; margin-right:5px; }
+.an-sw { display:inline-block; width:11px; height:11px; border-radius:2px;
+  margin-right:4px; vertical-align:-1px; }
+</style>
+
+<div class="card" id="cardSectors">
+  <h2>分段计时 · 理论最快圈
+    <span style="float:right;display:flex;gap:10px;align-items:center;text-transform:none">
+      <span id="secMeta" style="font-weight:400;color:var(--muted)"></span>
+      <label style="font-weight:400;font-size:12px;color:var(--muted)">段数
+        <select id="secN" onchange="secReload(this.value)"
+          style="font-weight:400;font-size:12px;padding:3px 7px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit">
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4" selected>4</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+        </select>
+      </label>
+    </span>
+  </h2>
+  <div id="secBody"><p class="an-note">正在计算分段…</p></div>
+</div>
+
+<div class="card" id="cardSlip">
+  <h2>轮胎滑移（空转 / 抱死）
+    <span style="float:right;display:flex;gap:8px;align-items:center;text-transform:none">
+      <span id="slipMeta" style="font-weight:400;color:var(--muted)"></span>
+      <select id="slipLapSel" onchange="slipPick(this.value)"
+        style="font-weight:400;font-size:12px;padding:3px 7px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"></select>
+    </span>
+  </h2>
+  <div id="slipBody"><p class="an-note">正在计算滑移…</p></div>
+</div>
+
+<script>
+// ---------- 场次详情页 · 分段计时 / 轮胎滑移 ----------
+(function () {
+  var FILE = '__FILE__';
+  var API = '/api/v1/sessions/' + encodeURIComponent(FILE);
+  var SEC = null, SLIP = null, secN = 4, slipLapNo = 0;
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function f3(v) { return v == null ? '-' : (+v).toFixed(3); }
+  function fsgn(v) {
+    if (v == null) return '-';
+    return (v > 0 ? '+' : v < 0 ? '-' : '') + Math.abs(v).toFixed(3);
+  }
+  function pct(v) { return v == null ? '-' : (+v * 100).toFixed(1) + '%'; }
+  // 圈速差值：负 = 更快（绿），正 = 更慢（红）——与「圈间对比」卡片同一套口径
+  function dcol(v) { return v < 0 ? 'var(--ok)' : v > 0 ? 'var(--bad)' : 'var(--muted)'; }
+  function stat(label, main, sub, color) {
+    return '<div class="an-stat"><span>' + esc(label) + '</span>'
+      + '<b style="color:' + (color || 'inherit') + '">' + esc(main) + '</b>'
+      + (sub ? '<em>' + esc(sub) + '</em>' : '') + '</div>';
+  }
+  var SCOLS = ['#0d6efd', '#7048e8', '#0c8599', '#f08c00', '#c2255c',
+               '#198754', '#e8590c', '#5f3dc4', '#0b7285', '#a61e4d'];
+
+  // ------------------------------------------------------------ 分段计时
+  function secFind(d, lap) {
+    for (var i = 0; i < d.laps.length; i++) if (d.laps[i].lap === lap) return d.laps[i];
+    return null;
+  }
+
+  function secBars(d) {
+    var be = d.best_each_s || [];
+    var best = secFind(d, d.actual_best_lap);
+    if (!best || !be.length || !d.reliable) return '';
+    // 两条堆叠条共用**同一绝对刻度**（刻度 = 实际最快圈总时长）。
+    // 若各自撑满 100%，两条就一样长，潜在空间正好看不出来——这才是这张图的重点。
+    var scale = d.actual_best_s;
+    var rows = [['实际最快圈（第 ' + best.lap + ' 圈）', best.sectors, best.total_s],
+                ['理论最快圈（各段最快拼接）', be, d.theoretical_best_s]];
+    var h = '<div class="an-bars">';
+    for (var r = 0; r < rows.length; r++) {
+      h += '<div class="an-bar-row"><span class="an-bar-lab">' + esc(rows[r][0])
+        + '</span><div class="an-bar">';
+      for (var k = 0; k < rows[r][1].length; k++) {
+        h += '<i style="width:' + (rows[r][1][k] / scale * 100).toFixed(3)
+          + '%;background:' + SCOLS[k % SCOLS.length] + '" title="S' + (k + 1)
+          + ' ' + f3(rows[r][1][k]) + 's"></i>';
+      }
+      h += '</div><b class="an-bar-sum">' + f3(rows[r][2]) + 's</b></div>';
+    }
+    h += '<div class="an-bar-row"><span class="an-bar-lab" style="color:var(--ok)">'
+      + '潜在空间</span><div class="an-bar"><i style="width:'
+      + (d.potential_gain_s / scale * 100).toFixed(3) + '%;background:var(--ok)"></i>'
+      + '</div><b class="an-bar-sum" style="color:var(--ok)">'
+      + fsgn(d.potential_gain_s) + 's</b></div>';
+    return h + '</div>';
+  }
+
+  function secTable(d) {
+    var n = d.n_sectors, be = d.best_each_s || [];
+    var head = '<tr><th>圈</th><th style="text-align:right">用时</th>'
+      + '<th style="text-align:right">圈长</th>';
+    for (var k = 0; k < n; k++) {
+      head += '<th style="text-align:right">S' + (k + 1) + '</th>';
+    }
+    var body = '';
+    for (var i = 0; i < d.laps.length; i++) {
+      var r = d.laps[i];
+      var cls = r.partial ? ' class="an-partial"'
+        : (r.counted ? '' : ' class="an-uncounted"');
+      body += '<tr' + cls + '><td>' + r.lap + (r.is_best ? ' ★' : '')
+        + (r.partial ? ' <span class="an-tag" title="没跑满整圈：段边界不在同一段路上">残缺</span>' : '')
+        + '</td><td class="num">' + f3(r.total_s) + '</td>'
+        + '<td class="num" style="color:var(--muted)">' + Math.round(r.dist_m) + '</td>';
+      for (var j = 0; j < n; j++) {
+        var dl = r.deltas ? r.deltas[j] : null;
+        var isBest = dl != null && Math.abs(dl) < 5e-4;
+        var col = SCOLS[j % SCOLS.length];
+        body += '<td class="num" style="text-align:right">'
+          + '<div style="' + (isBest ? 'color:var(--ok);font-weight:600'
+                                     : 'color:' + col + ';opacity:.92') + '">'
+          + f3(r.sectors[j]) + '</div>'
+          + (dl == null ? '' : '<div class="an-d" style="color:'
+              + (isBest ? 'var(--ok)' : dcol(dl)) + '">'
+              + (isBest ? '最快' : fsgn(dl)) + '</div>')
+          + '</td>';
+      }
+      body += '</tr>';
+    }
+    return '<div class="an-wrap"><table class="an-table"><thead>' + head
+      + '</thead><tbody>' + body + '</tbody></table></div>';
+  }
+
+  function renderSec(d) {
+    SEC = d;
+    var box = el('secBody'), meta = el('secMeta');
+    if (!box) return;
+    if (d.error || !d.laps || !d.laps.length) {
+      if (meta) meta.textContent = '';
+      box.innerHTML = '<p class="an-note">' + esc(d.error || d.note
+        || '没有可用于分段的圈（采样点不足）') + '</p>';
+      return;
+    }
+    if (meta) meta.textContent = '圈长基准 ' + Math.round(d.ref_dist_m) + 'm';
+    var best = secFind(d, d.actual_best_lap);
+    var h = '<div class="an-stats">';
+    // 主数值一律是**秒数**，圈号放副位：三格一起看时读数位置才对得齐
+    h += stat('实际最快圈', f3(d.actual_best_s) + 's',
+              best ? '第 ' + best.lap + ' 圈' : '');
+    if (d.reliable) {
+      h += stat('理论最快圈', f3(d.theoretical_best_s) + 's',
+                '由 ' + d.counted_laps.length + ' 个可信圈拼接', 'var(--ok)');
+      h += stat('潜在空间', fsgn(d.potential_gain_s) + 's',
+                fsgn(d.potential_gain_pct) + '%', 'var(--ok)');
+    } else {
+      h += stat('理论最快圈', '数据不足', d.note || '', 'var(--warn)');
+    }
+    h += '</div>' + secBars(d);
+    h += '<p class="an-note">段边界按<b>距离</b>等分（不是按时间）：只有把边界钉在'
+      + '同一段路上，跨圈的段用时才可比。理论最快圈 = 各段可信圈里最快用时之和，'
+      + '它<b>小于</b>实际最快圈是正常的——差的这一段就是「你已经能跑出来、'
+      + '只是还没在同一圈里连起来」的时间。</p>';
+    if (!d.reliable && d.note) h += '<p class="an-note">⚠ ' + esc(d.note) + '</p>';
+    if (d.partial_laps && d.partial_laps.length) {
+      h += '<p class="an-note">第 ' + d.partial_laps.join('、') + ' 圈的圈长偏离基准 >'
+        + Math.round(d.dist_tol * 100) + '%（没跑满整圈，或中途丢过帧）：段边界'
+        + '不在同一段路上，因此<b>不参与</b>理论值、也不给差值。</p>';
+    }
+    h += secTable(d);
+    box.innerHTML = h;
+  }
+
+  window.secReload = function (n) {
+    secN = parseInt(n, 10) || 4;
+    var meta = el('secMeta');
+    if (meta) meta.textContent = '计算中…';
+    fetch(API + '/sectors?n=' + secN).then(function (r) { return r.json(); })
+      .then(renderSec).catch(function () {
+        if (meta) meta.textContent = '读取失败';
+      });
+  };
+
+  // ------------------------------------------------------------ 轮胎滑移
+  function slipLine(s, vals, color, w, X, Y) {
+    var d = '';
+    for (var i = 0; i < s.t.length; i++) {
+      // 滑移率截断到 ±100%：空转峰值能到 +798%，不截会把有用的 ±20% 压成一条平线。
+      // 峰值一律以事件表为准，曲线只负责趋势。
+      var q = Math.max(-1, Math.min(1, vals[i]));
+      d += (i ? 'L' : 'M') + X(s.t[i]).toFixed(1) + ' ' + Y(q).toFixed(1) + ' ';
+    }
+    return '<path d="' + d + '" fill="none" stroke="' + color
+      + '" stroke-width="' + w + '" stroke-linejoin="round"/>';
+  }
+
+  function slipChart(lap) {
+    var s = (SLIP.series || {})[lap];
+    if (!s || !s.t || s.t.length < 2) {
+      return '<p class="an-note">该圈没有可画的曲线。</p>';
+    }
+    var W = 760, H = 250, L = 52, R = W - 12, T = 16, B = H - 30;
+    var t0 = s.t[0], t1 = s.t[s.t.length - 1];
+    var x = function (t) { return t1 > t0 ? L + (R - L) * (t - t0) / (t1 - t0) : L; };
+    // 🔴 方向不能反：+滑移（空转）必须在**上**、−滑移（抱死）在**下**，
+    //    与阈值线（上方 +10% 空转、下方 −15% 抱死）才自洽。
+    var y = function (q) { return T + (B - T) * (1 - q) / 2; };   // q 归一化到 [-1,1]
+    var h = '<svg class="cmp-svg" viewBox="0 0 ' + W + ' ' + H + '">';
+    var lv = [-100, -50, 0, 50, 100];
+    for (var i = 0; i < lv.length; i++) {
+      var yy = y(lv[i] / 100).toFixed(1);
+      h += '<line x1="' + L + '" y1="' + yy + '" x2="' + R + '" y2="' + yy
+        + '" stroke="rgba(128,128,128,' + (lv[i] === 0 ? '.5' : '.2') + ')"'
+        + (lv[i] === 0 ? ' stroke-dasharray="4 4"' : '') + '/>';
+      h += '<text x="' + (L - 6) + '" y="' + (+yy + 3.5)
+        + '" text-anchor="end" font-size="10" fill="var(--muted)">'
+        + lv[i] + '%</text>';
+    }
+    // 事件阈值线：曲线越过它就是判为一次空转/抱死的地方
+    var thr = [[-0.15, '#dc3545'], [0.10, '#f08c00']];
+    for (var j = 0; j < thr.length; j++) {
+      var ty = y(thr[j][0]).toFixed(1);
+      h += '<line x1="' + L + '" y1="' + ty + '" x2="' + R + '" y2="' + ty
+        + '" stroke="' + thr[j][1] + '" stroke-width="1" stroke-dasharray="2 3"'
+        + ' opacity=".85"/>';
+    }
+    for (var k = 0; k <= 6; k++) {
+      var tt = t0 + (t1 - t0) * k / 6, xx = x(tt).toFixed(1);
+      var anc = k === 0 ? 'start' : k === 6 ? 'end' : 'middle';
+      h += '<line x1="' + xx + '" y1="' + T + '" x2="' + xx + '" y2="' + B
+        + '" stroke="rgba(128,128,128,.16)"/>';
+      h += '<text x="' + xx + '" y="' + (B + 15) + '" text-anchor="' + anc
+        + '" font-size="10" fill="var(--muted)">' + tt.toFixed(1) + 's</text>';
+    }
+    h += slipLine(s, s.front, '#0d6efd', 1.3, x, y);
+    h += slipLine(s, s.rear, '#7048e8', 1.3, x, y);
+    h += '</svg>';
+    h += '<div class="an-legend">'
+      + '<span><i style="background:#0d6efd"></i>前轴滑移</span>'
+      + '<span><i style="background:#7048e8"></i>后轴滑移</span>'
+      + '<span><i style="background:#dc3545"></i>抱死阈值 −15%</span>'
+      + '<span><i style="background:#f08c00"></i>空转阈值 +10%</span>'
+      + '</div>';
+    h += '<p class="an-note">纵轴 = 滑移率 <b>(ω·R − v) / v</b>：'
+      + '<b>正值 = 轮子转得比车快（空转）</b>，<b>负值 = 比车慢（抱死）</b>。'
+      + '曲线已截断到 ±100%（低速全油门空转实测能到 +798%），'
+      + '峰值请以右侧事件表为准。</p>';
+    return h;
+  }
+
+  function slipLapTable() {
+    var rows = SLIP.laps || [];
+    var h = '<div class="an-wrap" style="max-height:300px">'
+      + '<table class="an-table"><thead><tr><th>圈</th><th>帧数</th>'
+      + '<th style="text-align:right">前轴 p05</th>'
+      + '<th style="text-align:right">前轴 min</th>'
+      + '<th style="text-align:right">后轴 p95</th>'
+      + '<th style="text-align:right">后轴 max</th>'
+      + '<th style="text-align:right">抱死帧</th>'
+      + '<th style="text-align:right">空转帧</th></tr></thead><tbody>';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i], f = r.front || {}, b = r.rear || {};
+      var hot = (r.lockup_frames || 0) + (r.wheelspin_frames || 0) > 0;
+      h += '<tr' + (hot ? ' class="an-hot"' : '') + '><td>' + r.lap + '</td>'
+        + '<td class="num" style="color:var(--muted)">' + r.frames + '</td>'
+        + '<td class="num">' + pct(f.p05) + '</td>'
+        + '<td class="num">' + pct(f.min) + '</td>'
+        + '<td class="num">' + pct(b.p95) + '</td>'
+        + '<td class="num">' + pct(b.max) + '</td>'
+        + '<td class="num"' + (r.lockup_frames ? ' style="color:var(--bad);font-weight:600"' : '')
+        + '>' + r.lockup_frames + '</td>'
+        + '<td class="num"' + (r.wheelspin_frames ? ' style="color:#f08c00;font-weight:600"' : '')
+        + '>' + r.wheelspin_frames + '</td></tr>';
+    }
+    return h + '</tbody></table></div>';
+  }
+
+  function slipEvents(list, color, label) {
+    if (!list || !list.length) {
+      return '<p class="an-note">整场没有' + esc(label) + '。</p>';
+    }
+    var h = '<p class="an-note" style="margin-bottom:4px">最严重的 ' + list.length
+      + ' 次' + esc(label) + '：</p><div class="an-wrap" style="max-height:260px">'
+      + '<table class="an-table"><thead><tr><th>圈</th>'
+      + '<th style="text-align:right">圈内时刻</th>'
+      + '<th style="text-align:right">滑移率</th>'
+      + '<th style="text-align:right">车速</th>'
+      + '<th style="text-align:right">油门</th>'
+      + '<th style="text-align:right">刹车</th>'
+      + '<th style="text-align:right">持续</th></tr></thead><tbody>';
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      h += '<tr><td>' + e.lap + '</td>'
+        + '<td class="num">' + (+e.t_rel).toFixed(2) + '</td>'
+        + '<td class="num" style="color:' + color + ';font-weight:600">'
+        + pct(e.slip) + '</td>'
+        + '<td class="num">' + (+e.speed_kph).toFixed(1) + '</td>'
+        + '<td class="num">' + Math.round(e.throttle) + '%</td>'
+        + '<td class="num">' + Math.round(e.brake) + '%</td>'
+        + '<td class="num" style="color:var(--muted)">' + e.frames + ' 帧</td></tr>';
+    }
+    return h + '</tbody></table></div>';
+  }
+
+  function renderSlipLap() {
+    // 🔴 只更新自己那两个容器。之前这里直接写 #slipBody，把上面刚渲染好的
+    //    标定统计和逐圈表整块覆盖掉了——卡片看着"渲染成功"，数字全没了。
+    var cbox = el('slipChartBox'), ebox = el('slipEventBox');
+    if (!SLIP) return;
+    var lk = SLIP.lockup || {}, ws = SLIP.wheelspin || {};
+    if (cbox) cbox.innerHTML = slipChart(slipLapNo);
+    if (ebox) {
+      ebox.innerHTML =
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:6px 18px;margin-top:10px">'
+        + '<div>' + slipEvents(lk.worst, 'var(--bad)', '抱死（刹车到底把前轮刹停）') + '</div>'
+        + '<div>' + slipEvents(ws.worst, '#f08c00', '空转（油门到底、后轮打滑）') + '</div>'
+        + '</div>';
+    }
+  }
+
+  window.slipPick = function (v) {
+    slipLapNo = parseInt(v, 10) || slipLapNo;
+    renderSlipLap();
+  };
+
+  function renderSlip() {
+    var card = el('cardSlip'), box = el('slipBody'), meta = el('slipMeta');
+    if (!card || !box) return;
+    // 老场次（含合成的测试数据）没有 wheel_rads：整卡隐藏，不给空表
+    if (!SLIP || SLIP.available === false) {
+      card.style.display = 'none';
+      return;
+    }
+    var c = SLIP.calibration || {};
+    var lk = SLIP.lockup || {}, ws = SLIP.wheelspin || {};
+    var laps = SLIP.laps || [];
+
+    // 默认停在「最脏」的那一圈（抱死 + 空转帧数最多），比停在第一圈有用
+    var pk = 0, pn = -1;
+    for (var i = 0; i < laps.length; i++) {
+      var v = (laps[i].lockup_frames || 0) + (laps[i].wheelspin_frames || 0);
+      if (v > pn) { pn = v; pk = laps[i].lap; }
+    }
+    slipLapNo = pk || (laps.length ? laps[0].lap : 0);
+
+    var sel = el('slipLapSel');
+    if (sel) {
+      sel.innerHTML = '';
+      for (var j = 0; j < laps.length; j++) {
+        var o = document.createElement('option');
+        var bad = (laps[j].lockup_frames || 0) + (laps[j].wheelspin_frames || 0);
+        o.value = laps[j].lap;
+        o.textContent = '第 ' + laps[j].lap + ' 圈'
+          + (bad ? '（滑移 ' + bad + ' 帧）' : '');
+        if (laps[j].lap === slipLapNo) o.selected = true;
+        sel.appendChild(o);
+      }
+    }
+    if (meta) meta.textContent = '四轮角速度 ' + laps.length + ' 圈';
+
+    var h = '<div class="an-stats">';
+    h += stat('自标定半径', (+c.front_m).toFixed(4) + ' / ' + (+c.rear_m).toFixed(4) + ' m',
+              '前轴 / 后轴 · 比值 ' + c.ratio);
+    h += stat('自由滚动帧', c.free_frames + '（' + c.free_pct + '%）',
+              // 标定残差在 1e-4 量级，用 1 位小数会显示成「-0.0%」看不出好坏
+              '标定后滑移均值 ' + (+c.free_slip_front * 100).toFixed(2) + '% / '
+              + (+c.free_slip_rear * 100).toFixed(2) + '%');
+    h += stat('标定自洽', c.ok ? '✓ 通过' : '⚠ 未通过', c.reason || '滑移均值≈0，半径可信',
+              c.ok ? 'var(--ok)' : 'var(--warn)');
+    h += '</div>';
+    h += '<p class="an-note">半径不靠任何外部参数，而是在<b>自由滚动帧</b>上现场标定'
+      + '（松油、松刹、低速以上、纵向与横向 G 都小）：那时 <b>ω·R ≈ v</b>，'
+      + '于是 <b>R = Σ(v·ω)/Σ(ω²)</b>。前后轴<b>分别</b>标定——实测比值 '
+      + c.ratio + '，若强用同一个半径，滑移率会被整体偏置约 '
+      + ((1 - c.ratio) * 100).toFixed(1) + '%，而抱死的典型信号本身只有百分之几。</p>';
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">'
+      + '<div class="an-stat" style="flex:1 1 160px"><span>抱死（轮子被刹停）</span>'
+      + '<b style="color:var(--bad)">' + lk.events + ' 次</b><em>共 ' + lk.frames
+      + ' 帧</em></div>'
+      + '<div class="an-stat" style="flex:1 1 160px"><span>空转（后轮打滑）</span>'
+      + '<b style="color:#f08c00">' + ws.events + ' 次</b><em>共 ' + ws.frames
+      + ' 帧</em></div></div>';
+    h += '<div id="slipChartBox"></div>';
+    h += '<div id="slipEventBox"></div>';
+    h += '<p class="an-note" style="margin-top:14px">逐圈滑移统计'
+      + '（<b>抱死帧 / 空转帧</b> 不为 0 的圈已高亮；'
+      + 'p05 / p95 是第 5 / 95 百分位，比极值更能代表常态）：</p>';
+    h += slipLapTable();
+    box.innerHTML = h;
+    renderSlipLap();
+  }
+
+  // 🔴 取数失败与**渲染**失败必须分开处理。
+  //    写成 `.then(render).catch(hide)` 的话，render 里抛的任何异常都会被
+  //    当成"取不到数据"而把整张卡静默隐藏——页面看着正常，卡就没了，
+  //    排查时完全看不到线索（这里踩过）。所以用双参数 then：
+  //    只让 fetch/JSON 的失败走错误分支，渲染异常直接冒到 console。
+  function secFetchFail() {
+    var meta = el('secMeta'), box = el('secBody');
+    if (meta) meta.textContent = '读取失败';
+    if (box) box.innerHTML = '<p class="an-note">分段数据请求失败（见控制台）。</p>';
+  }
+  function slipFetchFail() {
+    var meta = el('slipMeta'), box = el('slipBody');
+    if (meta) meta.textContent = '读取失败';
+    if (box) box.innerHTML = '<p class="an-note">滑移数据请求失败（见控制台）。</p>';
+  }
+
+  fetch(API + '/sectors?n=' + secN).then(function (r) { return r.json(); })
+    .then(function (d) { SEC = d; renderSec(d); }, secFetchFail);
+
+  fetch(API + '/slip').then(function (r) { return r.json(); })
+    .then(function (d) { SLIP = d; renderSlip(); }, slipFetchFail);
 })();
 </script>
 """
@@ -3775,6 +4396,10 @@ def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
     js_file = path.name.replace("\\", "").replace("'", "")
     return _page_shell(f"场次 · {_html.escape(str(hdr.get('circuit') or 'unknown'))}",
                        body + _COMPARE_TMPL.replace('__DATA__', cmp_json)
+                       # 两张分析卡排在「遥测数据」之前：先给结论（能快多少、
+                       # 胎怎么被糟蹋的），原始逐帧数据垫底。数据走 XHR 异步取，
+                       # 不占首屏渲染时间。
+                       + _ANALYSIS_TMPL.replace('__FILE__', js_file)
                        + _TELEMETRY_TMPL.replace('__FILE__', js_file))
 
 

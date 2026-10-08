@@ -134,6 +134,8 @@
 | `GET /api/v1/sessions/<文件名>/frames?offset=0&limit=200&lap=N` | **分页**逐帧数据（`limit` 上限 1000），用于表格 |
 | `GET /api/v1/sessions/<文件名>/csv?lap=N` | 全量 CSV 下载（带 UTF-8 BOM，Excel 直接打开不乱码） |
 | `GET /api/v1/sessions/<文件名>/raceline?lap=N` | 第 N 圈的**行车轨迹**（踏板 + G 力两套着色通道）；`lap` 缺省 = 最快圈 |
+| `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
+| `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -152,6 +154,77 @@
 `series` 额外返回 `laps[]`（每圈 `lap` / `t0` / `dur` / `frames`）、
 `total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、
 `sampled_frames`、`step`（抽稀步长）。
+
+## 分段计时与轮胎滑移
+
+这两张卡片回答的是「我还能快多少」和「我的胎是怎么被糟蹋的」。
+两个接口都只依赖场次文件内容，服务端按场次记忆化，所以重复请求几乎零成本
+（实测首次 0.39s / 0.53s，命中缓存后 4ms / 6ms）。
+
+### `GET /api/v1/sessions/<文件名>/sectors?n=4` —— 分段计时 / 理论最快圈
+
+每圈按**距离**等分成 `n` 段（不是按时间等分：只有把段边界钉在同一段路上，
+跨圈的段用时才可比），插值出各段用时；每段取所有**可信圈**里的最快值求和，
+就是「理论最快圈」。
+
+| 字段 | 说明 |
+|---|---|
+| `n_sectors` / `tol` / `dist_tol` | 段数 / 圈速容差（0.05）/ 圈长容差（0.03） |
+| `ref_dist_m` | 圈长中位数，圈长与它比对判断是否跑满整圈 |
+| `actual_best_lap` / `actual_best_s` | 实际最快圈号 / 圈速 |
+| `theoretical_best_s` | 理论最快圈（各段最快用时之和） |
+| `potential_gain_s` / `potential_gain_pct` | 潜在空间 = 实际最快 − 理论最快 |
+| `best_each_s[]` | 每段的场次最快用时 |
+| `counted_laps[]` | 参与计算理论值的可信圈 |
+| `partial_laps[]` | 圈长偏离中位数 >`dist_tol` 的圈，不给 `deltas` |
+| `reliable` / `note` | 理论值是否可信；不可信时 `note` 写明原因 |
+| `laps[]` | 逐圈 `{lap, total_s, dist_m, sectors[], counted, is_best, partial, deltas[]}` |
+
+两条口径必须**先过滤再计算**，否则数字会骗人：
+
+- **异常圈**：冲出赛道 / 进站 / 打转的圈里，某一小段可能"恰好很快"，把理论值
+  拉到不真实地低。实测同一场 23 圈不过滤得到 `+8.48%` 的假空间，只留
+  ≤最快圈×1.05 的 5 圈才是真实的 `+0.71%`。所以 `reliable` 只在可信圈
+  ≥2 个时为 `true`，否则宁可空着也不给一个会骗人的数字。
+- **残缺圈**：段边界按各圈**自己的**圈长等分，只有跑满整圈的圈边界才对得齐。
+  实测第 1 圈只有 6129.6m（最快圈 6937.8m，录像从半圈处开始），它的第 1 段
+  插出 25.2s，比全场最快的 33.2s 还"快" 8 秒 —— 纯属边界错位。更要紧的是
+  圈长偏短的圈**总时长也偏短，完全可能被选成 `actual_best`**，所以这一步
+  排在选最快圈**之前**，不只是从统计圈里剔掉。
+
+> `theoretical_best_s < actual_best_s` 是**正常**的，不要当 bug「修」成相等。
+> 残余偏差：同为完整圈时圈长仍有约 ±0.3% 的差（本次 5 个可信圈 6936~6960m），
+> 段边界会错开十几米，理论值可能乐观 0.1~0.3s —— 所以 `dist_m` 要展示出来，
+> 让人看得见可比性。
+
+### `GET /api/v1/sessions/<文件名>/slip?max_points=120` —— 轮胎滑移
+
+只有四轮角速度（`wheel_rads`）能反映「车轮实际转多快」，车身速度传感器
+测不出空转和抱死。滑移率 `s = (ω·R − v) / v`：`s > 0` 轮子转得比车快
+（空转），`s < 0` 转得比车慢（抱死）。
+
+半径**自标定**，不依赖任何外部参数：自由滚动帧上 `ω·R ≈ v`，于是
+`R = Σ(v·ω) / Σ(ω²)`（对 R 的最小二乘解）。**前后轴必须分别标定** ——
+实测 R前 0.3391m / R后 0.3435m（比值 0.987）；若假设同半径，滑移率会被
+整体偏置约 1.3%，而抱死的典型信号本身只有百分之几，偏置不可忽略。
+
+| 字段 | 说明 |
+|---|---|
+| `available` | 缺 `wheel_rads` 的老场次为 `false`，前端据此整卡隐藏 |
+| `calibration` | `{front_m, rear_m, ratio, free_frames, free_pct, ok, reason, free_slip_front, free_slip_rear}` |
+| `laps[]` | 逐圈 `{lap, frames, front, rear, lockup_frames, wheelspin_frames}`；`front`/`rear` 为 `{min, p05, p50, p95, max}` |
+| `lockup` / `wheelspin` | `{events, frames, worst[]}`；`worst[]` 最多 5 条 `{lap, t_rel, slip, speed_kph, throttle, brake, frames}` |
+| `series` | 逐圈降采样曲线 `{t[], front[], rear[], speed_kph[], throttle[], brake[]}`，每圈 ≤`max_points` 点 |
+
+- 事件按**连续帧**聚成一次（否则一次抱死会被算成 60 次），且至少 2 帧才算一次。
+- 踏板要到位：抱死要求 `brake > 0.85`，空转要求 `throttle > 0.95`。
+- `calibration.ok` 是自洽性检查：标定后自由滚动帧的滑移均值应接近 0
+  （实测 −0.0001 / +0.0000）。偏得远说明标定被污染（自由滚动帧太少，
+  或油门/刹车阈值没生效），此时 `reason` 写明原因。
+- 自由滚动帧的噪声底 `|s| ≈ 0.0005`，而事件峰值从 `−1.000`（四轮全锁，
+  ω 精确为 0）到 `+7.98`（低速全油门空转），阈值因此不敏感。
+- ⚠️ 曲线是抽稀的，**1~2 帧的尖峰会漏掉**（抱死常常就这么短）——
+  峰值一律从 `worst[]` 读，别从曲线读。
 
 ## 单圈行车轨迹
 

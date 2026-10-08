@@ -17,7 +17,8 @@ import tracemalloc
 import pytest
 
 # 全库没有任何一处读、因此不该被存储的字段（存了纯属白占内存）
-NEVER_READ = ["tyre_temp", "tyre_press", "tyre_wear", "wheel_rads", "wheel_revs",
+# ⚠️ wheel_rads 已从这份名单里移出：轮胎滑移检测（gt7analysis.wheel_slip）会读它。
+NEVER_READ = ["tyre_temp", "tyre_press", "tyre_wear", "wheel_revs",
               "susp_height", "velocity", "seq", "position", "lap_count",
               "oil_pressure", "water_temp", "oil_temp", "hand_brake", "in_gear",
               "time_of_day", "turbo_boost", "num_cars", "quali_pos"]
@@ -40,9 +41,11 @@ def _frame(lap, i, fps, t):
         "car_x": round(100 + i * 0.5, 4), "car_z": 50.0, "car_y": 3.5,
         "car_code": 2181, "layout": "A", "has_coords": True,
         "best_lap": 142155 if lap > 1 else None,
-        # 下面这些字段全库没有一处读，写进来是为了证明「不存它们也没人读」
+        # wheel_rads 是**已存储**字段（滑移检测要读）；其余几个全库没有一处读，
+        # 写进来是为了证明「不存它们也没人读」
+        "wheel_rads": [100.0, 100.0, 99.0, 99.0],
         "tyre_temp": [85.0, 86.0, 85.5, 86.5], "tyre_press": [2.1] * 4,
-        "wheel_rads": [100.0, 100.0, 99.0, 99.0], "susp_height": [0.03] * 4,
+        "susp_height": [0.03] * 4,
         "velocity": [10.0, 0.0, 20.0], "oil_pressure": 6.9, "water_temp": 85.0,
         "position": None, "car_on_track": True, "num_cars": 20, "flags": 393,
     }
@@ -185,7 +188,7 @@ class TestFidelity:
 
 
 class TestNoUnstoredFieldRead:
-    """存储清单（15 个字段）必须覆盖全流程真正读到的字段。"""
+    """存储清单必须覆盖全流程真正读到的字段。"""
 
     def test_全流程没有读到未存储的字段(self, dash, sess):
         dash.MISSED_FIELDS.clear()

@@ -399,6 +399,340 @@ def race_line_of_lap(frames: list[dict] | None = None, lap_no: int = 0,
                                                  decimate=decimate)["segments"]}
 
 
+# —— 分段计时 / 理论最快圈 ——————————————————————
+
+def _lap_sector_split(fs: list[dict], n_sectors: int):
+    """一圈按**距离**等分 → (各段用时, 圈长m, 圈总用时s)；采样点不足返回 None。
+
+    用距离等分而不是时间等分：段边界固定在同一段路上，跨圈才有可比性
+    （时间等分会让每圈的"段"落在不同位置，段用时差就失去意义）。
+    """
+    pts = lap_samples(fs)
+    if len(pts) < 10:
+        return None
+    total = pts[-1]["dist"]
+    if total <= 0:
+        return None
+    dists = [q["dist"] for q in pts]
+    trels = [q["t_rel"] for q in pts]
+    times = []
+    for k in range(n_sectors):
+        a = _interp(dists, trels, total * k / n_sectors)
+        b = _interp(dists, trels, total * (k + 1) / n_sectors)
+        times.append(b - a)
+    return times, total, pts[-1]["t_rel"]
+
+
+def sector_times(laps: dict[int, list[dict]], n_sectors: int = 4,
+                 tol: float = 0.05, dist_tol: float = 0.03) -> dict:
+    """分段计时 + 理论最快圈。
+
+    每圈按距离等分成 n_sectors 段、插值出各段用时；每段取所有**可信圈**里
+    的最快值求和 = 理论最快圈。它与实际最快圈的差，就是「你已经有能力跑出来、
+    只是还没在同一圈里连起来」的时间 —— 这才是分段计时真正有用的产出。
+
+    🔴 必须先过滤异常圈：冲出赛道 / 进站 / 打转的圈里，某一小段可能
+       "恰好很快"，把理论值拉到不真实地低。实测 LM55 23 圈不过滤得到
+       +8.48% 的假空间，只留 ≤最快圈*(1+tol) 的 5 圈才是真实的 +0.71%。
+       所以理论值**只在可信圈 ≥2 圈时**才给出，否则宁可空着（reliable=False）
+       也不给一个会骗人的数字。
+
+    🔴 圈长不一致的圈必须单独排除（dist_tol 那一路）。段边界是按各圈**自己的**
+       圈长等分的，所以只有"跑满一整圈"的圈，段边界才落在同一段路上。实测同一场
+       里第 1 圈只有 6129.6m（最快圈 6937.8m 的 88%，录像从半圈处开始），
+       它的 S1 插出来 25.229s，比全场最快的 33.208s 还"快" 8 秒 —— 纯粹是
+       边界错位，不是真本事。
+       ⚠️ 这不只是显示难看：**圈长偏短的圈总时长也偏短，完全可能被选成
+       actual_best**，那样"实际最快圈"和"潜在空间"一起就错了。所以筛选
+       发生在选 actual_best **之前**，不只是从 counted 里剔掉。
+       判据用圈长中位数 ±dist_tol（而不是最大值）：出赛道多跑一截会让积分圈长
+       变长，取最大反而会以偏为准。
+
+    ⚠️ 理论最快圈 < 实际最快圈是**正常**的，不要把它"修"成相等。
+    ⚠️ 残余偏差：即使同为完整圈，圈长仍有约 ±0.3% 的差（本次 5 个可信圈
+       6936~6960m），段边界会错开十几米，理论值因此可能乐观 0.1~0.3s。
+       所以 laps[].dist_m 要展示出来，让人看得见可比性。
+    """
+    out: dict = {
+        "n_sectors": n_sectors, "tol": tol, "dist_tol": dist_tol,
+        "laps": [], "best_each_s": [],
+        "theoretical_best_s": None, "actual_best_s": None,
+        "actual_best_lap": None,
+        "potential_gain_s": None, "potential_gain_pct": None,
+        "counted_laps": [], "partial_laps": [], "ref_dist_m": None,
+        "reliable": False, "note": "",
+    }
+    raw: dict[int, tuple] = {}
+    for ln, fs in sorted(laps.items()):
+        r = _lap_sector_split(fs, n_sectors)
+        if r is not None:
+            raw[ln] = r
+    if not raw:
+        out["note"] = "没有可用于分段的圈（采样点不足）"
+        return out
+
+    # —— 圈长一致性：只有跑满整圈的圈，段边界才落在同一段路上 ——
+    ds = sorted(v[1] for v in raw.values())
+    d_ref = ds[len(ds) // 2]
+    out["ref_dist_m"] = round(d_ref, 1)
+    usable = {n: v for n, v in raw.items()
+              if abs(v[1] - d_ref) <= d_ref * dist_tol}
+    out["partial_laps"] = sorted(set(raw) - set(usable))
+    if not usable:
+        # 圈长全都对不上（数据异常），退回全量但明确标注不可信
+        usable = dict(raw)
+        out["note"] = "所有圈的圈长都偏离中位数，分段不可比"
+
+    actual_best_lap = min(usable, key=lambda n: usable[n][2])
+    actual_best = usable[actual_best_lap][2]
+    counted = {n: v for n, v in usable.items() if v[2] <= actual_best * (1 + tol)}
+    out["actual_best_lap"] = actual_best_lap
+    out["actual_best_s"] = round(actual_best, 3)
+
+    if len(counted) >= 2:
+        best_each = [min(v[0][k] for v in counted.values())
+                     for k in range(n_sectors)]
+        theo = sum(best_each)
+        out["reliable"] = True
+        out["counted_laps"] = sorted(counted)
+        out["best_each_s"] = [round(x, 3) for x in best_each]
+        out["theoretical_best_s"] = round(theo, 3)
+        out["potential_gain_s"] = round(actual_best - theo, 3)
+        out["potential_gain_pct"] = round((actual_best - theo) / actual_best * 100, 2)
+    else:
+        # 只统计了信息性的段最快（不作为结论呈现）
+        out["best_each_s"] = [
+            round(min(v[0][k] for v in usable.values()), 3) for k in range(n_sectors)]
+        out["note"] = (f"接近最快圈（≤{actual_best * (1 + tol):.3f}s）的圈只有 "
+                       f"{len(counted)} 个，不足 2 个，理论最快圈不可信")
+
+    for ln in sorted(raw):
+        times, dist, total_s = raw[ln]
+        partial = ln not in usable
+        row = {
+            "lap": ln, "total_s": round(total_s, 3), "dist_m": round(dist, 1),
+            "sectors": [round(x, 3) for x in times],
+            "counted": ln in counted, "is_best": ln == actual_best_lap,
+            "partial": partial,
+        }
+        # 残缺圈的段边界不在同一段路上，给差值只会误导，干脆不给
+        if out["reliable"] and not partial:
+            be = out["best_each_s"]
+            row["deltas"] = [round(times[k] - be[k], 3) for k in range(n_sectors)]
+        out["laps"].append(row)
+    return out
+
+
+# —— 轮胎滑移（空转 / 抱死）——————————————————————
+#
+# 只有 wheel_rads（四轮角速度）是「车轮实际转多快」的来源 —— 车身速度传感器
+# 测不出空转和抱死。滑移率 s = (ω·R − v) / v：
+#   s > 0 轮子转得比车快（空转 / 打滑）；s < 0 轮子转得比车慢（抱死 / 拖胎）。
+
+# 自由滚动判据（标定只用这些帧）。只有自由滚动时 ω·R ≈ v 才成立。
+_SLIP_FREE_THR = 0.05          # 油门开度
+_SLIP_FREE_BRK = 0.05          # 刹车开度
+_SLIP_FREE_V_MIN = 10.0        # m/s（36 km/h）—— 低速时 ω 与 v 的信噪比都差
+_SLIP_FREE_G = 0.3             # 纵向与横向加速度都要小（单位 g）
+
+# 事件阈值。取实测噪声底之上很远：自由滚动帧 |s| ≈ 0.0005，
+# 而空转峰值 +16%、抱死最低 −96%，信噪比约 100:1，所以阈值不敏感。
+_SLIP_SPIN_THR = 0.10          # 后轴比车快 10% → 空转
+_SLIP_LOCK_THR = -0.15         # 前轴比车慢 15% → 抱死
+_SLIP_MIN_V = 3.0              # 统计滑移的最小速度（m/s），防低速除出噪声
+
+
+def _slip_percentiles(xs: list[float]) -> dict:
+    if not xs:
+        return {}
+    s = sorted(xs)
+    n = len(s)
+
+    def q(p: float) -> float:
+        return round(s[min(n - 1, max(0, int(n * p)))], 3)
+    return {"min": round(s[0], 3), "p05": q(0.05), "p50": q(0.50),
+            "p95": q(0.95), "max": round(s[-1], 3)}
+
+
+def wheel_slip(laps: dict[int, list[dict]], nmax_events: int = 5,
+               max_per_lap: int = 120) -> dict:
+    """用四轮角速度检测空转与抱死。
+
+    🔴 半径是**自标定**的，不依赖任何外部参数：自由滚动帧上 ω·R ≈ v，
+       于是 R = Σ(v·ω) / Σ(ω²)（对 R 的最小二乘解，即 argmin Σ(v−ωR)² 的解）。
+
+    🔴 前后轴必须**分别**标定：GT7 前后胎规格常不同，实测 R前 0.3395 m /
+       R后 0.3440 m（比值 0.987）。若假设同半径，滑移率会被整体偏置约 1.3%，
+       而抱死的均值信号本身只有 −7.8%，偏置不可忽略。
+
+    自洽性检查：标定后自由滚动帧的滑移均值应接近 0。偏得远说明标定被污染
+    （自由滚动帧太少，或油门/刹车阈值没生效），此时 calibration.ok 为 False。
+
+    缺 wheel_rads 的场次返回 available=False —— 老场次（含合成的测试数据）
+    没有这个字段，前端据此整卡隐藏，不要显示空表。
+
+    抽稀按「每圈目标点数」而不是固定步长：固定步长下长圈点密、短圈点疏，
+    而且总输出随帧数线性膨胀（本场 217k 帧、23 圈，步长 4 会产出 54k 点、
+    约 2.5 MB JSON）。改成每圈 ≤max_per_lap 点后，输出被圈数封顶
+    （23×120 ≈ 2.8k 点 / 约 120 KB），且各圈曲线密度一致、可比。
+
+    ⚠️ 抽稀会漏掉 1~2 帧的尖峰（抱死常常就这么短）。所以图表负责趋势、
+       events 负责峰值的分工不能倒过来 —— 尖峰必须从 events 读，别从曲线读。
+    """
+    per_lap: dict[int, list[tuple]] = {}
+    for ln, fs in sorted(laps.items()):
+        buf: list[tuple] = []
+        for f in fs:
+            r = f.get("wheel_rads")
+            if not r or len(r) < 4:
+                continue
+            v = (f.get("speed_kph") or 0.0) / 3.6
+            g = f.get("g_force") or (0.0, 0.0, 0.0)
+            glon = abs(g[0]) if len(g) > 0 else 0.0
+            glat = abs(g[1]) if len(g) > 1 else 0.0
+            buf.append((f.get("t") or 0.0, v, (r[0] + r[1]) / 2.0,
+                        (r[2] + r[3]) / 2.0, f.get("throttle") or 0.0,
+                        f.get("brake") or 0.0, glon, glat))
+        if buf:
+            per_lap[ln] = buf
+    if not per_lap:
+        return {"available": False,
+                "reason": "本场次没有 wheel_rads（四轮角速度）字段"}
+
+    # —— 1. 自由滚动帧上自标定前后轴半径 ——
+    free = [r for rows in per_lap.values() for r in rows
+            if r[4] < _SLIP_FREE_THR and r[5] < _SLIP_FREE_BRK
+            and r[1] > _SLIP_FREE_V_MIN and r[6] < _SLIP_FREE_G
+            and r[7] < _SLIP_FREE_G]
+    total_rows = sum(len(v) for v in per_lap.values())
+
+    def _calib(pick) -> float:
+        num = sum(r[1] * pick(r) for r in free)
+        den = sum(pick(r) ** 2 for r in free)
+        return num / den if den > 0 else 0.0
+
+    rf, rr = _calib(lambda r: r[2]), _calib(lambda r: r[3])
+    calib: dict = {
+        "front_m": round(rf, 4), "rear_m": round(rr, 4),
+        "ratio": round(rf / rr, 4) if rr else None,
+        "free_frames": len(free), "total_frames": total_rows,
+        "free_pct": round(len(free) / total_rows * 100, 1) if total_rows else 0.0,
+        "ok": False, "reason": "",
+    }
+    if len(free) < 50 or rf <= 0 or rr <= 0:
+        calib["reason"] = (f"自由滚动帧只有 {len(free)} 帧，标定不可靠"
+                          f"（需要 ≥50 帧）")
+        return {"available": False, "reason": calib["reason"],
+                "calibration": calib}
+
+    def s_front(r) -> float:
+        return (r[2] * rf - r[1]) / r[1] if r[1] > 0 else 0.0
+
+    def s_rear(r) -> float:
+        return (r[3] * rr - r[1]) / r[1] if r[1] > 0 else 0.0
+
+    # 自洽性：标定用的自由滚动帧上滑移应≈0
+    f_mean = sum(s_front(r) for r in free) / len(free)
+    r_mean = sum(s_rear(r) for r in free) / len(free)
+    calib["free_slip_front"] = round(f_mean, 4)
+    calib["free_slip_rear"] = round(r_mean, 4)
+    calib["ok"] = abs(f_mean) < 0.02 and abs(r_mean) < 0.02
+    if not calib["ok"]:
+        calib["reason"] = (f"自由滚动帧滑移均值偏离 0 过多"
+                           f"（前 {f_mean:+.4f} / 后 {r_mean:+.4f}），标定可能被污染")
+
+    # —— 2. 逐圈统计 + 事件（连续帧聚成一次，否则一次抱死会被算成 60 次）——
+    lap_rows: list[dict] = []
+    lock_events: list[dict] = []
+    spin_events: list[dict] = []
+    series: dict[int, dict] = {}
+
+    def _event(ln: int, t0: float, worst: tuple, getter, nframes: int) -> dict:
+        return {
+            "lap": ln, "t_rel": round(worst[0] - t0, 3),
+            "slip": round(getter(worst), 3),
+            "speed_kph": round(worst[1] * 3.6, 1),
+            "throttle": round(worst[4] * 100, 0),
+            "brake": round(worst[5] * 100, 0),
+            "frames": nframes,
+        }
+
+    for ln, rows in per_lap.items():
+        sf: list[float] = []
+        sr: list[float] = []
+        lock_run: list[tuple] = []
+        spin_run: list[tuple] = []
+        dec = {"t": [], "front": [], "rear": [], "speed_kph": [],
+               "throttle": [], "brake": []}
+        t0 = rows[0][0]
+        stride = max(1, math.ceil(len(rows) / max(1, max_per_lap)))
+
+        def _flush_lock(run: list[tuple]) -> None:
+            """一次抱死结束：取这一段里**最负**的前轴滑移作为严重度。"""
+            if len(run) >= 2:      # 单帧尖峰不算一次事件
+                w = min(run, key=s_front)
+                lock_events.append(_event(ln, t0, w, s_front, len(run)))
+
+        def _flush_spin(run: list[tuple]) -> None:
+            """一次空转结束：取这一段里**最正**的后轴滑移作为严重度。"""
+            if len(run) >= 2:
+                w = max(run, key=s_rear)
+                spin_events.append(_event(ln, t0, w, s_rear, len(run)))
+
+        for i, r in enumerate(rows):
+            f_ = s_front(r)
+            r_ = s_rear(r)
+            if r[1] > _SLIP_MIN_V:
+                sf.append(f_)
+                sr.append(r_)
+                if r[5] > 0.85 and f_ < _SLIP_LOCK_THR:
+                    lock_run.append(r)
+                else:
+                    _flush_lock(lock_run)
+                    lock_run = []
+                if r[4] > 0.95 and r_ > _SLIP_SPIN_THR:
+                    spin_run.append(r)
+                else:
+                    _flush_spin(spin_run)
+                    spin_run = []
+            if i % stride == 0:
+                dec["t"].append(round(r[0] - t0, 2))
+                dec["front"].append(round(f_, 3))
+                dec["rear"].append(round(r_, 3))
+                dec["speed_kph"].append(round(r[1] * 3.6, 1))
+                dec["throttle"].append(round(r[4] * 100, 0))
+                dec["brake"].append(round(r[5] * 100, 0))
+        _flush_lock(lock_run)
+        _flush_spin(spin_run)
+        series[ln] = dec
+
+        lock_frames = sum(1 for r in rows if r[1] > _SLIP_MIN_V
+                          and r[5] > 0.85 and s_front(r) < _SLIP_LOCK_THR)
+        spin_frames = sum(1 for r in rows if r[1] > _SLIP_MIN_V
+                          and r[4] > 0.95 and s_rear(r) > _SLIP_SPIN_THR)
+        lap_rows.append({
+            "lap": ln, "frames": len(rows),
+            "front": _slip_percentiles(sf), "rear": _slip_percentiles(sr),
+            "lockup_frames": lock_frames, "wheelspin_frames": spin_frames,
+        })
+
+    lock_events.sort(key=lambda e: e["slip"])
+    spin_events.sort(key=lambda e: e["slip"], reverse=True)
+    return {
+        "available": True,
+        "max_per_lap": max_per_lap,
+        "calibration": calib,
+        "laps": lap_rows,
+        "lockup": {"events": len(lock_events),
+                   "frames": sum(r["lockup_frames"] for r in lap_rows),
+                   "worst": lock_events[:nmax_events]},
+        "wheelspin": {"events": len(spin_events),
+                      "frames": sum(r["wheelspin_frames"] for r in lap_rows),
+                      "worst": spin_events[:nmax_events]},
+        "series": series,
+    }
+
+
 # —— 门面 ——————————————————————————————
 
 def match_pv_pairs(peaks_ref: list[dict], peaks_cur: list[dict],

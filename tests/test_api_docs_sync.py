@@ -39,6 +39,7 @@ def _slice(text: str, start: str, end: str) -> str:
 # 需要逐字一致的关键段落（本轮改动都落在这里，也是最容易漏抄的地方）
 _SHARED_SECTIONS = [
     ("参数", "### 参数", "## 字段与单位约定（对外承诺，只加不改）"),
+    ("分段计时与轮胎滑移", "## 分段计时与轮胎滑移", "## 单圈行车轨迹"),
     ("单圈行车轨迹", "## 单圈行车轨迹", "## 圈间对比自选两圈"),
     ("圈间对比自选两圈", "## 圈间对比自选两圈", "## 使用示例"),
 ]
@@ -56,6 +57,19 @@ def test_raceline_row_in_both_tables(embedded, doc_file):
            "（踏板 + G 力两套着色通道）；`lap` 缺省 = 最快圈 |")
     assert row in embedded
     assert row in doc_file
+
+
+def test_new_analysis_rows_in_both_tables(embedded, doc_file):
+    """两个新分析接口的表格行也必须两边都有，否则线上文档查不到这个接口。"""
+    rows = [
+        ("| `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；"
+         "`n` = 段数（2~10，缺省 4） |"),
+        ("| `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**："
+         "空转 / 抱死检测；每圈曲线最多 `max_points` 点 |"),
+    ]
+    for row in rows:
+        assert row in embedded, f"内嵌文档缺表格行：{row}"
+        assert row in doc_file, f"API文档.md 缺表格行：{row}"
 
 
 def test_cmp_lap_example_in_both(embedded, doc_file):
