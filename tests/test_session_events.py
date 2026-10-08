@@ -32,9 +32,9 @@ def _circle_xy(i, radius=100.0, samples=1500):
 
 
 def _frame(i, lap, v_ms=27.78, kf=1.0, kr=1.0, lat_g=0.0,
-           thr=0.0, brk=0.0, off_m=0.0):
+           thr=0.0, brk=0.0, off_m=0.0, tyre_temp=None, susp=None):
     x, z = _circle_xy(i, radius=100.0 + off_m)
-    return {
+    fr = {
         "t": i * DT, "lap": lap, "speed_kph": v_ms * 3.6, "rpm": 5000.0,
         "gear": 3, "throttle": thr, "brake": brk,
         "g_force": [0.0, lat_g, 0.0],
@@ -42,6 +42,12 @@ def _frame(i, lap, v_ms=27.78, kf=1.0, kr=1.0, lat_g=0.0,
         "wheel_rads": [kf * v_ms / RF, kf * v_ms / RF,
                        kr * v_ms / RR, kr * v_ms / RR],
     }
+    # 胎温 / 悬挂：2026-10-09 起进 _FRAME_COL_KIND，事件证据要读真值
+    if tyre_temp is not None:
+        fr["tyre_temp"] = list(tyre_temp)
+    if susp is not None:
+        fr["susp_height"] = list(susp)
+    return fr
 
 
 def _two_lap_frames(spin_at=None, offtrack_at=None):
@@ -139,3 +145,81 @@ def test_single_lap_scope(dash, tmp_path):
     assert out["laps"] == [1]
     assert all(e["lap"] == 1 for e in out["events"])
     assert not any(e["type"] == "spin" for e in out["events"])
+
+
+def test_tyre_abuse_evidence_uses_real_tyre_temp(dash, tmp_path):
+    """轮胎滥用事件的胎温必须是**真值**（2026-10-09 前恒 0，事件等于哑雷）。
+
+    合成一场：后轴单侧空转（kf/kr 差异）触发 tyre_abuse，帧里带真实胎温。
+    """
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    frames = []
+    for lap in (1, 2):
+        base = (lap - 1) * 1500
+        for i in range(1500):
+            kw = {}
+            if lap == 2 and 700 <= i < 760:
+                # 后轴整体空转（kr=1.3 → 滑移率 0.3，与干净前轴拉开差值）
+                # + 高速，触发 tyre_abuse；帧里带真实胎温/悬挂
+                kw = dict(v_ms=30.0, kr=1.3,
+                          tyre_temp=[88.0, 92.0, 85.0, 96.0],
+                          susp=[0.12, 0.09, 0.20, 0.05])
+            else:
+                kw = dict(tyre_temp=[70.0, 70.0, 70.0, 70.0],
+                          susp=[0.15, 0.15, 0.15, 0.15])
+            fr = _frame(base + i, lap, **kw)
+            frames.append(fr)
+    for fr in frames[1500:]:
+        fr["t"] += 1500 * DT
+    _write_session(f, frames)
+
+    out = dash.session_events(f)
+    assert out["available"] is True
+    abuses = [e for e in out["events"] if e["type"] == "tyre_abuse"]
+    assert abuses, f"没检出轮胎滥用，现有事件：{[e['type'] for e in out['events']]}"
+    ev = abuses[0]["evidence"]
+    # 🔴 核心断言：胎温不是四个 0（旧实现占位恒 0，证据是假的）
+    assert sum(ev["四轮胎温_C"]) > 0, ev
+    assert max(ev["四轮胎温_C"]) >= 90, ev
+    assert sum(ev["四轮悬挂_mm"]) > 0, ev
+
+
+def test_highlights_are_ffmpeg_sliceable(dash, tmp_path):
+    """/highlights 输出的切片窗口必须能直接喂 ffmpeg（-ss / -t）。"""
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames(spin_at=(720, 750), offtrack_at=(600, 700)))
+
+    hl = dash.session_highlights(f, top=5, pad_before=2.0, pad_after=1.5)
+    assert hl["available"] is True
+    clips = hl["clips"]
+    assert clips, "有事件就该有高光片段"
+    # 排序：score 降序，rank 从 1 连续
+    assert [c["rank"] for c in clips] == list(range(1, len(clips) + 1))
+    assert all(clips[i]["score"] >= clips[i + 1]["score"]
+               for i in range(len(clips) - 1))
+    for c in clips:
+        # 留白：切片起点 = 事件起点 - pad_before（被 0 截断除外）
+        if c["t_start"] >= 2.0:
+            assert c["clip_start"] == pytest.approx(c["t_start"] - 2.0, abs=1e-6)
+        assert c["clip_end"] == pytest.approx(c["t_end"] + 1.5, abs=1e-6)
+        assert c["duration"] == pytest.approx(
+            c["clip_end"] - c["clip_start"], abs=1e-6)
+        assert c["clip_start"] >= 0.0
+        assert c["type_cn"]
+    # 权重口径：打滑比大油门值钱
+    assert dash._HIGHLIGHT_WEIGHT["collision"] > dash._HIGHLIGHT_WEIGHT["hard_braking"]
+
+
+def test_highlights_params(dash, tmp_path):
+    """types 过滤 / top 截断 / min_score 都要生效。"""
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames(spin_at=(720, 750), offtrack_at=(600, 700)))
+
+    allc = dash.session_highlights(f, top=0)["clips"]
+    assert len(allc) >= 2
+    only = dash.session_highlights(f, top=0, types=["off_track"])["clips"]
+    assert only and all(c["type"] == "off_track" for c in only)
+    top1 = dash.session_highlights(f, top=1)["clips"]
+    assert len(top1) == 1
+    none_ = dash.session_highlights(f, top=0, min_score=999.0)["clips"]
+    assert none_ == []

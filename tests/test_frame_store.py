@@ -20,8 +20,12 @@ import pytest
 
 # 全库没有任何一处读、因此不该被存储的字段（存了纯属白占内存）
 # ⚠️ wheel_rads 已从这份名单里移出：轮胎滑移检测（gt7analysis.wheel_slip）会读它。
-NEVER_READ = ["tyre_temp", "tyre_press", "tyre_wear", "wheel_revs",
-              "susp_height", "velocity", "seq", "position", "lap_count",
+# ⚠️ tyre_temp / susp_height 也已移出（2026-10-09）：事件卡的「轮胎滥用」
+#    证据要读它们，实测两场真实 jsonl 都有真值（胎温 54~97℃ / 悬挂 0~0.3m）。
+# 🔴 tyre_press / tyre_wear **必须留在这份名单里**：格式 A 下恒为 0
+#    （GT7 不广播），存进内存只会让事件证据里出现一堆假数字。
+NEVER_READ = ["tyre_press", "tyre_wear", "wheel_revs",
+              "velocity", "seq", "position", "lap_count",
               "oil_pressure", "water_temp", "oil_temp", "hand_brake", "in_gear",
               "time_of_day", "turbo_boost", "num_cars"]
 # 🔴 quali_pos 已被读（进站与名次卡 /pitstops：比赛中 0x84 = 当前名次），
@@ -218,11 +222,15 @@ class TestNoUnstoredFieldRead:
             assert k not in dash._FRAME_COL_KIND, f"{k} 没有任何一处读，不该存"
 
     def test_读了没存的字段会被记录(self, dash, sess):
-        """守卫本身要有效：故意读一个没存的字段，必须被记下来。"""
+        """守卫本身要有效：故意读一个没存的字段，必须被记下来。
+
+        用 tyre_press 当样例（而不是 tyre_temp）：胎温 2026-10-09 起已存，
+        而胎压在格式 A 下恒 0、明确不存 —— 正好是「读了没存」的典型。
+        """
         dash.MISSED_FIELDS.clear()
         _, store = dash._load_frames(sess)
-        assert store[0].get("tyre_temp") is None      # 拿到 None（不是真值）
-        assert "tyre_temp" in dash.MISSED_FIELDS, "守卫漏报了"
+        assert store[0].get("tyre_press") is None     # 拿到 None（不是真值）
+        assert "tyre_press" in dash.MISSED_FIELDS, "守卫漏报了"
         dash.MISSED_FIELDS.clear()
 
 

@@ -144,6 +144,7 @@
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
+| `GET /api/v1/sessions/<文件名>/highlights?top=10&pad_before=2&pad_after=1.5&min_score=0&types=&lap=` | **集锦剪辑时间轴**：事件按 `置信度×类型权重` 排序，每段给出可直接喂 ffmpeg 的 `clip_start` / `duration`（含前后留白）。`top=0` = 不限；`types` 逗号分隔过滤 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 | `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
 
@@ -360,8 +361,29 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 - 🔴 结果按场次记忆化：**冷路径 ~10s**（逐帧构造 21 万个 Sample 逐圈跑
   检测），所以事件卡**展开时才取**；同场次再取 0ms。别把它塞进详情页
   首屏串行链路。
-- `evidence` 里 `tyre_abuse` 的 `四轮胎温_C` 恒为 `[0,0,0,0]`（占位：
-  列式存储没存胎温），别当真；`spin` 的 `方向`（转向角）数据里没有，恒 0。
+- `tyre_abuse` 的 `evidence` 带 `四轮胎温_C` 与 `四轮悬挂_mm`——**都是真值**
+  （2026-10-09 起胎温 / 悬挂进列式存储；实测两场真实 jsonl 胎温 54~97℃、
+  悬挂 0~0.3m）。
+- 🔴 `tyre_press` / `tyre_wear` 在格式 A 下**恒为 0**（GT7 不广播），
+  因此既不存也不进证据——免得解说词里出现假数字。`spin` 的 `方向`
+  （转向角）协议里没有，同样是 0。
+
+## 集锦高光（剪辑时间轴）
+
+`GET /api/v1/sessions/<文件名>/highlights` —— 把上面的事件排成**可直接切片**
+的集锦时间轴，是 POV 解说工具「自动剪集锦」的交接面。
+
+| 字段 | 说明 |
+|---|---|
+| `session_start` / `session_start_iso` | 场次起点（墙上时钟 / 本地时间 ISO）——录像对齐的锚点 |
+| `clips[]` | `{rank, score, type, type_cn, lap, confidence, t_start, t_end, clip_start, clip_end, duration, evidence, hint}` |
+| `score` | `confidence × 类型权重`；权重随 `weights` 一起返回（碰撞 10 > 打滑 8 > 出界 7 > 轮胎滥用 5 > 大油门 4 > 极限刹车 3） |
+| `t_start` / `t_end` | 事件本身，相对**场次起点**的秒数 |
+| `clip_start` / `clip_end` / `duration` | 含前后留白的切片窗口：`ffmpeg -ss <clip_start> -i video.mp4 -t <duration>` |
+| 参数 | `top`（0=不限，缺省 10）/ `pad_before`（2.0）/ `pad_after`（1.5）/ `min_score` / `types`（逗号分隔）/ `lap` |
+
+- 🔴 切片窗口**必须带留白**：从事件正中间开始切，观众看不到"怎么发生的"。
+- 事件只有 `t_rel`（相对圈起点），`/highlights` 负责把它还原成整场时间轴。
 
 ## 进站与名次
 

@@ -312,6 +312,13 @@ _FRAME_COL_KIND: dict[str, str] = {
     # 只有它是「车轮实际转多快」的唯一来源 —— 车身速度传感器测不出空转和抱死，
     # 轮胎滑移检测（gt7analysis.wheel_slip）全靠它。一场 217k 帧多占约 7 MB。
     "wheel_rads": "a",
+    # 四轮胎温（℃）与悬挂行程（m）：事件卡的「轮胎滥用」证据要读。
+    # 🔴 实测（两场真实 jsonl）确认这两个字段**有真值**（胎温 54~97℃、
+    #    悬挂 0.0~0.3m）；而 tyre_press / tyre_wear 在格式 A 下**恒为 0**
+    #    （GT7 不广播），所以那两个**不许加** —— 加了只会让事件证据里
+    #    出现一堆 0，看着像有数据其实是假的。
+    "tyre_temp": "a",
+    "susp_height": "a",
     "has_coords": "b",
     "layout": "s",
 }
@@ -1853,10 +1860,11 @@ def _load_detector():
 def _frame_to_sample(det, f, i: int):
     """Frame → 检测器 Sample。只映射检测器真正会读的字段。
 
-    🔴 tyre_temp 不在 _FRAME_COL_KIND（全库只有事件卡想读它），**不能读
-       帧**——FrameStore 会把「读了但没存」的字段记进 MISSED_FIELDS，
-       tests/test_frame_store.py 直接失败。占位 [0,0,0,0]：tyre_abuse
-       证据里胎温恒 0，别当真。steer_angle 数据里没有，恒 0。
+    🔴 要读的逐帧字段必须先在 _FRAME_COL_KIND 里登记，否则 FrameStore
+       会把「读了但没存」记进 MISSED_FIELDS，tests/test_frame_store.py 直接失败。
+       tyre_temp / susp_height 已登记（实测有真值），所以这里读真值；
+       steer_angle 协议里没有、tyre_press / tyre_wear 实测恒 0，三者都不读
+       （留给 Sample 的默认值 0，避免把假数字带进解说词）。
     """
     return det.Sample(
         t=f.get("t") or 0.0, seq=i,
@@ -1868,7 +1876,8 @@ def _frame_to_sample(det, f, i: int):
         brake=f.get("brake") or 0.0,
         wheel_speed=list(f.get("wheel_rads") or (0.0, 0.0, 0.0, 0.0)),
         g_force=list(f.get("g_force") or (0.0, 0.0, 0.0)),
-        tyre_temp=[0.0, 0.0, 0.0, 0.0],
+        tyre_temp=list(f.get("tyre_temp") or (0.0, 0.0, 0.0, 0.0)),
+        susp_height=list(f.get("susp_height") or (0.0, 0.0, 0.0, 0.0)),
     )
 
 
@@ -2020,6 +2029,112 @@ def session_events(path: Path, lap_no: int | None = None) -> dict[str, Any]:
     hit = dict(hit)
     hit["laps_list"] = [int(x["lap"]) for x in laps_list]
     return hit
+
+
+# ---------------------------------------------------------------------------
+# 集锦高光（解说工具 Phase 1 的剪辑时间轴）
+# ---------------------------------------------------------------------------
+
+# 类型权重：与检测器 run_all() 里的 priority 一致（越"戏剧性"越该进集锦）。
+_HIGHLIGHT_WEIGHT: dict[str, float] = {
+    "collision": 10.0, "spin": 8.0, "off_track": 7.0,
+    "tyre_abuse": 5.0, "heavy_throttle": 4.0, "hard_braking": 3.0,
+}
+_DEFAULT_WEIGHT = 1.0
+
+
+def session_highlights(path: Path, top: int = 10, pad_before: float = 2.0,
+                       pad_after: float = 1.5, min_score: float = 0.0,
+                       types: list[str] | None = None,
+                       lap_no: int | None = None) -> dict[str, Any]:
+    """把驾驶事件排成**可直接切片的集锦时间轴**。
+
+    这是 POV 解说工具 Phase 1（集锦自动剪辑）的交接面：
+    每个片段都给出相对场次起点的秒数，ffmpeg 直接 `-ss clip_start -t duration`
+    就能切出来，不用再算一次时间轴。
+
+    score = confidence × 类型权重（碰撞 10 > 打滑 8 > 出界 7 > …）：
+    置信度是「这个事件判得有多准」，权重是「这个事件值不值得放进集锦」，
+    两者相乘才是排片顺序。
+
+    🔴 clip 窗口会向两侧各留 pad 秒（默认前 2s / 后 1.5s）——切片不能
+       从事件正中间开始，否则观众看不到"怎么发生的"。
+    """
+    ev = session_events(path, lap_no=lap_no)
+    if not ev.get("available"):
+        return {"available": False, "reason": ev.get("reason", "events unavailable"),
+                "clips": []}
+
+    # 圈起点绝对时间（墙上时钟）：把 t_rel 还原成整场时间轴要它。
+    try:
+        laps_list, grouped, _ = _valid_laps(path)
+    except Exception as e:
+        return {"available": False, "reason": str(e), "clips": []}
+    lap_t0: dict[int, float] = {}
+    for ln, fs in grouped.items():
+        if fs:
+            t0 = fs[0].get("t")
+            if t0:
+                lap_t0[int(ln)] = float(t0)
+    if not lap_t0:
+        return {"available": False, "reason": "no lap timestamps", "clips": []}
+    session_start = min(lap_t0.values())
+
+    tset = {t.strip() for t in types} if types else None
+    clips = []
+    for e in ev.get("events") or []:
+        etype = e.get("type") or ""
+        if tset and etype not in tset:
+            continue
+        conf = float(e.get("confidence") or 0.0)
+        score = conf * _HIGHLIGHT_WEIGHT.get(etype, _DEFAULT_WEIGHT)
+        if score < min_score:
+            continue
+        t0 = lap_t0.get(int(e.get("lap") or 0))
+        if t0 is None:
+            continue
+        t_abs = t0 - session_start + float(e.get("t_rel") or 0.0)
+        t_end_abs = t0 - session_start + float(
+            e.get("t_end_rel") or e.get("t_rel") or 0.0)
+        start = max(0.0, t_abs - pad_before)
+        end = t_end_abs + pad_after
+        clips.append({
+            "type": etype,
+            "type_cn": _EVENT_TYPE_NAMES.get(etype, etype),
+            "lap": e.get("lap"),
+            "confidence": round(conf, 3),
+            "score": round(score, 3),
+            # 事件本身（相对场次起点，秒）
+            "t_start": round(t_abs, 3), "t_end": round(t_end_abs, 3),
+            # 切片窗口（含留白，ffmpeg 直接用这个）
+            "clip_start": round(start, 3),
+            "clip_end": round(end, 3),
+            "duration": round(max(0.1, end - start), 3),
+            "evidence": e.get("evidence") or {},
+            "hint": e.get("hint") or "",
+            "src": e.get("src") or "",
+        })
+    clips.sort(key=lambda c: -c["score"])
+    if top and top > 0:
+        clips = clips[:top]
+    for i, c in enumerate(clips, 1):
+        c["rank"] = i
+    return {
+        "available": True,
+        "session_start": round(session_start, 3),
+        # iso 用**本地时区**：这是给人核对"这段对应录像第几秒"用的，
+        # 而录像文件的创建时间也是本地时间，UTC 反而要心算一遍时差。
+        "session_start_iso": datetime.fromtimestamp(session_start).isoformat(),
+        "count": len(clips),
+        "params": {"top": top, "pad_before": pad_before,
+                   "pad_after": pad_after, "min_score": min_score,
+                   "types": sorted(tset) if tset else None, "lap": lap_no},
+        # 权重透明化：消费方要知道排序口径，方便自己调
+        "weights": dict(_HIGHLIGHT_WEIGHT),
+        "clips": clips,
+        "ffmpeg_hint": ("ffmpeg -ss <clip_start> -i video.mp4 -t <duration> "
+                        "-c copy clip.mp4"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2434,6 +2549,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
+| `GET /api/v1/sessions/<文件名>/highlights?top=10&pad_before=2&pad_after=1.5&min_score=0&types=&lap=` | **集锦剪辑时间轴**：事件按 `置信度×类型权重` 排序，每段给出可直接喂 ffmpeg 的 `clip_start` / `duration`（含前后留白）。`top=0` = 不限；`types` 逗号分隔过滤 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 | `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
 
@@ -2650,8 +2766,29 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 - 🔴 结果按场次记忆化：**冷路径 ~10s**（逐帧构造 21 万个 Sample 逐圈跑
   检测），所以事件卡**展开时才取**；同场次再取 0ms。别把它塞进详情页
   首屏串行链路。
-- `evidence` 里 `tyre_abuse` 的 `四轮胎温_C` 恒为 `[0,0,0,0]`（占位：
-  列式存储没存胎温），别当真；`spin` 的 `方向`（转向角）数据里没有，恒 0。
+- `tyre_abuse` 的 `evidence` 带 `四轮胎温_C` 与 `四轮悬挂_mm`——**都是真值**
+  （2026-10-09 起胎温 / 悬挂进列式存储；实测两场真实 jsonl 胎温 54~97℃、
+  悬挂 0~0.3m）。
+- 🔴 `tyre_press` / `tyre_wear` 在格式 A 下**恒为 0**（GT7 不广播），
+  因此既不存也不进证据——免得解说词里出现假数字。`spin` 的 `方向`
+  （转向角）协议里没有，同样是 0。
+
+## 集锦高光（剪辑时间轴）
+
+`GET /api/v1/sessions/<文件名>/highlights` —— 把上面的事件排成**可直接切片**
+的集锦时间轴，是 POV 解说工具「自动剪集锦」的交接面。
+
+| 字段 | 说明 |
+|---|---|
+| `session_start` / `session_start_iso` | 场次起点（墙上时钟 / 本地时间 ISO）——录像对齐的锚点 |
+| `clips[]` | `{rank, score, type, type_cn, lap, confidence, t_start, t_end, clip_start, clip_end, duration, evidence, hint}` |
+| `score` | `confidence × 类型权重`；权重随 `weights` 一起返回（碰撞 10 > 打滑 8 > 出界 7 > 轮胎滥用 5 > 大油门 4 > 极限刹车 3） |
+| `t_start` / `t_end` | 事件本身，相对**场次起点**的秒数 |
+| `clip_start` / `clip_end` / `duration` | 含前后留白的切片窗口：`ffmpeg -ss <clip_start> -i video.mp4 -t <duration>` |
+| 参数 | `top`（0=不限，缺省 10）/ `pad_before`（2.0）/ `pad_after`（1.5）/ `min_score` / `types`（逗号分隔）/ `lap` |
+
+- 🔴 切片窗口**必须带留白**：从事件正中间开始切，观众看不到"怎么发生的"。
+- 事件只有 `t_rel`（相对圈起点），`/highlights` 负责把它还原成整场时间轴。
 
 ## 进站与名次
 
@@ -3276,7 +3413,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     or path.endswith("/sectors") or path.endswith("/slip")
                     or path.endswith("/deviation") or path.endswith("/track")
                     or path.endswith("/events") or path.endswith("/pitstops")
-                    or path.endswith("/compare")):
+                    or path.endswith("/compare")
+                    or path.endswith("/highlights")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
@@ -3357,6 +3495,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif path.endswith("/events"):
                     self._send_json(session_events(target, lap_no=lap_no),
                                     cors=True)
+                elif path.endswith("/highlights"):
+                    # 集锦剪辑时间轴：事件按 置信度×类型权重 排序 + 前后留白，
+                    # 输出可直接喂 ffmpeg 的 clip_start / duration。
+                    def _f(key: str, default: float) -> float:
+                        try:
+                            return float(query.get(key, [default])[0])
+                        except (ValueError, TypeError):
+                            return default
+                    try:
+                        top_n = int(query.get("top", ["10"])[0])
+                    except ValueError:
+                        top_n = 10
+                    types_raw = query.get("types", [""])[0]
+                    self._send_json(
+                        session_highlights(
+                            target, top=max(0, top_n),
+                            pad_before=_f("pad_before", 2.0),
+                            pad_after=_f("pad_after", 1.5),
+                            min_score=_f("min_score", 0.0),
+                            types=[t for t in types_raw.split(",") if t.strip()]
+                            or None,
+                            lap_no=lap_no),
+                        cors=True)
                 elif path.endswith("/pitstops"):
                     self._send_json(session_pitstops(target), cors=True)
                 elif path.endswith("/compare"):

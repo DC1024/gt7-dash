@@ -594,9 +594,12 @@ class EventDetector:
                         "打滑轮胎": wheel_names[worst],
                         "该轮滑移率": round(slips[worst], 3),
                         "其他轮滑移率": round(min(slips), 3),
-                        # tyre_temp：GT7 遥测有该字段，但 dashboard 适配层
-                        # 目前不映射（占位 [0,0,0,0]），有值才看，恒 0 别当真
+                        # 🔴 胎温 / 悬挂是**真值**（实测两场真实 jsonl 都有数）：
+                        #    胎温看哪一侧过热，悬挂看是不是压了路肩/草地
+                        #    （一边悬挂被顶起 = 车轮压到路边）。
+                        #    tyre_press / tyre_wear 格式 A 恒 0，**不进证据**。
                         "四轮胎温_C": [round(t) for t in peak.tyre_temp],
+                        "四轮悬挂_mm": [round(h * 1000) for h in peak.susp_height],
                     },
                     comment_hint="四轮附着差异过大，可能是单轮压到路肩或草地",
                 )
