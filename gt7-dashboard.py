@@ -212,6 +212,10 @@ class TelemetryHub:
         with self._lock:
             frames = list(self._buffer)[-max_frames:]
             latest = dict(self._latest) if self._latest else None
+            # 🔴 latest 是**原始帧**，菜单态的 0xFFFF 会原样发给 /api/state 的
+            #    调用方（前端自己的 okPos() 只挡 UI，挡不住第三方）。归一一次。
+            if latest is not None:
+                _normalize_u16_frame(latest)
             lap_time = 0.0
             if latest and self._session_start:
                 lap_time = max(0.0, latest["t"] - self._session_start)
@@ -1146,6 +1150,26 @@ def _lap_no(f: dict) -> int:
     return _u16(f.get("lap"))
 
 
+# 一帧里所有已知会用 0xFFFF 表示「不适用」的 u16 字段。
+_U16_FIELDS = ("lap", "num_cars", "quali_pos")
+
+
+def _normalize_u16_frame(f: dict) -> dict:
+    """把一帧里的 u16 哨兵字段就地归一（返回同一个 dict，方便链式用）。
+
+    🔴 只改**已存在**的键，不凭空补键 —— 否则「键缺席」会变成「键在但值为 0」，
+       那些靠 `in` 判断字段有无的调用方口径就被改掉了。
+
+    出口不止一个：/api/v1/live 有 _v1_live 自己挡一道，但 /api/state 的 `latest`
+    是**原始帧**（直接透传接收器给的那一份），前端和第三方都能拿到，
+    菜单态会直接显示「65535 辆车 / 第 65535 位」。所以在源头归一一次最省事。
+    """
+    for k in _U16_FIELDS:
+        if k in f:
+            f[k] = _u16(f.get(k))
+    return f
+
+
 def _series_cols(store: "FrameStore"):
     """把 _frame_row 要用的各通道底层列一次抓齐，之后每行只做下标。
 
@@ -1959,7 +1983,8 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
         {
             "t": f.get("t"), "speed_kph": f.get("speed_kph"), "rpm": f.get("rpm"),
             "gear": f.get("gear"), "throttle": f.get("throttle"),
-            "brake": f.get("brake"), "lap": f.get("lap"),
+            # 🔴 lap 必须走哨兵归一：菜单态 0xFFFF 会原样出现在历史窗里
+            "brake": f.get("brake"), "lap": _lap_no(f),
             "tyre_temp_c": f.get("tyre_temp"), "g_force": f.get("g_force"),
         }
         for f in snap.get("history", [])
@@ -2028,6 +2053,13 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
                      "num_cars": _u16(L.get("num_cars"))},
             "tyre_temp_c": L.get("tyre_temp", []),
             "suspension_height_m": L.get("susp_height", []),
+            # 🔴 单位修正：这条通道是**角速度 rad/s**，不是「转/秒」。
+            #    证据是自标定半径：R = Σ(v·ω)/Σ(ω²) 用自由滚动帧算出来是
+            #    0.339 / 0.344 m（正常赛车轮胎量级）；若 ω 真是 rev/s，
+            #    倒推半径会是 0.05 m —— 荒谬。旧键名字是错的。
+            #    v1 对外「只加不改」：新增正确命名的键，旧键保留同一取值，
+            #    免得打断已经在用 wheel_rev_per_s 的调用方（文档里标废弃）。
+            "wheel_rad_per_s": L.get("wheel_rads", []),
             "wheel_rev_per_s": L.get("wheel_rads", []),
             "flags": L.get("flags", 0),
             "state": {"on_track": L.get("car_on_track", False),
@@ -2150,7 +2182,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `race` | 对象 | 比赛信息：`time_of_day_ms`（赛道时钟）/ `grid_position`（**当前名次**，0x84 在比赛中随排名实时变）/ `grid_start`（发车位，开跑瞬间快照；0=未捕获）/ `num_cars`（参赛车数） |
 | `tyre_temp_c` | ℃ | 四轮表面温度，顺序 FL/FR/RL/RR |
 | `suspension_height_m` | 米 | 四轮悬挂行程，顺序 FL/FR/RL/RR |
-| `wheel_rev_per_s` | 转/秒 | 四轮转速（带符号，倒挡为负） |
+| `wheel_rad_per_s` | rad/s | 四轮**角速度**，顺序 FL/FR/RL/RR；记录器存的是绝对值，恒非负 |
+| `wheel_rev_per_s` | rad/s | ⚠️ **已废弃**：名字写「转/秒」而实际单位是 rad/s，为兼容旧调用方保留，取值与 `wheel_rad_per_s` 完全相同 |
 | `flags` | bit 位 | bit0 在赛道 / bit1 暂停 / bit2 加载 / bit3 在挡 … |
 | `state.on_track` | bool | 是否在赛道上（比赛进行中） |
 
@@ -2175,6 +2208,9 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 ### `history[]`（每帧一条）
 `t`（服务器时间戳秒）、`speed_kph`、`rpm`、`gear`、`throttle`、`brake`、
 `lap`、`tyre_temp_c`、`g_force`。
+
+> `lap` 的菜单态哨兵 `0xFFFF` 一律归一为 `0`（与 `series` / `frames` 同一口径），
+> 所以历史窗里不会出现「第 65535 圈」。
 
 ## 历史场次的逐帧数据
 

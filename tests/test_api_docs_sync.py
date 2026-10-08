@@ -117,6 +117,26 @@ def test_pitstops_row_in_both_tables(embedded, doc_file):
         assert "当前名次" in text
 
 
+def test_wheel_unit_fixed_in_both(embedded, doc_file):
+    """四轮角速度的键名/单位修正在两份文档里都要到位。
+
+    旧键 `wheel_rev_per_s` 写「转/秒」但实际是 rad/s（自标定半径 0.339/0.344 m
+    就是证据）。v1 只加不改，所以正确做法是并肩加 `wheel_rad_per_s` 并把旧键
+    标废弃 —— 文档里必须把这个坑写清楚，否则后来者还会照着旧键去乘 2π。
+    """
+    for text in (embedded, doc_file):
+        assert "`wheel_rad_per_s` | rad/s" in text
+        assert "已废弃" in text
+        # 「转/秒」不能再作为**单位列**出现（废弃说明里提到这三个字是应该的）
+        assert "| 转/秒 |" not in text
+
+
+def test_history_lap_sentinel_documented(embedded, doc_file):
+    """/api/v1/live 的 history[].lap 也归一了，两份文档都要写。"""
+    for text in (embedded, doc_file):
+        assert "所以历史窗里不会出现「第 65535 圈」" in text
+
+
 def test_ref_lap_param_mentions_cmp_lap(embedded, doc_file):
     """参数说明里要同时写清 ref_lap 与 cmp_lap 的缺省值。"""
     for text in (embedded, doc_file):

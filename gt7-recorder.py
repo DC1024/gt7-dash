@@ -169,7 +169,11 @@ class TelemetrySample:
     lap: int = 0
     throttle: float = 0.0
     brake: float = 0.0
-    # 四轮（FL FR RL RR）
+    # 四轮（FL FR RL RR）**角速度**，单位 rad/s（不是 rev/s —— 名字里的 rads 是对的，
+    # 同文件下面那个 wheel_revs 才是名不副实的那个）。
+    # 🔴 恒非负：解码时取了 abs()（见 Decoder._decode_plain），倒挡的符号被丢掉了。
+    #    这是有意的：滑移率 s=(ωR−v)/v 里的 v 是**速率**（倒车也是正的），
+    #    带符号的 ω 会让倒车帧算出 −200% 的假抱死。全库只有这个字段被读。
     wheel_rads: list[float] = field(default_factory=lambda: [0.0] * 4)
     tyre_temp: list[float] = field(default_factory=lambda: [0.0] * 4)
     tyre_press: list[float] = field(default_factory=lambda: [0.0] * 4)
@@ -188,6 +192,10 @@ class TelemetrySample:
     # —— 以下为 InvoGT 偏移表新增 ——
     car_y: float = 0.0# position[1]，高度
     velocity: list[float] = field(default_factory=lambda: [0.0] * 3)
+    # ⚠️ 名字是历史包袱：单位**同样是 rad/s**，不是 rev/s（没有乘 2π）。
+    #    它和 wheel_rads 的唯一区别是**带符号**（倒挡为负）——即 abs() 之前的原始值。
+    #    全库没有任何一处读它（tests/test_frame_store.py 的 NEVER_READ 守着），
+    #    保留只是为了 jsonl 里留一份没被 abs() 削过的原始值。
     wheel_revs: list[float] = field(default_factory=lambda: [0.0] * 4)
     suggested_gear: int = 0             # gear 高 4 位
     flags: int = 0                      # 状态位
@@ -654,6 +662,10 @@ class Decoder:
                 f32(0x60), f32(0x64), f32(0x68), f32(0x6C),
             ] if n >= 0x70 else [0.0] * 4
 
+            # 0xA4~0xB0：四轮角速度，**单位是 rad/s**（不是 rev/s）。
+            # 判定依据：gt7analysis 用自由滚动帧做 R = Σ(v·ω)/Σ(ω²) 自标定，
+            # 实测前后轴 0.339 / 0.344 m —— 赛车轮胎的正常量级；
+            # 若这里是 rev/s，倒推半径会是 0.05 m。
             wheel_revs = [
                 f32(0xA4), f32(0xA8), f32(0xAC), f32(0xB0),
             ] if n >= 0xB4 else [0.0] * 4
@@ -747,6 +759,8 @@ class Decoder:
                 lap=lap_count,
                 throttle=throttle,
                 brake=brake,
+                # abs()：丢掉倒挡的负号。别"修"——滑移率里的 v 是速率（倒车也
+                # 是正的），带符号的 ω 会在倒车帧算出 −200% 的假抱死。
                 wheel_rads=[abs(r) for r in wheel_revs],
                 wheel_revs=wheel_revs,
                 tyre_temp=tyre_temp,

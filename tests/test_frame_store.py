@@ -281,6 +281,59 @@ class TestSentinel:
         assert d["car"]["race"]["grid_position"] == 7
         assert d["car"]["race"]["grid_start"] == 12
 
+    def test_v1_live_history_里的圈号哨兵被归一(self, dash):
+        """history[] 是逐帧的，菜单态的 0xFFFF 不能原样出现在公开接口里。"""
+        snap = {"connected": True, "powertrain": "fuel", "frames": 2,
+                "latest": {"g_force": [0.1, 0.2, 0.0]},
+                "history": [{"lap": 65535, "t": 1.0}, {"lap": 3, "t": 1.1}]}
+        d = dash._v1_live(snap)
+        assert [h["lap"] for h in d["history"]] == [0, 3]
+
+    def test_normalize_u16_frame_只归一已存在的键(self, dash):
+        f = {"lap": 65535, "num_cars": 65535, "quali_pos": 65535,
+             "speed_kph": 200.0}
+        out = dash._normalize_u16_frame(f)
+        assert out is f
+        assert (out["lap"], out["num_cars"], out["quali_pos"]) == (0, 0, 0)
+        assert out["speed_kph"] == 200.0        # 其余字段一个都不动
+
+    def test_normalize_u16_frame_不凭空补键(self, dash):
+        """「键缺席」不能被改写成「键在、值是 0」——那会改掉 `in` 的口径。"""
+        f = {"lap": 3}
+        dash._normalize_u16_frame(f)
+        assert set(f) == {"lap"}
+
+    def test_state_snapshot_的_latest_也被归一(self, dash, tmp_path):
+        """/api/state 的 latest 是**原始帧**（不是 v1 结构），同样不能漏 65535。"""
+        hub = dash.TelemetryHub(tmp_path / "status.json")
+        hub.refresh = lambda: None              # 别去读真实状态文件
+        hub._latest = {"lap": 65535, "num_cars": 65535, "quali_pos": 65535}
+        latest = hub.snapshot(max_frames=10)["latest"]
+        assert (latest["lap"], latest["num_cars"], latest["quali_pos"]) == (0, 0, 0)
+        # 归一只能作用在**副本**上：hub 自己缓存的原始帧必须保持原样
+        assert hub._latest["num_cars"] == 65535
+
+
+class TestLiveCarUnits:
+    """对外字段的命名/单位（v1 只加不改，所以错名字只能并肩加一个对的）。"""
+
+    def test_wheel_rad_per_s_与旧键同值(self, dash):
+        """wheel_rev_per_s 名不副实（写「转/秒」实为 rad/s）：
+        新增正确命名的键，旧键保留同一取值，谁都不会被打破。"""
+        snap = {"connected": True, "powertrain": "fuel", "frames": 1,
+                "latest": {"wheel_rads": [100.0, 100.5, 99.0, 99.5],
+                           "g_force": [0.1, 0.2, 0.0]}}
+        car = dash._v1_live(snap)["car"]
+        assert car["wheel_rad_per_s"] == [100.0, 100.5, 99.0, 99.5]
+        assert car["wheel_rev_per_s"] == car["wheel_rad_per_s"]
+
+    def test_缺_wheel_rads_时两键一起降级(self, dash):
+        snap = {"connected": True, "powertrain": "fuel", "frames": 1,
+                "latest": {"g_force": [0.1, 0.2, 0.0]}}
+        car = dash._v1_live(snap)["car"]
+        assert car["wheel_rad_per_s"] == []
+        assert car["wheel_rev_per_s"] == []
+
 
 class TestPresence:
     """`"k" in f` 走的是一张预先算好的存在位图，不是真的取一次值。

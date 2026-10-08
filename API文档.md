@@ -97,7 +97,8 @@
 | `race` | 对象 | 比赛信息：`time_of_day_ms`（赛道时钟）/ `grid_position`（**当前名次**，0x84 在比赛中随排名实时变）/ `grid_start`（发车位，开跑瞬间快照；0=未捕获）/ `num_cars`（参赛车数） |
 | `tyre_temp_c` | ℃ | 四轮表面温度，顺序 FL/FR/RL/RR |
 | `suspension_height_m` | 米 | 四轮悬挂行程，顺序 FL/FR/RL/RR |
-| `wheel_rev_per_s` | 转/秒 | 四轮转速（带符号，倒挡为负） |
+| `wheel_rad_per_s` | rad/s | 四轮**角速度**，顺序 FL/FR/RL/RR；记录器存的是绝对值，恒非负 |
+| `wheel_rev_per_s` | rad/s | ⚠️ **已废弃**：名字写「转/秒」而实际单位是 rad/s，为兼容旧调用方保留，取值与 `wheel_rad_per_s` 完全相同 |
 | `flags` | bit 位 | bit0 在赛道 / bit1 暂停 / bit2 加载 / bit3 在挡 … |
 | `state.on_track` | bool | 是否在赛道上（比赛进行中） |
 
@@ -122,6 +123,9 @@
 ### `history[]`（每帧一条）
 `t`（服务器时间戳秒）、`speed_kph`、`rpm`、`gear`、`throttle`、`brake`、
 `lap`、`tyre_temp_c`、`g_force`。
+
+> `lap` 的菜单态哨兵 `0xFFFF` 一律归一为 `0`（与 `series` / `frames` 同一口径），
+> 所以历史窗里不会出现「第 65535 圈」。
 
 ## 历史场次的逐帧数据
 
