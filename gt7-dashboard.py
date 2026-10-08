@@ -2380,6 +2380,7 @@ _TELEMETRY_TMPL = r"""
       <span id="teleMeta" style="font-weight:400;color:var(--muted)"></span>
       <select id="teleLapSel" onchange="teleSetLap(this.value)"
         style="font-weight:400;font-size:12px;padding:3px 7px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"></select>
+      <button id="teleZoom" class="tbtn" onclick="openZoom('teleChart')">⤢ 放大曲线</button>
       <a id="teleCsv" class="tbtn" href="#" download>⬇ 导出 CSV</a>
     </span>
   </h2>
@@ -2387,11 +2388,17 @@ _TELEMETRY_TMPL = r"""
     接收器<b>逐帧</b>落盘的原始通道都在这里：时间、速度、转速、档位、油门 / 刹车百分比、
     横向 / 纵向 G、油量。曲线默认跨整场，右上角可切到某一圈；
     帧数很多时会自动<b>等间隔抽稀</b>后再画（是抽稀不是丢帧，曲线依然覆盖全程）。
-    点击曲线可放大，下方表格可翻页看原始帧。
+    <b>鼠标划过曲线</b>会跟着出现十字光标，<b>点一下</b>就把读数钉住（再点一下取消，
+    或按 Esc），下方读数条会列出该时刻每项通道的具体数值；放大曲线请点右上角按钮，
+    下方表格可翻页看原始帧。
     横轴与「时间」列都是<b>相对时间</b>：整场 = 从场次开始算，单圈 = 从该圈起点算，
     导出的 CSV 也是同一基准。
   </p>
-  <div id="teleChart" class="telechart"></div>
+  <div id="teleChartWrap" class="telewrap2">
+    <div id="teleChart" class="telechart"></div>
+    <svg id="teleCursor" class="telecursor" aria-hidden="true"></svg>
+  </div>
+  <div id="teleReadout" class="treadout"></div>
   <div class="telebar">
     <b style="font-size:12px">原始帧</b>
     <span id="telePageInfo" style="font-size:12px;color:var(--muted)"></span>
@@ -2404,7 +2411,24 @@ _TELEMETRY_TMPL = r"""
   </div>
 </div>
 <style>
-.telechart svg { display:block; width:100%; height:auto; }
+.telechart svg { display:block; width:100%; height:auto; cursor:crosshair; }
+/* 十字光标是**叠在曲线上的独立 SVG**：只在移鼠标时重画这几条线，
+   不重绘 2000+ 个点的曲线（那会卡）。pointer-events:none 让事件穿透到下面的曲线。 */
+.telewrap2 { position:relative; }
+.telecursor { position:absolute; left:0; top:0; pointer-events:none; display:none; }
+.telecursor.on { display:block; }
+.treadout { margin-top:8px; padding:7px 10px; border:1px solid var(--line);
+  border-radius:8px; background:rgba(128,128,128,.06); display:flex;
+  flex-wrap:wrap; gap:6px 14px; align-items:baseline; font-size:12px; min-height:32px; }
+.treadout .trhint { color:var(--muted); font-size:11.5px; }
+.treadout .tr-item { display:inline-flex; align-items:baseline; gap:4px; white-space:nowrap; }
+.treadout .tr-item i { font-style:normal; color:var(--muted); font-size:11px; }
+.treadout .tr-item b { font-family:var(--mono); font-size:13px; font-weight:600; }
+.treadout .tr-item em { font-style:normal; color:var(--muted); font-size:10.5px; }
+.treadout .tr-pin { border:1px solid var(--line); border-radius:5px; padding:1px 7px;
+  cursor:pointer; font-size:11px; color:var(--muted); }
+.treadout .tr-pin:hover { background:rgba(128,128,128,.18); }
+.treadout.pinned { border-color:var(--accent, #0d6efd); }
 .tbtn { border:1px solid var(--line); background:var(--card); color:inherit;
   border-radius:6px; padding:3px 9px; cursor:pointer; font-family:inherit;
   font-size:12px; text-decoration:none; display:inline-block; }
@@ -2440,7 +2464,10 @@ _TELEMETRY_TMPL = r"""
     ['fuel', '油量(%)'],
     ['lap',  '圈']
   ];
-  // 曲线的分面配置：fix=固定量程，sym=以 0 对称（G 力）
+  // 曲线的分面配置：
+  //   fix    = 固定量程（踏板有明确的 0~100 物理含义，直接钉死）
+  //   sym    = 以 0 对称（G 力可正可负）
+  //   bounds = 物理边界：自动量程的余量**不许越过**它（否则油量轴会显示成 -3~106）
   var FACETS = [
     {k:'spd',  label:'速度',   unit:'km/h', c:'#0d6efd'},
     {k:'rpm',  label:'转速',   unit:'rpm',  c:'#e8590c'},
@@ -2449,9 +2476,11 @@ _TELEMETRY_TMPL = r"""
     {k:'gear', label:'档位',   unit:'',     c:'#7048e8'},
     {k:'glon', label:'纵向 G', unit:'g',    c:'#c2255c', sym:true},
     {k:'glat', label:'横向 G', unit:'g',    c:'#0c8599', sym:true},
-    {k:'fuel', label:'油量',   unit:'%',    c:'#f08c00'}
+    {k:'fuel', label:'油量',   unit:'%',    c:'#f08c00', bounds:[0,100]}
   ];
   var pageSize = 200, pageOff = 0, curLap = 0, rows = [], laps = [], ready = false;
+  // 十字光标要用与曲线完全相同的 Y 换算，所以把每个分面的量程/像素范围存下来
+  var scales = [], geom = null, cxRow = null, cxPinned = false;
 
   function gv(n, fb) {
     var v = getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -2478,6 +2507,8 @@ _TELEMETRY_TMPL = r"""
   function renderChart() {
     var box = el('teleChart');
     if (!box) return;
+    // 任何一次重画（切圈 / 缩放窗口 / 数据到达）都作废旧的光标读数
+    cxClear();
     if (!ready) { box.innerHTML = '<div style="padding:26px;text-align:center;color:var(--muted)">正在读取逐帧数据…</div>'; return; }
     if (!rows.length) { box.innerHTML = '<div style="padding:26px;text-align:center;color:var(--muted)">这一范围没有逐帧数据</div>'; return; }
     var W = Math.max(360, box.clientWidth || 720);
@@ -2488,6 +2519,7 @@ _TELEMETRY_TMPL = r"""
     var grid = gv('--cv-grid', 'rgba(128,128,128,.18)');
     var tcol = gv('--cv-text', 'rgba(128,128,128,.6)');
     function X(t) { return PADL + PW * (t - t0) / span; }
+    scales = [];
 
     var total = FACETS.length * (FH + GAP) + XLH;
     var s = '<svg width="' + W + '" height="' + total + '" viewBox="0 0 ' + W + ' ' + total + '">';
@@ -2512,11 +2544,22 @@ _TELEMETRY_TMPL = r"""
           if (vals[j2] < mn) mn = vals[j2];
           if (vals[j2] > mx) mx = vals[j2];
         }
-        if (mx - mn < 1e-6) { mx = mn + 1; }
-        // 上下各留 6% 余量，线不贴边
-        var pad = (mx - mn) * 0.06; mn -= pad; mx += pad;
+        // 🔴 有物理量程的量（油量 0~100%）：数据整个落在量程内时，直接用
+        //    物理量程当坐标轴。百分比就该按 0~100 看，这样两个坑一起躲开：
+        //      ① LM55 那场油量 2.83~100，留 6% 余量后轴变成 -3~106，
+        //         用户看到「油量上限 106」以为数据坏了；
+        //      ② 恒 100%（不耗油的车）走「数据无波动」兜底 → 上界 101。
+        //    数据真的越界（加满溢出、传感器跳变）时才退回自动量程，不藏数据。
+        if (f.bounds && mn >= f.bounds[0] && mx <= f.bounds[1]) {
+          mn = f.bounds[0]; mx = f.bounds[1];
+        } else {
+          if (mx - mn < 1e-6) { mx = mn + 1; }
+          // 上下各留 6% 余量，线不贴边
+          var pad = (mx - mn) * 0.06; mn -= pad; mx += pad;
+        }
       }
       var top = fi * (FH + GAP) + 13, bot = top + FH - 16;
+      scales.push({k: f.k, yi: yi, mn: mn, mx: mx, top: top, bot: bot, f: f});
       // ⚠️ 用函数表达式而不是块内 function 声明：块级函数声明在不同
       //    JS 引擎/严格模式下的作用域规则不一致，这里是循环体内，别踩。
       var Y = function (v) { return bot - (bot - top) * ((v - mn) / (mx - mn)); };
@@ -2528,7 +2571,8 @@ _TELEMETRY_TMPL = r"""
           + '" y2="' + gy + '" stroke="' + grid + '" stroke-width="1"'
           + (k === 0 ? '' : ' stroke-dasharray="3 3"') + '/>';
         s += '<text x="' + (PADL + PW + 5) + '" y="' + (+gy + 3.5)
-          + '" font-size="10" fill="' + tcol + '">' + fmtTick(f, tv) + '</text>';
+          + '" font-size="10" fill="' + tcol + '" data-k="' + f.k + '">'
+          + fmtTick(f, tv) + '</text>';
       }
       // 通道名（左上角，用本通道颜色，省掉一整个图例）
       s += '<text x="' + (PADL + 2) + '" y="' + (top - 5) + '" font-size="10.5"'
@@ -2559,7 +2603,124 @@ _TELEMETRY_TMPL = r"""
     }
     s += '</svg>';
     box.innerHTML = s;
+    // 十字光标要和曲线共用同一套坐标，这里把几何参数与量程留成模块级状态
+    geom = {W: W, H: total, PADL: PADL, PW: PW, t0: t0, span: span};
+    bindCursor(box);
   }
+
+  // —— 十字光标 + 读数条 ——
+  // 🔴 坐标换算一律走 getBoundingClientRect：SVG 里每个子节点（path/text）的
+  //    offsetX 基准不一致，直接读 offsetX 会偏。用外框算再按 viewBox 比例还原。
+  function bindCursor(box) {
+    if (box._cxBound) return;
+    box._cxBound = true;
+    box.addEventListener('mousemove', function (e) {
+      if (cxPinned) return;              // 钉住后不再跟随鼠标，方便读数
+      cxAt(e.clientX);
+    });
+    box.addEventListener('mouseleave', function () {
+      if (!cxPinned) cxClear();
+    });
+    box.addEventListener('click', function (e) {
+      if (cxPinned) { cxClear(); return; }
+      cxAt(e.clientX);
+      cxPinned = true;
+      renderReadout();
+    });
+    document.addEventListener('keydown', function (e) {
+      if ((e.key === 'Escape' || e.keyCode === 27) && cxRow !== null) cxClear();
+    });
+  }
+
+  // rows 按时间升序 → 二分找离 t 最近的采样点（不是插值：读数必须是真实落盘的帧）
+  function nearestRow(t) {
+    var lo = 0, hi = rows.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (rows[mid][IDX.t] < t) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(rows[lo - 1][IDX.t] - t) < Math.abs(rows[lo][IDX.t] - t)) lo--;
+    return lo;
+  }
+
+  function cxAt(clientX) {
+    var box = el('teleChart');
+    if (!box || !geom || !rows.length) return;
+    var svg = box.querySelector('svg');
+    if (!svg) return;
+    var r = svg.getBoundingClientRect();
+    if (!r.width) return;
+    var x = (clientX - r.left) * (geom.W / r.width);
+    var t = geom.t0 + (x - geom.PADL) / geom.PW * geom.span;
+    cxRow = nearestRow(t);
+    // 光标吸附到真实采样点上，避免「线在两点之间、数值却是其中一点」的错位感
+    drawCursor(geom.PADL + geom.PW * (rows[cxRow][IDX.t] - geom.t0) / geom.span);
+    renderReadout();
+  }
+
+  function drawCursor(x) {
+    var cv = el('teleCursor');
+    if (!cv || !geom || cxRow === null) return;
+    var row = rows[cxRow];
+    var accent = gv('--accent', '#0d6efd');
+    var s = '<line x1="' + x.toFixed(1) + '" y1="3" x2="' + x.toFixed(1) + '" y2="'
+      + (geom.H - 21) + '" stroke="' + accent
+      + '" stroke-width="1" stroke-dasharray="4 3" opacity=".8"/>';
+    for (var i = 0; i < scales.length; i++) {
+      var sc = scales[i], v = row[sc.yi];
+      if (v === null || v === undefined) continue;
+      var y = sc.bot - (sc.bot - sc.top) * ((+v - sc.mn) / (sc.mx - sc.mn));
+      // 每个分面各画一条横线 → 合起来就是「十字」
+      s += '<line x1="' + geom.PADL + '" y1="' + y.toFixed(1) + '" x2="'
+        + (geom.PADL + geom.PW) + '" y2="' + y.toFixed(1) + '" stroke="' + sc.f.c
+        + '" stroke-width="1" stroke-dasharray="2 4" opacity=".5"/>';
+      s += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="3" fill="'
+        + sc.f.c + '" stroke="' + gv('--card', '#fff') + '" stroke-width="1.2"/>';
+    }
+    var tx = Math.min(Math.max(x, 24), geom.W - 24);
+    s += '<text x="' + tx.toFixed(1) + '" y="' + (geom.H - 5)
+      + '" font-size="10" font-weight="600" text-anchor="middle" fill="' + accent + '">'
+      + rows[cxRow][IDX.t].toFixed(2) + 's</text>';
+    cv.setAttribute('viewBox', '0 0 ' + geom.W + ' ' + geom.H);
+    cv.setAttribute('width', geom.W);
+    cv.setAttribute('height', geom.H);
+    cv.innerHTML = s;
+    cv.classList.add('on');
+  }
+
+  function renderReadout() {
+    var box = el('teleReadout');
+    if (!box) return;
+    if (cxRow === null) {
+      box.className = 'treadout';
+      box.innerHTML = '<span class="trhint">把鼠标移到曲线上、或点一下曲线，'
+        + '就会出十字光标并列出该时刻的各项数值</span>';
+      return;
+    }
+    var row = rows[cxRow];
+    var out = '<span class="tr-item"><i>时间</i><b>' + fmtCell('t', row[IDX.t])
+      + '</b><em>s</em></span>';
+    for (var i = 0; i < FACETS.length; i++) {
+      var f = FACETS[i], v = row[IDX[f.k]];
+      out += '<span class="tr-item"><i>' + f.label + '</i><b style="color:' + f.c
+        + '">' + fmtCell(f.k, v) + '</b>'
+        + (f.unit ? '<em>' + f.unit + '</em>' : '') + '</span>';
+    }
+    out += '<span class="tr-item"><i>圈</i><b>' + (row[IDX.lap] || '-') + '</b></span>';
+    out += cxPinned
+      ? '<span class="tr-pin" onclick="teleCxClear()">✕ 取消钉住</span>'
+      : '<span class="trhint">点一下曲线可钉住</span>';
+    box.className = 'treadout' + (cxPinned ? ' pinned' : '');
+    box.innerHTML = out;
+  }
+
+  function cxClear() {
+    cxRow = null; cxPinned = false;
+    var cv = el('teleCursor');
+    if (cv) { cv.classList.remove('on'); cv.innerHTML = ''; }
+    renderReadout();
+  }
+  window.teleCxClear = cxClear;
 
   // —— 逐帧表格（服务端分页）——
   function renderTable(data) {
@@ -2656,13 +2817,15 @@ _TELEMETRY_TMPL = r"""
   function boot() {
     loadSeries();
     loadTable();
-    var cz = el('teleChart');
-    if (cz && window.makeZoomable) {
-      window.registerZoom('teleChart', {
+    // 🔴 这里**不**调 makeZoomable：曲线上的单击已经被「钉住十字光标读数」占用，
+    //    同一张图上再绑「点击放大」就成了一个点击两个动作。
+    //    放大改到 h2 工具条上的「⤢ 放大曲线」按钮（直接调 openZoom）。
+    if (window.registerZoom) {
+      registerZoom('teleChart', {
         title: '遥测数据 · 全通道曲线', kind: 'node', src: 'teleChart'
       });
-      makeZoomable(cz, 'teleChart');
     }
+    renderReadout();
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
