@@ -1076,8 +1076,72 @@ def _lap_no(f: dict) -> int:
     return _u16(f.get("lap"))
 
 
+def _series_cols(store: "FrameStore"):
+    """把 _frame_row 要用的各通道底层列一次抓齐，之后每行只做下标。
+
+    /csv 要给整场（实测 21 万帧）各出一行、每行取 10 个通道；表格分页走的
+    是同一条路。逐帧走 Frame.get 每行多两层函数调用，整场下来在慢一点的
+    机器上是几百毫秒。
+
+    🔴 为什么绕开 Frame 直读列是安全的：_frame_row 里每个通道的兜底都是
+       0.0（`f.get(k) or 0.0`），而列式存储在「键缺席 / 值为 null」时填的
+       正是 0.0（见 _parse_frames 的 `num[k].append(0.0)`），两条路可观测
+       结果一致。等价性由 tests/test_series_row.py 逐行锁死。
+
+    返回 None 表示有通道列取不到。按现在的字段清单这不该发生（_parse_frames
+    对 _FRAME_COL_KIND 里每个字段都无条件建列，缺值时填 0.0），所以它是一道
+    「以后有人动了字段清单」的护栏 —— 一旦有人把某个字段从清单里摘掉，
+    直读会静默给出全 0 的假数据，那比慢得多的问题严重。返回 None 时调用方
+    退回逐帧的 _frame_row（它走 Frame 的通用取值路径，会显出真实语义）。
+    """
+    num = store._num
+    axes = store._arr.get("g_force") or ()
+    try:
+        return (
+            num["t"], num["speed_kph"], num["rpm"], num["throttle"],
+            num["brake"], num["gear"], num["gas_level"], num["gas_capacity"],
+            # g[0]=纵向、g[1]=横向（与 _frame_row 的取法一致）
+            axes[0] if len(axes) > 0 else None,
+            axes[1] if len(axes) > 1 else None,
+            num["lap"],
+        )
+    except KeyError:
+        return None
+
+
+def _frame_row_at(cols, i: int, t0: float) -> list:
+    """_frame_row 的按列直读版（列序与它逐字对应）。"""
+    (t_c, sp_c, rpm_c, th_c, bk_c, gr_c, gl_c, gc_c,
+     g_lon_c, g_lat_c, lap_c) = cols
+    cap = gc_c[i]
+    fuel = round(gl_c[i] / cap * 100.0, 1) if cap else None
+    return [
+        round(t_c[i] - t0, 3),
+        round(sp_c[i], 1),
+        int(round(rpm_c[i])),                        # 转速取整：曲线/表格都不要小数
+        round(th_c[i] * 100, 0),
+        round(bk_c[i] * 100, 0),
+        int(gr_c[i]),
+        round(g_lat_c[i] if g_lat_c is not None else 0.0, 2),   # 横向 G
+        round(g_lon_c[i] if g_lon_c is not None else 0.0, 2),   # 纵向 G
+        fuel,
+        _u16(lap_c[i]),
+    ]
+
+
+def _row_builder(store: "FrameStore", t0: float):
+    """返回 row(frame) -> list。能按列直读就给快路，否则退回逐帧实现。"""
+    cols = _series_cols(store)
+    if cols is None:
+        return lambda f: _frame_row(f, t0)
+    return lambda f: _frame_row_at(cols, f._i, t0)
+
+
 def _frame_row(f: dict, t0: float) -> list:
-    """把一帧压成一行（列顺序见 _SERIES_COLS）。"""
+    """把一帧压成一行（列顺序见 _SERIES_COLS）。
+
+    走 Frame 的通用取值路径 —— 慢路，也是 _frame_row_at 的语义基准。
+    """
     g = f.get("g_force") or [0.0, 0.0, 0.0]
     return [
         round((f.get("t") or 0.0) - t0, 3),
@@ -1168,10 +1232,11 @@ def session_series(path: Path, lap_no: int | None = None,
             return {"error": f"第 {lap_no} 圈没有可用数据"}
     t0 = _scope_t0(scope, sess_t0, lap_no)
     step = max(1, int(math.ceil(len(scope) / max(1, max_points))))
-    rows = [_frame_row(f, t0) for f in scope[::step]]
+    row = _row_builder(store, t0)
+    rows = [row(f) for f in scope[::step]]
     # 抽稀会漏掉最后一帧，补上——否则曲线右端「差一截」，看着像数据断了
     if scope and (len(scope) - 1) % step:
-        rows.append(_frame_row(scope[-1], t0))
+        rows.append(row(scope[-1]))
     return {
         "cols": _SERIES_COLS,
         "rows": rows,
@@ -1201,9 +1266,10 @@ def session_frames(path: Path, offset: int = 0, limit: int = 200,
     offset = max(0, int(offset or 0))
     limit = max(1, min(int(limit or 200), 1000))
     page = fr[offset:offset + limit]
+    row = _row_builder(store, t0)
     return {
         "cols": _SERIES_COLS,
-        "rows": [_frame_row(f, t0) for f in page],
+        "rows": [row(f) for f in page],
         "offset": offset, "limit": limit, "total": total,
         "lap": lap_no or 0,
     }
@@ -1218,8 +1284,9 @@ def session_csv(path: Path, lap_no: int | None = None) -> str:
     head = ("时间(s),速度(km/h),转速(rpm),油门(%),刹车(%),档位,"
             "横向G,纵向G,油量(%),圈号")
     out = [head]
+    row = _row_builder(store, t0)
     for f in fr:
-        r = _frame_row(f, t0)
+        r = row(f)
         out.append(",".join("" if v is None else str(v) for v in r))
     return "\n".join(out) + "\n"
 
