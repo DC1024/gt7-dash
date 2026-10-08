@@ -43,7 +43,8 @@ _SHARED_SECTIONS = [
     ("单圈行车轨迹", "## 单圈行车轨迹", "## 圈间对比自选两圈"),
     ("圈间对比自选两圈", "## 圈间对比自选两圈", "## 赛道自动识别"),
     ("赛道自动识别", "## 赛道自动识别", "## 驾驶事件时间线"),
-    ("驾驶事件时间线", "## 驾驶事件时间线", "## 使用示例"),
+    ("驾驶事件时间线", "## 驾驶事件时间线", "## 进站与名次"),
+    ("进站与名次", "## 进站与名次", "## 使用示例"),
 ]
 
 
@@ -102,6 +103,18 @@ def test_events_row_in_both_tables(embedded, doc_file):
     for text in (embedded, doc_file):
         assert "off_track` 由走线偏差主导" in text
         assert "冷路径 ~10s" in text
+
+
+def test_pitstops_row_in_both_tables(embedded, doc_file):
+    row = ("| `GET /api/v1/sessions/<文件名>/pitstops` | "
+           "**进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |")
+    assert row in embedded, "内嵌文档缺 /pitstops 表格行"
+    assert row in doc_file, "API文档.md 缺 /pitstops 表格行"
+    for text in (embedded, doc_file):
+        # 两个关键诚实声明：电车不检测加油；轮胎磨损协议里没有
+        assert "电车**不检测**" in text
+        assert "轮胎磨损广播协议里没有" in text
+        assert "当前名次" in text
 
 
 def test_ref_lap_param_mentions_cmp_lap(embedded, doc_file):

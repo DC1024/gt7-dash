@@ -297,6 +297,10 @@ _FRAME_COL_KIND: dict[str, str] = {
     "throttle": "n", "brake": "n", "gear": "n",
     "car_x": "n", "car_z": "n",
     "gas_level": "n", "gas_capacity": "n", "car_code": "n",
+    # 🔴 比赛进行中 quali_pos(0x84) = **当前名次**（逐帧实时变）——进站与名次
+    #    时间线卡（/pitstops）的唯一名次来源。此前全库无人读所以没存；
+    #    加入后老场次照样能读出（recorder 落盘就有该字段）。
+    "quali_pos": "n",
     "g_force": "a",
     # 四轮角速度（rad/s，顺序 前左/前右/后左/后右）。
     # 只有它是「车轮实际转多快」的唯一来源 —— 车身速度传感器测不出空转和抱死，
@@ -1785,6 +1789,152 @@ def session_events(path: Path, lap_no: int | None = None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 进站策略与名次（stint 分析 / 进站检测 / 实时名次时间线）
+# ---------------------------------------------------------------------------
+
+def _pit_compute(path: Path, grouped: dict, laps_list: list) -> dict[str, Any]:
+    """session_pitstops 的慢路径（结果由调用方记忆化）。"""
+    # 动力类型：gas_capacity == 0 → 纯电（与 recorder.classify_powertrain 同判据）。
+    # 电车的 gas_level 是剩余电量 kWh，进站**不加油**，环跳判据不成立。
+    # 取全场最常见容量（个别帧可能缺席）。
+    caps = [f.get("gas_capacity") for fs in grouped.values() for f in fs]
+    caps = [c for c in caps if c is not None]
+    cap = max(set(caps), key=caps.count) if caps else None
+    is_ev = (cap is not None and cap <= 1e-3)
+
+    lap_nos = sorted(grouped.keys())
+    pitstops: list[dict[str, Any]] = []
+    stints: list[dict[str, Any]] = []
+
+    # —— 进站检测：油量环跳（🔴 电车不检测：进站不加油，电量回升可能来自
+    #    再生回充等与进站无关的语义，环跳判据不成立）——
+    # 油量只会单调下降（消耗），唯一的大幅上升就是进站加油。
+    # 本场实测：2.84 → 100.0 的一次环跳 = 进站加油，判据干净。
+    PIT_JUMP = 5.0     # 比上一帧高出 5%（或 5 个单位）以上判为加油
+    prev_gas = None
+    prev_lap = None
+    prev_t = None
+    if not is_ev:
+        for ln in lap_nos:
+            for f in grouped[ln]:
+                g = f.get("gas_level")
+                t = f.get("t") or 0.0
+                if g is not None and prev_gas is not None \
+                        and g - prev_gas > PIT_JUMP:
+                    pitstops.append({
+                        "lap": int(ln),          # 出站圈（加油后第一帧所在圈）
+                        "prev_lap": int(prev_lap) if prev_lap else int(ln),
+                        "t_rel": round(t - (grouped[ln][0].get("t") or t), 3),
+                        "before": round(prev_gas, 2),
+                        "after": round(g, 2),
+                    })
+                if g is not None:
+                    prev_gas, prev_lap, prev_t = g, ln, t
+
+    # —— stint 切分：进站点把圈序列切段 ——
+    # 每段：起止圈 / 帧跨度时长 / 段首段末油量 / 段内均耗。
+    # （进站帧落在出站圈，所以该圈属于**新段**——段界 = 进站帧所在圈。）
+    cut_laps = {p["lap"] for p in pitstops}
+    segs: list[list[int]] = []
+    cur: list[int] = []
+    for ln in lap_nos:
+        if ln in cut_laps and cur:
+            segs.append(cur)
+            cur = []
+        cur.append(ln)
+    if cur:
+        segs.append(cur)
+    for i, seg in enumerate(segs):
+        fs = [f for ln in seg for f in grouped[ln]]
+        if not fs:
+            continue
+        gs = [f.get("gas_level") for f in fs if f.get("gas_level") is not None]
+        g_start, g_end = (gs[0], gs[-1]) if gs else (None, None)
+        used = (g_start - g_end) if (g_start is not None and g_end is not None) \
+            else None
+        dur = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+        stints.append({
+            "stint": i + 1,
+            "from_lap": int(seg[0]), "to_lap": int(seg[-1]),
+            "laps": len(seg),
+            "dur_s": round(dur, 1),
+            "gas_start": g_start, "gas_end": g_end,
+            "fuel_used": round(used, 2) if used is not None else None,
+            "fuel_per_lap": (round(used / len(seg), 2)
+                             if used is not None and seg else None),
+            # 该段是不是从进站出来的（第一段 = 起步，不算进站后）
+            "after_stop": i > 0,
+        })
+
+    # —— 实时名次：quali_pos(0x84) 在比赛中 = 当前名次（逐帧变化）——
+    # 取每帧的有效名次（1..numCars；0/65535/None 是菜单态哨兵），相邻变化
+    # 即超车 / 被超事件。t_rel 相对该圈起点，与 /series?lap=N、/events 同基准。
+    positions: list[dict[str, Any]] = []
+    pos_events: list[dict[str, Any]] = []
+    prev_pos = None
+    for ln in lap_nos:
+        fs = grouped[ln]
+        t0 = fs[0].get("t") or 0.0
+        for f in fs:
+            v = f.get("quali_pos")
+            if not v or v >= 65000:
+                continue
+            if v != prev_pos:
+                e = {"lap": int(ln), "pos": int(v),
+                     "t_rel": round((f.get("t") or t0) - t0, 3)}
+                if prev_pos is not None:
+                    e["from"] = int(prev_pos)
+                    # 正 = 被超（名次数字变大），负 = 超车
+                    e["delta"] = int(v - prev_pos)
+                pos_events.append(e)
+                prev_pos = v
+        if prev_pos is not None:
+            positions.append({"lap": int(ln), "pos": int(prev_pos)})
+    return {
+        "available": True,
+        "powertrain": "electric" if is_ev else "fuel",
+        "pitstops": pitstops,
+        "stints": stints,
+        "positions": positions,
+        "pos_events": pos_events,
+        "laps_list": [int(x["lap"]) for x in laps_list],
+        "lap_durs": {int(ln): round(grouped[ln][-1].get("t")
+                                    - grouped[ln][0].get("t"), 3)
+                     for ln in lap_nos if len(grouped[ln]) >= 2},
+    }
+
+
+def session_pitstops(path: Path) -> dict[str, Any]:
+    """进站策略与名次：进站检测 / stint 分析 / 实时名次时间线。
+
+    三块数据一次算完（全部来自广播已有的帧字段，不依赖协议没有的东西）：
+      · 进站 = 油量环跳（gas_level 比上一帧高 >5）。GT7 油量只会单调消耗，
+        唯一的大幅上升就是进站加油；电车（gas_capacity==0）不检测。
+      · stint = 进站点切开的连续跑段，每段给起止圈 / 均耗。
+      · 名次 = quali_pos(0x84) 在比赛中是**当前名次**（逐帧实时变，实测
+        1~20 全出现、49 次变化）；0/65535 是菜单态哨兵，跳过。
+
+    🔴 结果按场次记忆化（全场帧遍历一遍，冷 ~0.3s），命中 0ms。
+    """
+    try:
+        laps_list, grouped, _ = _valid_laps(path)
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+    if not grouped:
+        return {"available": False, "reason": "no frames"}
+    _, store = _load_frames(path)
+    if not store:
+        return {"available": False, "reason": "no frames"}
+    memo = store._memo
+    key = ("pitstops",)
+    hit = memo.get(key)
+    if hit is None:
+        hit = _pit_compute(path, grouped, laps_list)
+        memo[key] = hit
+    return hit
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -2041,6 +2191,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
+| `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -2257,6 +2408,31 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
   首屏串行链路。
 - `evidence` 里 `tyre_abuse` 的 `四轮胎温_C` 恒为 `[0,0,0,0]`（占位：
   列式存储没存胎温），别当真；`spin` 的 `方向`（转向角）数据里没有，恒 0。
+
+## 进站与名次
+
+`GET /api/v1/sessions/<文件名>/pitstops` —— 进站检测 / stint 分析 /
+实时名次时间线，三块一次算完（全场帧遍历一遍 ~0.3s，结果记忆化）。
+
+| 字段 | 说明 |
+|---|---|
+| `powertrain` | `fuel` / `electric`（按全场 `gas_capacity` 众数判定；电车 `gas_capacity==0`） |
+| `pitstops[]` | `{lap(出站圈), prev_lap, t_rel(相对出站圈起点), before, after}`；判据 = 油量比上一帧高 >5 |
+| `stints[]` | 进站切开的跑段：`{stint, from_lap, to_lap, laps, dur_s, gas_start, gas_end, fuel_used, fuel_per_lap, after_stop}` |
+| `positions[]` | 每圈末名次 `{lap, pos}`（画时间线的骨架） |
+| `pos_events[]` | 名次逐帧变化：`{lap, pos, t_rel, from, delta}`；`delta<0` 超车、`>0` 被超；首个事件无 `from` |
+| `laps_list[]` / `lap_durs{}` | 有效圈号清单 / 每圈时长（秒） |
+
+- 🔴 **进站判据是油量环跳**：GT7 油量只会单调消耗（进站加油才会大幅上升）。
+  遍历范围是 `clean_laps` 的有效圈——菜单态/离场段的「油量重置回满」
+  （场次结束后 gas 回 100）**不会**被误判成进站。电车**不检测**——进站不
+  加油，电量回升可能来自再生回充，环跳判据不成立。
+- 🔴 **名次来自 `quali_pos`(0x84)**：比赛进行中它是**当前名次**（逐帧实时变，
+  实测一场 1~20 名全出现、49 次变化），不是排位成绩；0/65535 是菜单态哨兵。
+  真正的发车位在接收器开跑瞬间的快照 `grid_start` 里。
+- 🔴 **轮胎磨损广播协议里没有**（296 字节包无 wear 字段），这张卡**不含换胎
+  判定**——轮胎寿命请看游戏内 HUD 自行判断。胎温（`tyre_temp`）协议里有，
+  但列式存储未存、且温度 ≠ 磨损，不要拿它当磨损用。
 
 ## 使用示例
 
@@ -2713,7 +2889,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     or path.endswith("/csv") or path.endswith("/raceline")
                     or path.endswith("/sectors") or path.endswith("/slip")
                     or path.endswith("/deviation") or path.endswith("/track")
-                    or path.endswith("/events")):
+                    or path.endswith("/events") or path.endswith("/pitstops")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
@@ -2785,6 +2961,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif path.endswith("/events"):
                     self._send_json(session_events(target, lap_no=lap_no),
                                     cors=True)
+                elif path.endswith("/pitstops"):
+                    self._send_json(session_pitstops(target), cors=True)
                 elif path.endswith("/csv"):
                     body = session_csv(target, lap_no=lap_no).encode("utf-8")
                     fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"
@@ -4819,6 +4997,203 @@ _EVENTS_TMPL = r"""
 """
 
 
+# 场次详情页的「进站与名次」卡片。
+#
+# 数据来自 /api/v1/sessions/<名>/pitstops（全场帧遍历一遍 ~0.3s，服务端记忆化）。
+# 三块：stint 表（进站切开的跑段）、名次时间线 SVG（quali_pos 逐帧实时名次）、
+# 名次变化明细（超车/被超）。点变化点或明细行 → telePinAt 联动遥测。
+# 🔴 轮胎磨损广播协议里没有（296 字节包无 wear 字段），所以这张卡不含
+#    换胎判定——只有油量环跳给出的进站事实。
+_PIT_TMPL = r"""
+<div class="card" id="cardPit">
+  <h2>进站与名次
+    <span id="pitMeta" style="float:right;font-weight:400;color:var(--muted);text-transform:none"></span>
+  </h2>
+  <div id="pitBody"><p class="an-note">正在分析进站与名次…</p></div>
+</div>
+
+<script>
+// ---------- 场次详情页 · 进站与名次 ----------
+(function () {
+  var FILE = '__FILE__';
+  var API = '/api/v1/sessions/' + encodeURIComponent(FILE);
+  var PIT = null;
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function f2(v) { return v == null ? '-' : (+v).toFixed(2); }
+  function f1(v) { return v == null ? '-' : (+v).toFixed(1); }
+
+  function stintTable() {
+    var st = PIT.stints || [];
+    if (!st.length) return '';
+    var h = '<p class="an-note">按进站切开的跑段（stint）：'
+      + '<b>均耗</b> = 该段油量差 ÷ 圈数；油量受引擎工况影响逐圈有波动，'
+      + '这里取段内平均。</p>'
+      + '<div class="an-wrap"><table class="an-table"><thead><tr>'
+      + '<th>段</th><th>圈</th><th>圈数</th><th>时长</th>'
+      + '<th>段首油量</th><th>段末油量</th><th>段内均耗</th></tr></thead><tbody>';
+    for (var i = 0; i < st.length; i++) {
+      var x = st[i];
+      h += '<tr><td>' + x.stint + (x.after_stop ? ' <span class="an-d">进站后</span>' : '')
+        + '</td>'
+        + '<td class="num">' + x.from_lap + '–' + x.to_lap + '</td>'
+        + '<td class="num">' + x.laps + '</td>'
+        + '<td class="num">' + f1(x.dur_s) + 's</td>'
+        + '<td class="num">' + f2(x.gas_start) + '</td>'
+        + '<td class="num">' + f2(x.gas_end) + '</td>'
+        + '<td class="num">' + (x.fuel_per_lap != null ? f2(x.fuel_per_lap) : '-')
+        + '</td></tr>';
+    }
+    return h + '</tbody></table></div>';
+  }
+
+  function pitList() {
+    var ps = PIT.pitstops || [];
+    if (!ps.length) {
+      return '<p class="an-note">本场<b>没有检测到进站加油</b>'
+        + '（油量全程单调下降）。换胎窗口无法从遥测判断——'
+        + 'GT7 广播协议不含轮胎磨损字段。</p>';
+    }
+    var h = '<p class="an-note">检测到 <b>' + ps.length + ' 次进站</b>'
+      + '（油量环跳 &gt;5% 判定；点行跳到遥测对应时刻）：</p>'
+      + '<div class="an-wrap"><table class="an-table"><thead><tr>'
+      + '<th>#</th><th>出站圈</th><th>时刻（圈内秒）</th>'
+      + '<th>加油前</th><th>加油后</th></tr></thead><tbody>';
+    for (var i = 0; i < ps.length; i++) {
+      var p = ps[i];
+      h += '<tr class="ev-row" onclick="pitPin(' + p.lap + ',' + p.t_rel + ')">'
+        + '<td class="num">' + (i + 1) + '</td>'
+        + '<td class="num">第 ' + p.lap + ' 圈</td>'
+        + '<td class="num">' + f2(p.t_rel) + 's</td>'
+        + '<td class="num">' + f2(p.before) + '</td>'
+        + '<td class="num" style="color:var(--ok)">' + f2(p.after) + '</td></tr>';
+    }
+    return h + '</tbody></table></div>';
+  }
+
+  // 名次时间线：x = 圈，y = 名次（P1 在顶）。
+  // 🔴 名次来自 quali_pos(0x84)——比赛进行中它是**当前名次**（逐帧实时变），
+  //    不是排位成绩。变化点：delta<0 超车（绿）/ >0 被超（红）。
+  function posChart() {
+    var evs = (PIT.pos_events || []).filter(function (e) {
+      return e.from != null;
+    });
+    if (!evs.length) return '';
+    var W = 1000, H = 150, PADL = 44, PADR = 16, PADT = 14, PADB = 24;
+    var laps = PIT.laps_list || [];
+    if (laps.length < 2) return '';
+    var lmin = laps[0], lmax = laps[laps.length - 1];
+    var mxPos = 1;
+    for (var i = 0; i < evs.length; i++) {
+      mxPos = Math.max(mxPos, evs[i].from, evs[i].pos);
+    }
+    function X(lap) { return PADL + (lap - lmin) / (lmax - lmin) * (W - PADL - PADR); }
+    function Y(p) { return PADT + (p - 1) / Math.max(1, mxPos - 1) * (H - PADT - PADB); }
+    var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto">'
+      + '<rect x="' + PADL + '" y="' + PADT + '" width="' + (W - PADL - PADR)
+      + '" height="' + (H - PADT - PADB) + '" fill="rgba(128,128,128,.06)" rx="4"/>';
+    for (var p = 1; p <= mxPos; p++) {
+      s += '<line x1="' + PADL + '" y1="' + Y(p) + '" x2="' + (W - PADR)
+        + '" y2="' + Y(p) + '" stroke="rgba(128,128,128,.15)" stroke-width="1"/>'
+        + '<text x="' + (PADL - 6) + '" y="' + (Y(p) + 3) + '" font-size="10"'
+        + ' text-anchor="end" fill="var(--muted)">P' + p + '</text>';
+    }
+    for (var k = 0; k < laps.length; k++) {
+      var lv = laps[k];
+      if ((lv - lmin) % Math.ceil((lmax - lmin) / 10) === 0) {
+        s += '<text x="' + X(lv) + '" y="' + (H - 6) + '" font-size="10"'
+          + ' text-anchor="middle" fill="var(--muted)">' + lv + '</text>';
+      }
+    }
+    // 进站圈画竖虚线
+    var ps = PIT.pitstops || [];
+    for (var q = 0; q < ps.length; q++) {
+      s += '<line x1="' + X(ps[q].lap) + '" y1="' + PADT + '" x2="' + X(ps[q].lap)
+        + '" y2="' + (H - PADB) + '" stroke="var(--warn)" stroke-width="1"'
+        + ' stroke-dasharray="3 3" opacity=".6"/>';
+    }
+    for (var j = 0; j < evs.length; j++) {
+      var e = evs[j];
+      var c = e.delta < 0 ? 'var(--ok)' : 'var(--bad)';
+      s += '<line x1="' + X(e.lap) + '" y1="' + Y(e.from) + '" x2="' + X(e.lap)
+        + '" y2="' + Y(e.pos) + '" stroke="' + c + '" stroke-width="2"/>'
+        + '<circle cx="' + X(e.lap) + '" cy="' + Y(e.pos) + '" r="3.5" fill="' + c
+        + '" stroke="var(--card)" stroke-width="1" class="pit-dot"'
+        + ' data-lap="' + e.lap + '" data-t="' + e.t_rel + '"/>'
+        + '<circle cx="' + X(e.lap) + '" cy="' + Y(e.from) + '" r="2.5" fill="none"'
+        + ' stroke="' + c + '" stroke-width="1"/>';
+    }
+    return s + '</svg>';
+  }
+
+  function posTable() {
+    var evs = (PIT.pos_events || []).filter(function (e) {
+      return e.from != null;
+    });
+    if (!evs.length) {
+      return '<p class="an-note">全场名次没有变化。</p>';
+    }
+    var h = '<p class="an-note">名次变化明细（<b style="color:var(--ok)">超车</b> / '
+      + '<b style="color:var(--bad)">被超</b>；点行跳到遥测对应时刻）：</p>'
+      + '<div class="an-wrap" style="max-height:220px"><table class="an-table"><thead><tr>'
+      + '<th>圈</th><th>时刻</th><th>变化</th><th>类型</th></tr></thead><tbody>';
+    for (var i = 0; i < evs.length; i++) {
+      var e = evs[i];
+      var over = e.delta < 0;
+      h += '<tr class="ev-row" onclick="pitPin(' + e.lap + ',' + e.t_rel + ')">'
+        + '<td class="num">第 ' + e.lap + ' 圈</td>'
+        + '<td class="num">' + f2(e.t_rel) + 's</td>'
+        + '<td class="num">P' + e.from + ' → P' + e.pos + '</td>'
+        + '<td style="color:' + (over ? 'var(--ok)' : 'var(--bad)') + '">'
+        + (over ? '▲ 超车' : '▼ 被超') + '</td></tr>';
+    }
+    return h + '</tbody></table></div>';
+  }
+
+  window.pitPin = function (lap, tRel) {
+    if (window.telePinAt) window.telePinAt(lap, tRel);
+  };
+
+  function render() {
+    var card = el('cardPit'), box = el('pitBody'), meta = el('pitMeta');
+    if (!card || !box) return;
+    if (!PIT || PIT.available === false) {
+      card.style.display = 'none';
+      return;
+    }
+    var ps = PIT.pitstops || [];
+    if (meta) {
+      meta.textContent = (PIT.powertrain === 'electric' ? '电车（不检测加油） · ' : '')
+        + ps.length + ' 次进站 · ' + (PIT.laps_list || []).length + ' 圈';
+    }
+    box.innerHTML = pitList() + stintTable()
+      + '<p class="an-note" style="margin-top:12px">名次时间线（虚线 = 进站圈；'
+      + '名次来自比赛中的实时排名，点变化点跳遥测）：</p>'
+      + posChart() + posTable();
+  }
+
+  function pitFetchFail() {
+    var meta = el('pitMeta'), box = el('pitBody');
+    if (meta) meta.textContent = '读取失败';
+    if (box) box.innerHTML = '<p class="an-note">进站数据请求失败（见控制台）。</p>';
+  }
+
+  function boot() {
+    fetch(API + '/pitstops').then(function (r) { return r.json(); })
+      .then(function (d) { PIT = d; render(); }, pitFetchFail);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else { boot(); }
+})();
+</script>
+"""
+
+
 # 场次详情页的「遥测数据」卡片：逐帧原始数据可视化 + 分页表 + CSV 导出。
 #
 # 背景：接收器本来就逐帧把四十几个字段写进了 jsonl，但旧版详情页只把它
@@ -5583,6 +5958,7 @@ window.trackRen = function (id) {{
                        # 两个 IIFE 都是 DOMContentLoaded 前定义，顺序只影响
                        # 卡片视觉位置，不影响函数可用性。
                        + _EVENTS_TMPL.replace('__FILE__', js_file)
+                       + _PIT_TMPL.replace('__FILE__', js_file)
                        + _TELEMETRY_TMPL.replace('__FILE__', js_file))
 
 
@@ -6238,6 +6614,8 @@ th { color:var(--muted); font-weight:500; }
       <div class="laplist" id="lapList"></div>
       <div id="fuelStrategy" style="margin-top:9px;font-size:12.5px;
         color:var(--muted)"></div>
+      <div id="pitWindow" style="margin-top:5px;font-size:12.5px;
+        color:var(--muted)"></div>
     </div>
 
     <div class="card" id="c-gball">
@@ -6784,6 +7162,37 @@ function render(s) {
   } else if (lf.length >= 1) {
     fs2.textContent = '已跑 ' + lf.length + ' 圈 · 均耗 '
       + (lf.reduce((a, x) => a + Math.max(0, x[1]), 0) / lf.length).toFixed(1) + perUnit + '/圈';
+  }
+
+  // —— 进站窗口（纯油量口径）——
+  // 🔴 只由「油量 ÷ 均耗」给出最晚进站圈。轮胎磨损广播协议里没有
+  //    （296 字节包无 wear 字段），**不给假轮胎窗口**——轮胎寿命请看
+  //    游戏 HUD 自行判断。油车 canStrategy 成立才显示；电车不加油，
+  //    电量是否够跑完已在上面的策略行里，这里留空。
+  const pw = $('pitWindow');
+  if (pw) {
+    if (canStrategy && !isEV && avg > 0 && typeof L.gas_level === 'number') {
+      const lapsLeft = L.gas_level / avg;          // 还能跑几圈（含小数）
+      const full = Math.floor(lapsLeft);           // 能完整跑完的圈数
+      let txt, col;
+      if (L.laps_in_race > 0 && L.lap + lapsLeft >= L.laps_in_race) {
+        txt = '✅ 油量足够跑完剩余 ' + (L.laps_in_race - L.lap + 1) + ' 圈，无需进站';
+        col = 'var(--ok)';
+      } else if (full <= 0) {
+        txt = '🛑 油量撑不完一圈 → 立即进站！';
+        col = 'var(--bad)';
+      } else {
+        // 最晚进站圈 = 当前圈 + 可跑圈数 − 1：留一圈跑进站圈本身，
+        // 且保证出站后的油能撑到比赛结束（油够时上面已判「无需进站」）。
+        txt = '🛞 油量可跑 ' + full + ' 圈 · 最晚第 ' + (L.lap + full - 1)
+          + ' 圈前进站';
+        col = full <= 1 ? 'var(--bad)' : full <= 3 ? 'var(--warn)' : 'inherit';
+      }
+      pw.innerHTML = '进站窗口：' + txt;
+      pw.style.color = col;
+    } else {
+      pw.textContent = '';
+    }
   }
 
   // —— 每圈圈速列表（新圈在上，最快圈标绿★）——

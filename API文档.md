@@ -138,6 +138,7 @@
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 | `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
+| `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -354,6 +355,31 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
   首屏串行链路。
 - `evidence` 里 `tyre_abuse` 的 `四轮胎温_C` 恒为 `[0,0,0,0]`（占位：
   列式存储没存胎温），别当真；`spin` 的 `方向`（转向角）数据里没有，恒 0。
+
+## 进站与名次
+
+`GET /api/v1/sessions/<文件名>/pitstops` —— 进站检测 / stint 分析 /
+实时名次时间线，三块一次算完（全场帧遍历一遍 ~0.3s，结果记忆化）。
+
+| 字段 | 说明 |
+|---|---|
+| `powertrain` | `fuel` / `electric`（按全场 `gas_capacity` 众数判定；电车 `gas_capacity==0`） |
+| `pitstops[]` | `{lap(出站圈), prev_lap, t_rel(相对出站圈起点), before, after}`；判据 = 油量比上一帧高 >5 |
+| `stints[]` | 进站切开的跑段：`{stint, from_lap, to_lap, laps, dur_s, gas_start, gas_end, fuel_used, fuel_per_lap, after_stop}` |
+| `positions[]` | 每圈末名次 `{lap, pos}`（画时间线的骨架） |
+| `pos_events[]` | 名次逐帧变化：`{lap, pos, t_rel, from, delta}`；`delta<0` 超车、`>0` 被超；首个事件无 `from` |
+| `laps_list[]` / `lap_durs{}` | 有效圈号清单 / 每圈时长（秒） |
+
+- 🔴 **进站判据是油量环跳**：GT7 油量只会单调消耗（进站加油才会大幅上升）。
+  遍历范围是 `clean_laps` 的有效圈——菜单态/离场段的「油量重置回满」
+  （场次结束后 gas 回 100）**不会**被误判成进站。电车**不检测**——进站不
+  加油，电量回升可能来自再生回充，环跳判据不成立。
+- 🔴 **名次来自 `quali_pos`(0x84)**：比赛进行中它是**当前名次**（逐帧实时变，
+  实测一场 1~20 名全出现、49 次变化），不是排位成绩；0/65535 是菜单态哨兵。
+  真正的发车位在接收器开跑瞬间的快照 `grid_start` 里。
+- 🔴 **轮胎磨损广播协议里没有**（296 字节包无 wear 字段），这张卡**不含换胎
+  判定**——轮胎寿命请看游戏内 HUD 自行判断。胎温（`tyre_temp`）协议里有，
+  但列式存储未存、且温度 ≠ 磨损，不要拿它当磨损用。
 
 ## 使用示例
 
