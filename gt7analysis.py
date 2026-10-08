@@ -1018,6 +1018,151 @@ def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
     return out
 
 
+# —— 赛道指纹（自动识别赛道） ————————————————
+
+_FP_POINTS = 200        # 描述子点数：等弧长重采样
+_FP_LEN_TOL = 0.05      # 代表圈圈长容差（相对中位数）
+_FP_MIN_PTS = 100       # 一圈至少多少个有效坐标点才参与
+
+
+def _fp_path_len(pts: list[tuple[float, float]]) -> float:
+    """几何路径长度（米）——注意是**坐标折线**长度，不是速度积分距离。
+
+    出赛道/打转会让折线长度明显变大；残缺圈则偏短。两者都能被
+    「圈长相对中位数 ±tol」这道过滤拦住（与 sector_times 的残缺圈过滤同源）。
+    """
+    return sum(math.dist(pts[i - 1], pts[i]) for i in range(1, len(pts)))
+
+
+def _fp_resample(pts: list[tuple[float, float]], n: int):
+    """等弧长重采样成 n 个点。总长 <=0 返回 None。"""
+    cum = [0.0]
+    for i in range(1, len(pts)):
+        cum.append(cum[-1] + math.dist(pts[i - 1], pts[i]))
+    total = cum[-1]
+    if total <= 0:
+        return None
+    out = []
+    j = 0
+    for k in range(n):
+        target = total * k / n
+        while j + 1 < len(cum) and cum[j + 1] < target:
+            j += 1
+        if j + 1 >= len(cum):
+            out.append(pts[-1])
+            continue
+        seg = cum[j + 1] - cum[j]
+        w = 0.0 if seg <= 0 else (target - cum[j]) / seg
+        (x0, z0), (x1, z1) = pts[j], pts[j + 1]
+        out.append((x0 + (x1 - x0) * w, z0 + (z1 - z0) * w))
+    return out
+
+
+def _fp_signed_area(pts) -> float:
+    """带符号面积：正 = 逆时针，负 = 顺时针（鞋带公式）。"""
+    s = 0.0
+    for i in range(len(pts)):
+        x0, z0 = pts[i - 1]
+        x1, z1 = pts[i]
+        s += x0 * z1 - x1 * z0
+    return s / 2.0
+
+
+def _fp_normalize(pts):
+    """归一化：质心对齐 → RMS 半径归一 → 起点旋到 +X → 绕行方向统一逆时针。
+
+    🔴 起点对齐**不需要旋转搜索**：同一赛道上车永远从同一物理位置过线，
+       所以两个场次的起点天然对应。这是这套指纹又快又稳的前提；
+       track_deviation 的 start_gap 护栏依赖的是同一前提。
+       反向跑（同一条赛道反方向）在「镜像成逆时针」那步被拉齐——
+       形状相同就命中同一条，想区分看 meta.turns_cw。
+    """
+    n = len(pts)
+    cx = sum(p[0] for p in pts) / n
+    cz = sum(p[1] for p in pts) / n
+    c = [(x - cx, z - cz) for x, z in pts]
+
+    area = _fp_signed_area(c)
+    turns_cw = area < 0
+    if turns_cw:
+        c = [(x, -z) for x, z in c]
+
+    rms = math.sqrt(sum(x * x + z * z for x, z in c) / n)
+    if rms <= 0:
+        return None, None
+    c = [(x / rms, z / rms) for x, z in c]
+
+    sx, sz = c[0]
+    ang = math.atan2(sz, sx)
+    ca, sa = math.cos(-ang), math.sin(-ang)
+    c = [(x * ca - z * sa, x * sa + z * ca) for x, z in c]
+
+    meta = {"turns_cw": turns_cw, "rms_radius": None}
+    return c, meta
+
+
+def track_fingerprint(grouped: dict[int, list[dict]],
+                      n_points: int = _FP_POINTS,
+                      tol: float = _FP_LEN_TOL) -> dict:
+    """从按圈分组的帧里提取**赛道形状指纹**（自动识别赛道用）。
+
+    GT7 协议不下发赛道名（jsonl 表头 circuit 恒为 null），但轨迹形状稳定：
+    同一赛道两个场次的归一化指纹 RMS 距离 ~0.006，不同赛道最近也有 ~0.24
+    （7 场实测，间隔 43 倍）——阈值好定，识别可靠。
+
+    代表圈挑选（两道过滤，与 sector_times / track_deviation 同源）：
+      1. 圈长（坐标折线长度）相对中位数 ±tol —— 挡掉出赛道/打转/残缺圈；
+         中位数不取最大值，理由见 sector_times。
+      2. 幸存圈里挑**用时最短**的——最快圈走线最干净，最能代表赛道形状。
+
+    返回 {desc: [[x,z]×n_points], ref_len_m, turns_cw, lap, n_laps, n_full}
+    或 {error}。desc 已归一化，与平移/尺度/旋转/绕行方向无关。
+    """
+    if not grouped:
+        return {"error": "没有可用的圈"}
+    info = []
+    for lap_no, fs in grouped.items():
+        pts = [(f.get("car_x"), f.get("car_z")) for f in fs]
+        pts = [(x, z) for x, z in pts if x is not None and z is not None]
+        if len(pts) < _FP_MIN_PTS:
+            continue
+        ln = _fp_path_len(pts)
+        if len(fs) < 2 or fs[-1].get("t") is None or fs[0].get("t") is None:
+            continue
+        dur = (fs[-1]["t"] or 0.0) - (fs[0]["t"] or 0.0)
+        if ln <= 0 or dur <= 0:
+            continue
+        info.append((lap_no, pts, ln, dur))
+    if not info:
+        return {"error": "没有足够长的圈"}
+
+    lens = sorted(i[2] for i in info)
+    ref = lens[len(lens) // 2]
+    full = [i for i in info if abs(i[2] - ref) <= ref * tol]
+    if not full:
+        full = info
+    lap_no, xy, ln, dur = min(full, key=lambda i: i[3])
+
+    rs = _fp_resample(xy, n_points)
+    if not rs:
+        return {"error": "重采样失败"}
+    desc, _meta = _fp_normalize(rs)
+    if desc is None:
+        return {"error": "归一化失败"}
+    return {"desc": [[round(x, 4), round(z, 4)] for x, z in desc],
+            "ref_len_m": round(ln, 1),
+            "turns_cw": _meta["turns_cw"],
+            "lap": lap_no, "n_laps": len(info), "n_full": len(full)}
+
+
+def fingerprint_distance(a: list, b: list) -> float:
+    """两条指纹的逐点 RMS 距离（归一化坐标系，无量纲）。"""
+    if not a or not b or len(a) != len(b):
+        return float("inf")
+    return math.sqrt(sum(math.dist(a[i], b[i]) ** 2 for i in range(len(a)))
+                     / len(a))
+
+
 # —— 门面 ——————————————————————————————
 
 def match_pv_pairs(peaks_ref: list[dict], peaks_cur: list[dict],

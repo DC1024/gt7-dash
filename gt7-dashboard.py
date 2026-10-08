@@ -770,6 +770,42 @@ def save_session_meta(history_dir: Path, meta: dict[str, Any]) -> None:
     fp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+# 赛道库 data/tracks.json —— 赛道自动识别的持久化边车文件（jsonl 不可变，
+# 所有标注都进边车，与 sessions_meta.json 同一先例）：
+#   {
+#     "next_id": 3,
+#     "tracks": [ {"id": 1, "name": "赛道名", "desc": [[x,z]×200],
+#                  "ref_len_m": 6937.8, "turns_cw": false,
+#                  "created": "2026-10-08", "sample_session": "xxx.jsonl"} ],
+#     "sessions": { "xxx.jsonl": {"track_id": 1, "dist": 0.006} }
+#   }
+# sessions 映射是**缓存**：场次第一次打开详情页时识别并落库，之后列表页
+# 直接读映射展示赛道名，零开销（识别要解析 244MB jsonl，不能在列表页做）。
+_TRACK_MATCH_TOL = 0.05
+# 命中阈值。依据（7 个真实场次、6 条赛道的探针实测）：同赛道指纹 RMS 距离
+# 0.0056，最近的不同赛道 0.2426 —— 间隔 43 倍。取 0.05：比同赛道值高一个
+# 数量级（容下抽稀/丢包造成的形状抖动），离异赛道值还有 5 倍安全余量。
+
+
+def load_tracks(history_dir: Path) -> dict[str, Any]:
+    fp = history_dir / "tracks.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"next_id": 1, "tracks": [], "sessions": {}}
+        data.setdefault("next_id", 1)
+        data.setdefault("tracks", [])
+        data.setdefault("sessions", {})
+        return data
+    except Exception:
+        return {"next_id": 1, "tracks": [], "sessions": {}}
+
+
+def save_tracks(history_dir: Path, data: dict[str, Any]) -> None:
+    fp = history_dir / "tracks.json"
+    fp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
 def _first_car_code(path: Path) -> int:
     """轻量读场次首帧的 car_code（车型码，用于列表展示）。
 
@@ -922,6 +958,10 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     csv_path = str(history_dir / "cars.csv")
     tpl = load_settings(history_dir).get(
         "session_name_template", DEFAULT_NAME_TEMPLATE)
+    # 赛道识别结果（缓存映射）：只读 tracks.json 的 sessions 映射，
+    # 🔴 绝不在列表页触发识别本身——那要解析整场 jsonl。
+    _lib = load_tracks(history_dir)
+    _track_names = {t["id"]: t.get("name") or "" for t in _lib["tracks"]}
     sessions = []
     # 是否正在录制（一次判定，循环内复用）——用于保护活场不被自动归档
     live = _recording_active(history_dir)
@@ -963,6 +1003,11 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                 "favorite": bool(m.get("favorite")),
                 "custom_name": m.get("custom_name") or "",
             }
+            # 赛道自动识别结果（缓存命中才有；未识别为空串）
+            th = _lib["sessions"].get(f.name) or {}
+            tid = th.get("track_id")
+            entry["track_name"] = _track_names.get(tid, "") if tid else ""
+            entry["track_id"] = tid if tid else None
             # 展示名：手动改名优先，否则按默认模板组合
             entry["display_name"] = (entry["custom_name"]
                                      or _session_display_name(entry, tpl))
@@ -1442,6 +1487,84 @@ def session_deviation(path: Path, ref_lap: int | None = None,
     return hit
 
 
+def session_track(path: Path) -> dict[str, Any]:
+    """赛道自动识别：本场的形状指纹 ↔ 赛道库（data/tracks.json）匹配。
+
+    - 已在库映射里 ⇒ 直接返回缓存结果（不解析 jsonl，列表页也可安全调用
+      带映射的查询路径）。
+    - 首次见到 ⇒ 算指纹（记忆化到 store._memo）→ 与库内每条比 RMS 距离 →
+      命中(_TRACK_MATCH_TOL 内)则挂靠该赛道；否则**新建一条未命名赛道**。
+      结果写回 tracks.json，之后的加载走快路径。
+
+    🔴 指纹本身只取决于文件内容，纯记忆化；但「匹配 + 落库」有副作用，
+       所以副作用只在未映射时发生一次，幂等。
+    """
+    hist = path.parent
+    lib = load_tracks(hist)
+    name = path.name
+
+    # —— 快路径：已识别过 ——
+    hit = lib["sessions"].get(name)
+    if hit:
+        tr = next((t for t in lib["tracks"] if t["id"] == hit.get("track_id")),
+                  None)
+        if tr:
+            return {"track_id": tr["id"], "name": tr["name"],
+                    "matched": bool(tr["name"]), "distance": hit.get("dist"),
+                    "ref_len_m": tr.get("ref_len_m")}
+
+    # —— 慢路径：算指纹并匹配 ——
+    try:
+        _, grouped, _ = _valid_laps(path)
+    except Exception as e:
+        return {"error": str(e)}
+    _, store = _load_frames(path)
+    if not store:
+        return {"error": "no frames"}
+    memo = store._memo
+    key = ("fingerprint",)
+    fp = memo.get(key)
+    if fp is None:
+        import gt7analysis
+        fp = gt7analysis.track_fingerprint(grouped)
+        memo[key] = fp
+    if "error" in fp:
+        # 没有可用圈：不落库，也不报成页面错误——识别是增值功能
+        return {"error": fp["error"], "identified": False}
+
+    import gt7analysis
+    best_id, best_d = None, None
+    for tr in lib["tracks"]:
+        d = gt7analysis.fingerprint_distance(fp["desc"], tr["desc"])
+        if best_d is None or d < best_d:
+            best_id, best_d = tr["id"], d
+
+    if best_d is not None and best_d <= _TRACK_MATCH_TOL:
+        track_id, track_name, matched = best_id, next(
+            t["name"] for t in lib["tracks"] if t["id"] == best_id), True
+    else:
+        # 新建未命名赛道。名字留空，UI 显示「未命名赛道 #N」并给改名入口。
+        track_id = int(lib["next_id"])
+        lib["next_id"] = track_id + 1
+        track_name, matched = "", False
+        lib["tracks"].append({
+            "id": track_id, "name": track_name,
+            "desc": fp["desc"], "ref_len_m": fp["ref_len_m"],
+            "turns_cw": fp["turns_cw"],
+            "created": datetime.now().strftime("%Y-%m-%d"),
+            "sample_session": name,
+        })
+    lib["sessions"][name] = {"track_id": track_id, "dist": round(best_d, 4)
+                             if best_d is not None else None}
+    try:
+        save_tracks(hist, lib)
+    except OSError:
+        pass    # 写不进就当会话内缓存用，下次再试
+    return {"track_id": track_id, "name": track_name, "matched": matched,
+            "distance": lib["sessions"][name]["dist"],
+            "ref_len_m": fp["ref_len_m"]}
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -1859,6 +1982,31 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 ⚠️ 时间差曲线是**按距离对齐**的，两圈圈长不同时曲线会截到短的那圈为止，因此
 曲线末端的时间差**不等于**两圈圈速之差。详情页在两圈圈长相差 > 2% 时给出提示。
 
+## 赛道自动识别
+
+GT7 协议不下发赛道名（jsonl 表头 `circuit` 恒为 null），但轨迹形状稳定。
+识别用**归一化形状指纹**：质心对齐 → RMS 半径归一 → 起点旋到 +X →
+绕行方向统一为逆时针，再等弧长重采样 200 点。同一赛道两个场次的指纹
+RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍），
+命中阈值取 `0.05`。
+
+起点对齐**不需要旋转搜索**：同赛道车永远从同一物理位置过线。
+反向跑的圈会在「镜像成逆时针」一步被拉齐——形状相同就命中同一条。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数） |
+| `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
+| `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
+
+- 代表圈挑选：圈长（坐标折线长度）相对**中位数** ±5% 先剔脏圈/残圈，
+  幸存圈里挑用时最短的——最快圈走线最干净。
+- 库存 `data/tracks.json`（边车文件，jsonl 不可变）。`tracks[].name` 为空
+  表示未命名，详情页显示「未命名赛道 #N」并给 ✎ 改名入口。
+- 场次→赛道映射也在这个文件里：**详情页首次打开时识别并落库**，
+  列表页只读映射展示赛道名，绝不触发识别本身（那要解析整场 jsonl）。
+- 无有效圈的场次返回 `{error}`，不落库、不影响页面。
+
 ## 使用示例
 
 ```bash
@@ -1883,6 +2031,10 @@ curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/raceline?lap=3"
 # 走线偏差（参考圈 vs 对比圈，逐米横向偏移）
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation"
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation?ref_lap=6&cmp_lap=7&step=5"
+
+# 赛道自动识别（首次识别并落库，之后走缓存）
+curl "http://localhost:8787/api/v1/tracks"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/track"
 
 # 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"
@@ -2059,6 +2211,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         seg = parsed.path.split("/")
+        # /api/v1/tracks/<id>/rename —— 赛道改名（同赛道所有场次一起生效）
+        if (len(seg) == 6 and seg[1:4] == ["api", "v1", "tracks"]
+                and seg[5] == "rename"):
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except Exception:
+                body = {}
+            try:
+                tid = int(seg[4])
+            except ValueError:
+                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                return
+            new = str(body.get("value") or "").strip()[:60]
+            if not new:
+                self._send_json({"error": "名称不能为空"}, 400, cors=True)
+                return
+            lib = load_tracks(hist)
+            tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
+            if not tr:
+                self._send_json({"error": "track not found", "id": tid},
+                                404, cors=True)
+                return
+            tr["name"] = new
+            save_tracks(hist, lib)
+            self._send_json({"ok": True, "id": tid, "name": new,
+                             "hint": "已保存，同赛道所有场次一起生效"},
+                            cors=True)
+            return
+
         # /api/v1/sessions/<name>/<action>
         if (len(seg) != 6 or seg[1:4] != ["api", "v1", "sessions"]
                 or not seg[5]):
@@ -2228,6 +2411,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                  "data_dir": str(hist),
                                  "sessions": list_sessions(hist)}, cors=True)
 
+            elif path == "/api/v1/tracks":
+                # 赛道库清单：识别出的所有赛道 + 各自挂了多少场次
+                hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
+                lib = load_tracks(hist)
+                cnt: dict[int, int] = {}
+                for s in lib["sessions"].values():
+                    tid = s.get("track_id")
+                    if tid is not None:
+                        cnt[tid] = cnt.get(tid, 0) + 1
+                tracks = [{
+                    "id": t["id"], "name": t.get("name") or "",
+                    "ref_len_m": t.get("ref_len_m"),
+                    "turns_cw": t.get("turns_cw"),
+                    "created": t.get("created"),
+                    "sessions": cnt.get(t["id"], 0),
+                } for t in lib["tracks"]]
+                self._send_json({"meta": {"api_version": 1},
+                                 "match_tol": _TRACK_MATCH_TOL,
+                                 "tracks": tracks}, cors=True)
+
             elif path.startswith("/api/v1/sessions/") and path.endswith("/download"):
                 # /api/v1/sessions/<名>/download —— 流式下发原始 jsonl
                 seg = path.split("/")
@@ -2258,13 +2461,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     path.endswith("/series") or path.endswith("/frames")
                     or path.endswith("/csv") or path.endswith("/raceline")
                     or path.endswith("/sectors") or path.endswith("/slip")
-                    or path.endswith("/deviation")):
+                    or path.endswith("/deviation") or path.endswith("/track")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
                 # 外加 /sectors（分段计时 + 理论最快圈）、/slip（轮胎滑移）、
                 #   /deviation（走线偏差）：三张分析卡片各自展开时才取，
                 #   同样不拖累整页渲染。
+                # 外加 /track：赛道自动识别（首次会算指纹并落库）。
                 # 🔴 必须排在下面那条「通用 /api/v1/sessions/<名>」之前，
                 #    否则会被当成场次名吞掉。
                 seg = path.split("/")
@@ -2323,6 +2527,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_json(
                         session_deviation(target, ref_lap=rl, cmp_lap=cl,
                                           step=st), cors=True)
+                elif path.endswith("/track"):
+                    self._send_json(session_track(target), cors=True)
                 elif path.endswith("/csv"):
                     body = session_csv(target, lap_no=lap_no).encode("utf-8")
                     fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"
@@ -4622,6 +4828,7 @@ _TELEMETRY_TMPL = r"""
 
 def build_sessions_page(hist: Path) -> str:
     """历史场次列表页。空状态要说清为什么空、以及怎么让它有数据。"""
+    import html as _html
     sessions = list_sessions(hist)
 
     if not sessions:
@@ -4653,7 +4860,8 @@ def build_sessions_page(hist: Path) -> str:
             f"""<tr data-fav="{'1' if s['favorite'] else '0'}" data-anom="{'1' if anom else '0'}" data-file="{s['file']}">
       <td><b><a href="/session?file={s['file']}"
          style="color:var(--accent)">{disp}</a></b>{star}{badge}</td>
-      <td style="font-size:12.5px">{s.get('car_name') or '<span class="dim">-</span>'}</td>
+      <td style="font-size:12.5px">{_html.escape(s.get('car_name') or '') or '<span class="dim">-</span>'
+          }{'<span class="dim"> · ' + _html.escape(s['track_name']) + '</span>' if s.get('track_name') else ''}</td>
       <td>{s['modified']}</td>
       <td class="num">{s['size_kb']} KB</td>
       <td class="num">
@@ -4782,11 +4990,28 @@ def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
     layout_txt = "、".join(f"{k}×{v}" for k, v in layouts.items()) or "未知"
     coord = "含车身坐标" if stats.get("has_coords") else "无车身坐标"
 
+    # —— 赛道自动识别：详情页打开即识别一次并落库（之后走缓存快路径）——
+    # 识别失败（无有效圈）不阻塞页面，赛道行显示「未识别」。
+    trk = session_track(path)
+    if trk.get("track_id") is not None:
+        trk_label = _html.escape(trk.get("name") or f"未命名赛道 #{trk['track_id']}")
+        trk_title = (f"指纹距离 {trk.get('distance')}" if trk.get("matched")
+                     else "场次较少未匹配到已知赛道；点 ✎ 给它起名")
+        trk_html = (f'{trk_label} '
+                    f'<button title="{trk_title}" style="border:1px solid var(--line);'
+                    f'background:var(--card);color:inherit;border-radius:6px;'
+                    f'padding:2px 8px;cursor:pointer;font-family:inherit;'
+                    f'margin-left:4px;font-size:12px" '
+                    f'onclick="trackRen({trk["track_id"]})">✎</button>')
+    else:
+        trk_html = '<span style="color:var(--muted)">未识别</span>'
+
     body = f"""
 <div class="card">
   <h2>概览</h2>
   <div class="kv">
     <div><span>车型</span><b style="font-size:14px">{_html.escape(stats.get('car_name') or '未识别')}</b></div>
+    <div><span>赛道</span><b style="font-size:14px">{trk_html}</b></div>
     <div><span>总帧数</span><b>{stats.get('frame_count', 0)}</b></div>
     <div><span>时长</span><b>{stats.get('duration', 0)}s</b></div>
     <div><span>最高速度</span><b>{stats.get('max_speed', 0)}</b></div>
@@ -4797,6 +5022,23 @@ def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
   <p style="margin-top:12px;font-size:12px;color:var(--muted)">
     {_html.escape(hdr.get('source_ip') or '来源未知')} · {coord}</p>
 </div>
+<script>
+// 赛道改名：改名写 tracks.json 的 tracks[].name，与场次无关（同赛道所有场次一起变）
+window.trackRen = function (id) {{
+  var v = prompt('给这条赛道起名（同赛道所有场次一起生效）');
+  if (v == null) return;
+  v = v.trim();
+  if (!v) return;
+  fetch('/api/v1/tracks/' + id + '/rename', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{value: v}})
+  }}).then(function (r) {{ return r.json(); }}).then(function (d) {{
+    if (d.error) {{ alert(d.error); return; }}
+    location.reload();
+  }}).catch(function () {{ alert('保存失败'); }});
+}};
+</script>
 
 <div class="card">
   <h2>圈速</h2>
@@ -4807,7 +5049,11 @@ def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
     # 文件名要嵌进 JS 的单引号字符串里：把反斜杠和单引号剥掉，
     # 免得带奇怪字符的文件名把 __FILE__ 那行拆掉、整段脚本挂掉。
     js_file = path.name.replace("\\", "").replace("'", "")
-    return _page_shell(f"场次 · {_html.escape(str(hdr.get('circuit') or 'unknown'))}",
+    # 标题优先用识别出的赛道名（比协议给的 null/unknown 有用得多）
+    page_title = (trk.get("name") if trk.get("track_id") is not None
+                  and trk.get("name") else None) \
+        or str(hdr.get('circuit') or 'unknown')
+    return _page_shell(f"场次 · {_html.escape(page_title)}",
                        body + _COMPARE_TMPL.replace('__DATA__', cmp_json)
                        # 三张分析卡排在「遥测数据」之前：先给结论（走线偏哪、胎怎么被
                        # 糟蹋的、能快多少），原始逐帧数据垫底。数据走 XHR 异步取，

@@ -41,7 +41,8 @@ _SHARED_SECTIONS = [
     ("参数", "### 参数", "## 字段与单位约定（对外承诺，只加不改）"),
     ("分段计时与轮胎滑移", "## 分段计时与轮胎滑移", "## 单圈行车轨迹"),
     ("单圈行车轨迹", "## 单圈行车轨迹", "## 圈间对比自选两圈"),
-    ("圈间对比自选两圈", "## 圈间对比自选两圈", "## 使用示例"),
+    ("圈间对比自选两圈", "## 圈间对比自选两圈", "## 赛道自动识别"),
+    ("赛道自动识别", "## 赛道自动识别", "## 使用示例"),
 ]
 
 
@@ -80,6 +81,15 @@ def test_cmp_lap_example_in_both(embedded, doc_file):
             '&ref_lap=3&cmp_lap=7"')
     assert line in embedded
     assert line in doc_file
+
+
+def test_track_identify_rows_in_both(embedded, doc_file):
+    """赛道识别三个接口的行两边都要有。"""
+    for text in (embedded, doc_file):
+        assert "`GET /api/v1/tracks`" in text
+        assert "`GET /api/v1/sessions/<文件名>/track`" in text
+        assert "`POST /api/v1/tracks/<id>/rename`" in text
+        assert "命中阈值取 `0.05`" in text
 
 
 def test_ref_lap_param_mentions_cmp_lap(embedded, doc_file):

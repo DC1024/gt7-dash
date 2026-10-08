@@ -298,6 +298,31 @@
 ⚠️ 时间差曲线是**按距离对齐**的，两圈圈长不同时曲线会截到短的那圈为止，因此
 曲线末端的时间差**不等于**两圈圈速之差。详情页在两圈圈长相差 > 2% 时给出提示。
 
+## 赛道自动识别
+
+GT7 协议不下发赛道名（jsonl 表头 `circuit` 恒为 null），但轨迹形状稳定。
+识别用**归一化形状指纹**：质心对齐 → RMS 半径归一 → 起点旋到 +X →
+绕行方向统一为逆时针，再等弧长重采样 200 点。同一赛道两个场次的指纹
+RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍），
+命中阈值取 `0.05`。
+
+起点对齐**不需要旋转搜索**：同赛道车永远从同一物理位置过线。
+反向跑的圈会在「镜像成逆时针」一步被拉齐——形状相同就命中同一条。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数） |
+| `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
+| `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
+
+- 代表圈挑选：圈长（坐标折线长度）相对**中位数** ±5% 先剔脏圈/残圈，
+  幸存圈里挑用时最短的——最快圈走线最干净。
+- 库存 `data/tracks.json`（边车文件，jsonl 不可变）。`tracks[].name` 为空
+  表示未命名，详情页显示「未命名赛道 #N」并给 ✎ 改名入口。
+- 场次→赛道映射也在这个文件里：**详情页首次打开时识别并落库**，
+  列表页只读映射展示赛道名，绝不触发识别本身（那要解析整场 jsonl）。
+- 无有效圈的场次返回 `{error}`，不落库、不影响页面。
+
 ## 使用示例
 
 ```bash
@@ -322,6 +347,10 @@ curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/raceline?lap=3"
 # 走线偏差（参考圈 vs 对比圈，逐米横向偏移）
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation"
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation?ref_lap=6&cmp_lap=7&step=5"
+
+# 赛道自动识别（首次识别并落库，之后走缓存）
+curl "http://localhost:8787/api/v1/tracks"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/track"
 
 # 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"
