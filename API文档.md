@@ -111,12 +111,45 @@
 ### `track`
 | 字段 | 说明 |
 |---|---|
-| `path` | `[[x, z, 该点G值], ...]` 约 10Hz 采样的整车轨迹（画行车轨迹用） |
+| `path` | `[[x, z, 该点G值, 油门, 刹车, 圈号, 速度], ...]` 约 10Hz 采样的整车轨迹 |
 | `gg_samples` | `[[横向g, 纵向g], ...]` 约 16Hz 采样的 G-G 散点 |
+
+> `path` 的点位格式在 v1 内**向后兼容地加长**过：早期版本只有 `[x, z, G]` 三个值，
+> 现在补到 7 个（多出的油门/刹车/圈号/速度用于画「参考圈赛车线」）。
+> 消费方请按长度判断，缺字段时把油门/刹车当 0 处理，不要假设一定有 7 个。
 
 ### `history[]`（每帧一条）
 `t`（服务器时间戳秒）、`speed_kph`、`rpm`、`gear`、`throttle`、`brake`、
 `lap`、`tyre_temp_c`、`g_force`。
+
+## 历史场次的逐帧数据
+
+场次 jsonl 里每帧有四十几个字段（速度/转速/档位/油门/刹车/G 力/四轮/油量…）。
+下面三个接口把它按不同粒度暴露出来，供详情页与第三方分析使用。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/v1/sessions/<文件名>/series?lap=N&max_points=2400` | 整场（或第 N 圈）的**降采样**时序，用于画曲线 |
+| `GET /api/v1/sessions/<文件名>/frames?offset=0&limit=200&lap=N` | **分页**逐帧数据（`limit` 上限 1000），用于表格 |
+| `GET /api/v1/sessions/<文件名>/csv?lap=N` | 全量 CSV 下载（带 UTF-8 BOM，Excel 直接打开不乱码） |
+
+`series` / `frames` 返回的 `cols` 固定为
+`["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
+
+| 列 | 含义 | 单位 |
+|---|---|---|
+| `t` | 相对时间（整场=从场次开始；选圈=从该圈起点） | 秒 |
+| `spd` | 速度 | km/h |
+| `rpm` | 发动机转速 | rpm |
+| `thr` / `brk` | 油门 / 刹车开度 | %（0~100） |
+| `gear` | 档位 | — |
+| `glat` / `glon` | 横向 / 纵向 G（沿用游戏内 `g_force` 的横向在前定义） | g |
+| `fuel` | 油量百分比；纯电车无此口径时为 `null` | % |
+| `lap` | 圈号 | — |
+
+`series` 额外返回 `laps[]`（每圈 `lap` / `t0` / `dur` / `frames`）、
+`total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、
+`sampled_frames`、`step`（抽稀步长）。
 
 ## 使用示例
 
@@ -134,10 +167,17 @@ curl "http://localhost:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jso
 # 详情页分析（赛车线 / 时间差对比）；?ref_lap=N 指定参考圈（缺省=最快圈）
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl"
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&ref_lap=3"
+
+# 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series?lap=3"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/frames?offset=200&limit=200"
+curl -o lap3.csv "http://localhost:8787/api/v1/sessions/SESSION.jsonl/csv?lap=3"
 ```
 
 ## 稳定性说明
 
 - v1 字段**只加不改名不改单位**；将来不兼容的改动会升到 v2 并保留 v1
 - `history` 的条数上限 600；`path`/`gg` 上限 4000/1200 点
+- `frames` 的 `limit` 上限 1000；`series` 的 `max_points` 上限 6000
 - 服务器单线程 HTTP，请勿高频轮询（≥100ms 间隔为宜）

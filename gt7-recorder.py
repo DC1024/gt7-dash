@@ -1411,13 +1411,21 @@ class Recorder:
         仪表盘渲染也会卡。降到 10Hz 后轨迹依然平滑，体积降到 1/6。
         上限用「丢最早的」而不是停止追加，这样长时间跑图能看到最新路段。
         """
-        # —— 赛道轨迹：[x, z, G力大小] ——
+        # —— 赛道轨迹：[x, z, G力大小, 油门, 刹车, 圈号, 速度] ——
+        # 🔴 早期只有 [x, z, gmag] 三个值，仪表盘的「行车轨迹」就只能按 G 力
+        #    上色，画不出「参考圈赛车线」（需要逐点的踏板开度）。踏板/圈号/速度
+        #    本来就在 jsonl 里逐帧记着，顺手带进状态文件，每点只多几字节。
+        #    ⚠️ 仪表盘必须兼容旧格式（len < 7 时踏板按 0 处理），别假设一定有。
         if now - self._path_last_t >= 0.1:
             gmag = math.hypot(sample.g_force[1], sample.g_force[0])
             self._path.append([
                 round(sample.car_x, 1),
                 round(sample.car_z, 1),
                 round(gmag, 2),
+                round(sample.throttle, 2),
+                round(sample.brake, 2),
+                int(sample.lap),
+                round(sample.speed_kph, 1),
             ])
             self._path_last_t = now
             if len(self._path) > self.path_cap:

@@ -10,7 +10,8 @@ def build_packet(on_track=True, spd_ms=40.0, x=100.0, z=50.0, vx=None, vz=0.0,
                  body_height=0.12, time_of_day=43200000, quali_pos=5,
                  num_cars=16, min_alert_rpm=6000, max_alert_rpm=8500,
                  turbo=0.0, powertrain=None, energy_recovery=0.0,
-                 throttle_filtered=0.0, brake_filtered=0.0, pkt="A"):
+                 throttle_filtered=0.0, brake_filtered=0.0, pkt="A",
+                 throttle=200 / 255, brake=0.0):
     """合成 GT7 遥测包。
 
     powertrain: 'fuel'/'electric'/'kart'。None 时不改 cap（默认油车）。
@@ -42,7 +43,10 @@ def build_packet(on_track=True, spd_ms=40.0, x=100.0, z=50.0, vx=None, vz=0.0,
     for i in range(4):
         struct.pack_into("<f", b, 0x60 + i * 4, 75.0)
     b[0x90] = gear
-    b[0x91] = 200
+    # 0x91 油门 / 0x92 刹车（u8，0~255 → 解码器 /255 成 0~1）。
+    # 默认油门沿用历史上的 200，避免改动既有用例的语义。
+    b[0x91] = max(0, min(255, int(round(throttle * 255))))
+    b[0x92] = max(0, min(255, int(round(brake * 255))))
     struct.pack_into("<f", b, 0x38, body_height)
     struct.pack_into("<f", b, 0x50, turbo)
     struct.pack_into("<f", b, 0x54, oil_pressure)

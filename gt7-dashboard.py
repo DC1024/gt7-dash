@@ -633,6 +633,163 @@ def analyze_session(path: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 逐帧遥测（场次详情页的「遥测数据」卡片 / CSV 导出）
+# ---------------------------------------------------------------------------
+# 接收器每帧落盘的字段有四十几个（速度/转速/档位/油门/刹车/G 力/四轮/油量…），
+# 但详情页原先只把它汇总成几个数字，逐帧数据等于「存了看不见」。
+# 这里把同一份帧换个粒度暴露出来：
+#   · session_series —— 整场/单圈的**降采样**时序（画曲线用）
+#   · session_frames —— **分页**逐帧表（翻页用，绝不整场塞进页面）
+#   · session_csv    —— 全量 CSV（留给 Excel / pandas）
+#
+# 🔴 一律复用 _load_frames 的解析缓存，不再额外读盘：详情页本来就要读一遍
+#    场次算统计，这里只是对同一份帧做抽稀/切片。
+#    单场 jsonl 能到 250MB，再读第二遍纯属浪费。
+_SERIES_COLS = ["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]
+
+
+def _fuel_pct(f: dict) -> float | None:
+    """油量百分比。⚠️ 纯电车 gas_capacity=0，此时没有百分比口径，返回 None。"""
+    cap = f.get("gas_capacity") or 0.0
+    if not cap:
+        return None
+    return round((f.get("gas_level") or 0.0) / cap * 100.0, 1)
+
+
+def _frame_row(f: dict, t0: float) -> list:
+    """把一帧压成一行（列顺序见 _SERIES_COLS）。"""
+    g = f.get("g_force") or [0.0, 0.0, 0.0]
+    return [
+        round((f.get("t") or 0.0) - t0, 3),
+        round(f.get("speed_kph") or 0.0, 1),
+        int(round(f.get("rpm") or 0.0)),           # 转速取整：曲线/表格都不需要小数
+        round((f.get("throttle") or 0.0) * 100, 0),
+        round((f.get("brake") or 0.0) * 100, 0),
+        int(f.get("gear") or 0),
+        round(g[1] if len(g) > 1 else 0.0, 2),      # 横向 G
+        round(g[0] if len(g) > 0 else 0.0, 2),      # 纵向 G（正=加速，负=制动）
+        _fuel_pct(f),
+        int(f.get("lap") or 0),
+    ]
+
+
+def _valid_laps(path: Path) -> tuple[list[dict], dict, float]:
+    """场次的有效圈清单 + 按圈分组的帧 + 该场起始 t。
+
+    圈口径复用 gt7analysis.clean_laps（与圈速表 / 赛车线 / 参考圈同一套），
+    避免这里算一套、那边算一套导致圈号对不上。
+    """
+    _, frames = _load_frames(path)
+    if not frames:
+        return [], {}, 0.0
+    t0 = frames[0].get("t") or 0.0
+    import gt7analysis
+    grouped = gt7analysis.clean_laps(frames)
+    laps = []
+    for no, fs in sorted(grouped.items()):
+        if len(fs) < 2:
+            continue
+        laps.append({
+            "lap": no,
+            "t0": round((fs[0].get("t") or 0.0) - t0, 3),
+            "dur": round((fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0), 3),
+            "frames": len(fs),
+        })
+    return laps, grouped, t0
+
+
+def _scope_t0(scope: list[dict], session_t0: float, lap_no: int | None) -> float:
+    """时间基准：选了单圈就从**该圈起点**算，否则从场次起点算。
+
+    🔴 曲线、表格、CSV 必须共用同一个基准。之前这里只让曲线减了圈首时间、
+    表格仍在印场次绝对时间（第 3 圈第一帧显示 162.70s），同一圈在两张图里
+    对不上，读「入弯在第几秒」会直接读错。
+    """
+    if lap_no and scope:
+        return scope[0].get("t") or session_t0
+    return session_t0
+
+
+def session_series(path: Path, lap_no: int | None = None,
+                   max_points: int = 2400) -> dict[str, Any]:
+    """整场（或指定一圈）的降采样时序 + 圈边界，供详情页画全通道曲线。
+
+    抽稀用固定 stride 而不是简单截断——30 万帧的场次截前 2400 帧
+    只能看到开场 40 秒，曲线完全没意义。
+    """
+    try:
+        laps, grouped, sess_t0 = _valid_laps(path)
+    except Exception as e:
+        return {"error": str(e)}
+    _, frames = _load_frames(path)
+    fr = [f for f in frames if "lap" in f]
+    if not fr:
+        return {"error": "没有可用的帧（缺少 lap 字段）"}
+
+    scope = fr
+    if lap_no:
+        scope = grouped.get(lap_no) or []
+        if len(scope) < 2:
+            return {"error": f"第 {lap_no} 圈没有可用数据"}
+    t0 = _scope_t0(scope, sess_t0, lap_no)
+    step = max(1, int(math.ceil(len(scope) / max(1, max_points))))
+    rows = [_frame_row(f, t0) for f in scope[::step]]
+    # 抽稀会漏掉最后一帧，补上——否则曲线右端「差一截」，看着像数据断了
+    if scope and (len(scope) - 1) % step:
+        rows.append(_frame_row(scope[-1], t0))
+    return {
+        "cols": _SERIES_COLS,
+        "rows": rows,
+        "lap": lap_no or 0,
+        "laps": laps,
+        # total_frames = 整场帧数（恒定）；scope_frames = 当前所选范围的帧数。
+        # 前端展示必须用 scope_frames——否则选了「第 3 圈」还写着整场的帧数，
+        # 用户会以为抽稀把圈数据搞丢了。
+        "total_frames": len(fr),
+        "scope_frames": len(scope),
+        "sampled_frames": len(rows),
+        "step": step,
+    }
+
+
+def session_frames(path: Path, offset: int = 0, limit: int = 200,
+                   lap_no: int | None = None) -> dict[str, Any]:
+    """逐帧数据分页。limit 硬上限 1000——别让人一页拉爆浏览器。"""
+    try:
+        _, grouped, sess_t0 = _valid_laps(path)
+    except Exception as e:
+        return {"error": str(e)}
+    _, frames = _load_frames(path)
+    fr = (grouped.get(lap_no) or []) if lap_no else [f for f in frames if "lap" in f]
+    t0 = _scope_t0(fr, sess_t0, lap_no)
+    total = len(fr)
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or 200), 1000))
+    page = fr[offset:offset + limit]
+    return {
+        "cols": _SERIES_COLS,
+        "rows": [_frame_row(f, t0) for f in page],
+        "offset": offset, "limit": limit, "total": total,
+        "lap": lap_no or 0,
+    }
+
+
+def session_csv(path: Path, lap_no: int | None = None) -> str:
+    """逐帧数据导成 CSV（Excel / pandas 可直接打开）。"""
+    _, grouped, sess_t0 = _valid_laps(path)
+    _, frames = _load_frames(path)
+    fr = (grouped.get(lap_no) or []) if lap_no else [f for f in frames if "lap" in f]
+    t0 = _scope_t0(fr, sess_t0, lap_no)
+    head = ("时间(s),速度(km/h),转速(rpm),油门(%),刹车(%),档位,"
+            "横向G,纵向G,油量(%),圈号")
+    out = [head]
+    for f in fr:
+        r = _frame_row(f, t0)
+        out.append(",".join("" if v is None else str(v) for v in r))
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -860,12 +1017,45 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 ### `track`
 | 字段 | 说明 |
 |---|---|
-| `path` | `[[x, z, 该点G值], ...]` 约 10Hz 采样的整车轨迹（画行车轨迹用） |
+| `path` | `[[x, z, 该点G值, 油门, 刹车, 圈号, 速度], ...]` 约 10Hz 采样的整车轨迹 |
 | `gg_samples` | `[[横向g, 纵向g], ...]` 约 16Hz 采样的 G-G 散点 |
+
+> `path` 的点位格式在 v1 内**向后兼容地加长**过：早期版本只有 `[x, z, G]` 三个值，
+> 现在补到 7 个（多出的油门/刹车/圈号/速度用于画「参考圈赛车线」）。
+> 消费方请按长度判断，缺字段时把油门/刹车当 0 处理，不要假设一定有 7 个。
 
 ### `history[]`（每帧一条）
 `t`（服务器时间戳秒）、`speed_kph`、`rpm`、`gear`、`throttle`、`brake`、
 `lap`、`tyre_temp_c`、`g_force`。
+
+## 历史场次的逐帧数据
+
+场次 jsonl 里每帧有四十几个字段（速度/转速/档位/油门/刹车/G 力/四轮/油量…）。
+下面三个接口把它按不同粒度暴露出来，供详情页与第三方分析使用。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/v1/sessions/<文件名>/series?lap=N&max_points=2400` | 整场（或第 N 圈）的**降采样**时序，用于画曲线 |
+| `GET /api/v1/sessions/<文件名>/frames?offset=0&limit=200&lap=N` | **分页**逐帧数据（`limit` 上限 1000），用于表格 |
+| `GET /api/v1/sessions/<文件名>/csv?lap=N` | 全量 CSV 下载（带 UTF-8 BOM，Excel 直接打开不乱码） |
+
+`series` / `frames` 返回的 `cols` 固定为
+`["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
+
+| 列 | 含义 | 单位 |
+|---|---|---|
+| `t` | 相对时间（整场=从场次开始；选圈=从该圈起点） | 秒 |
+| `spd` | 速度 | km/h |
+| `rpm` | 发动机转速 | rpm |
+| `thr` / `brk` | 油门 / 刹车开度 | %（0~100） |
+| `gear` | 档位 | — |
+| `glat` / `glon` | 横向 / 纵向 G（沿用游戏内 `g_force` 的横向在前定义） | g |
+| `fuel` | 油量百分比；纯电车无此口径时为 `null` | % |
+| `lap` | 圈号 | — |
+
+`series` 额外返回 `laps[]`（每圈 `lap` / `t0` / `dur` / `frames`）、
+`total_frames`（整场帧数）、`scope_frames`（当前范围帧数）、
+`sampled_frames`、`step`（抽稀步长）。
 
 ## 使用示例
 
@@ -883,12 +1073,19 @@ curl "http://localhost:8787/api/v1/sessions/20261007_045628_unknown_6ac5607c.jso
 # 详情页分析（赛车线 / 时间差对比）；?ref_lap=N 指定参考圈（缺省=最快圈）
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl"
 curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&ref_lap=3"
+
+# 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series?lap=3"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/frames?offset=200&limit=200"
+curl -o lap3.csv "http://localhost:8787/api/v1/sessions/SESSION.jsonl/csv?lap=3"
 ```
 
 ## 稳定性说明
 
 - v1 字段**只加不改名不改单位**；将来不兼容的改动会升到 v2 并保留 v1
 - `history` 的条数上限 600；`path`/`gg` 上限 4000/1200 点
+- `frames` 的 `limit` 上限 1000；`series` 的 `max_points` 上限 6000
 - 服务器单线程 HTTP，请勿高频轮询（≥100ms 间隔为宜）
 """
 
@@ -1240,6 +1437,63 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                 return
 
+            elif path.startswith("/api/v1/sessions/") and (
+                    path.endswith("/series") or path.endswith("/frames")
+                    or path.endswith("/csv")):
+                # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
+                # 🔴 必须排在下面那条「通用 /api/v1/sessions/<名>」之前，
+                #    否则会被当成场次名吞掉。
+                seg = path.split("/")
+                name = Path(seg[4]).name if len(seg) == 6 else ""
+                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+                target = (hist / name).resolve()
+                if (not str(target).startswith(str(hist)) or not target.exists()
+                        or target.suffix != ".jsonl"):
+                    self._send_json({"error": "session not found", "file": name},
+                                    404, cors=True)
+                    return
+                lap_raw = query.get("lap", [""])[0]
+                try:
+                    lap_no = int(lap_raw) if lap_raw else None
+                except ValueError:
+                    lap_no = None
+                if lap_no is not None and lap_no <= 0:
+                    lap_no = None
+                if path.endswith("/csv"):
+                    body = session_csv(target, lap_no=lap_no).encode("utf-8")
+                    fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"
+                    self.send_response(200)
+                    # Excel 打开 UTF-8 CSV 需要 BOM，否则中文表头会乱码
+                    self.send_header("Content-Type",
+                                     "text/csv; charset=utf-8")
+                    self.send_header("Content-Disposition",
+                                     f'attachment; filename="{fn}"')
+                    self.send_header("Content-Length", str(len(body) + 3))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(b"\xef\xbb\xbf" + body)
+                elif path.endswith("/frames"):
+                    try:
+                        off = int(query.get("offset", ["0"])[0])
+                    except ValueError:
+                        off = 0
+                    try:
+                        lim = int(query.get("limit", ["200"])[0])
+                    except ValueError:
+                        lim = 200
+                    self._send_json(
+                        session_frames(target, offset=off, limit=lim,
+                                       lap_no=lap_no), cors=True)
+                else:
+                    try:
+                        mx = int(query.get("max_points", ["2400"])[0])
+                    except ValueError:
+                        mx = 2400
+                    self._send_json(
+                        session_series(target, lap_no=lap_no,
+                                       max_points=max(200, min(mx, 6000))),
+                        cors=True)
+
             elif path.startswith("/api/v1/sessions/"):
                 # /api/v1/sessions/<文件名> —— 防目录穿越：只取文件名部分
                 name = Path(path.rsplit("/", 1)[-1]).name
@@ -1452,11 +1706,133 @@ THEME_BOOT_JS = r"""
 """
 
 
+# ---------------------------------------------------------------------------
+# 图表点击放大（仪表盘页 / 历史详情页共用）
+# ---------------------------------------------------------------------------
+# 主仪表盘（HTML_PAGE，裸字符串）与历史页（_page_shell，f-string）是两套外壳，
+# 放大组件抽成常量各自注入，避免同功能维护两份实现。
+#
+# 两条放大路径：
+#   · kind='node'   —— SVG / DOM 图表：克隆一份交给浏览器按矢量拉伸，不失真
+#   · kind='canvas' —— 位图：按放大后的尺寸**重画**。把原位图拉大只会糊，
+#                      所以画图函数必须能往任意 canvas 上画（见 drawXxxInto）。
+ZOOM_CSS = r"""
+.zoomer { cursor:zoom-in; }
+.zoomer:hover { filter:brightness(1.05); }
+#zoomWrap { position:fixed; inset:0; z-index:120; display:none;
+  background:rgba(0,0,0,.6); backdrop-filter:blur(3px);
+  align-items:center; justify-content:center; padding:18px; }
+#zoomWrap.open { display:flex; }
+#zoomBox { background:var(--card); border:1px solid var(--line);
+  border-radius:12px; padding:14px 16px; max-width:96vw; max-height:94vh;
+  overflow:auto; box-shadow:0 24px 60px rgba(0,0,0,.4); }
+#zoomBox h3 { font-size:13px; font-weight:600; color:var(--text);
+  margin-bottom:10px; }
+#zoomBox h3 a { color:var(--muted); text-decoration:none; font-size:12px;
+  font-weight:400; }
+#zoomBox h3 a:hover { color:var(--accent); }
+#zoomBody { display:block; }
+#zoomHint { font-size:11.5px; color:var(--muted); margin-top:8px;
+  text-align:center; }
+"""
+
+ZOOM_JS = r"""
+// ---------- 图表点击放大 ----------
+// 每张图登记 {title, kind, ar, src, draw}。放大版与屏幕上那份**共用同一段
+// 绘制代码**——两套实现迟早会走偏（改了主页忘了放大版）。
+var ZOOMABLES = {};
+function registerZoom(key, def) { ZOOMABLES[key] = def; }
+
+function zoomFit(ar) {
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var dw = Math.min(vw * 0.9, 1500), dh = dw / (ar || 1.6);
+  var maxH = vh * 0.74;
+  if (dh > maxH) { dh = maxH; dw = dh * (ar || 1.6); }
+  return [Math.round(dw), Math.round(dh)];
+}
+
+function openZoom(key) {
+  var def = ZOOMABLES[key];
+  var body = document.getElementById('zoomBody');
+  if (!def || !body) return;
+  document.getElementById('zoomTitle').textContent = def.title || '图表';
+  body.innerHTML = '';
+  if (def.kind === 'node') {
+    // SVG：克隆后拉满宽度，矢量缩放（含文字）不失真。
+    var src = document.getElementById(def.src);
+    if (!src) return;
+    var node = src.cloneNode(true);
+    node.removeAttribute('id');
+    if (node.classList) node.classList.remove('zoomer');
+    var w = Math.round(Math.min(window.innerWidth * 0.9, 1500));
+    var svgs = node.tagName === 'svg' ? [node] : node.querySelectorAll('svg');
+    for (var i = 0; i < svgs.length; i++) {
+      svgs[i].setAttribute('width', w);
+      svgs[i].style.width = '100%';
+      svgs[i].style.height = 'auto';
+      svgs[i].style.maxWidth = '100%';
+    }
+    node.style.width = w + 'px';
+    node.style.maxWidth = '100%';
+    node.style.height = 'auto';
+    body.appendChild(node);
+  } else if (typeof def.draw === 'function') {
+    var d = zoomFit(def.ar), dpr = Math.min(2, window.devicePixelRatio || 1);
+    var cv = document.createElement('canvas');
+    cv.width = Math.round(d[0] * dpr);
+    cv.height = Math.round(d[1] * dpr);
+    cv.style.width = d[0] + 'px';
+    cv.style.height = d[1] + 'px';
+    cv.style.display = 'block';
+    body.appendChild(cv);
+    // 用放大后的真实像素尺寸重画：字号/线宽按同比例放大才不显小
+    def.draw(cv, cv.width, cv.height);
+  }
+  document.getElementById('zoomWrap').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeZoom() {
+  var w = document.getElementById('zoomWrap');
+  if (w) w.classList.remove('open');
+  var b = document.getElementById('zoomBody');
+  if (b) b.innerHTML = '';
+  document.body.style.overflow = '';
+}
+
+// 图表本身不可交互，用光标 + 点击来提示「可放大」
+function makeZoomable(el, key) {
+  if (!el) return;
+  el.classList.add('zoomer');
+  el.title = '点击放大';
+  el.addEventListener('click', function () { openZoom(key); });
+}
+
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' || e.keyCode === 27) closeZoom();
+});
+"""
+
+ZOOM_HTML = r"""
+<div id="zoomWrap" onclick="if(event.target===this)closeZoom()">
+  <div id="zoomBox">
+    <h3><span id="zoomTitle">图表</span>
+      <a href="#" style="float:right" onclick="closeZoom();return false">✕ 关闭（Esc）</a></h3>
+    <div id="zoomBody"></div>
+    <div id="zoomHint">放大视图为只读快照 · 按 Esc 或点击空白处关闭</div>
+  </div>
+</div>
+"""
+
+
 def build_page() -> str:
     # 用占位符替换而不是 f-string：整页 CSS/JS 里花括号上千个，
     # 转义一遍只会让人再也不敢改样式。
     return HTML_PAGE.replace("/*THEME_CSS*/", THEME_CSS) \
-                    .replace("/*THEME_BOOT_JS*/", THEME_BOOT_JS)
+                    .replace("/*THEME_BOOT_JS*/", THEME_BOOT_JS) \
+                    .replace("/*ZOOM_CSS*/", ZOOM_CSS) \
+                    .replace("/*ZOOM_JS*/", ZOOM_JS) \
+                    .replace("/*ZOOM_HTML*/", ZOOM_HTML)
 
 
 def _page_shell(title: str, body: str) -> str:
@@ -1512,7 +1888,9 @@ td.num {{ font-family:var(--mono); text-align:right; }}
 @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
 #loadOv .msg {{ font-size:13.5px; }}
 #loadOv .sub {{ font-size:11.5px; color:var(--muted); margin-top:6px; }}
+{ZOOM_CSS}
 </style></head><body>
+<script>{ZOOM_JS}</script>
 <div id="loadOv"><div class="box">
   <div class="spin"></div>
   <div class="msg" id="loadMsg">加载中…</div>
@@ -1530,6 +1908,7 @@ function showLoad(msg) {{
   <h1>{title}</h1>
 </div>
 {body}
+{ZOOM_HTML}
 </body></html>"""
 
 
@@ -1865,13 +2244,13 @@ const CMP = __DATA__;
   // 油门「青→绿」（踩得越深越绿），两个都不踩 = 滑行（用强调色）。
   // 后端 race_line 已按通道切段，并把每点的开度 b[] / t[] 与 pts[] 一一对齐；
   // 这里逐「子线段」取两端开度均值插值上色，于是得到连续渐变而不是三块死色。
-  const cv = document.getElementById('raceLineCv'), ctx = cv.getContext('2d');
-  const segs = (CMP.race_line || {}).segments || [];
-  ctx.clearRect(0, 0, cv.width, cv.height);
+  //
+  // 画成 drawRaceLineInto(cv, W, H) 是为了「点击放大」能按放大后的真实像素
+  // 重画——把原来的位图拉大只会糊。
+  const cv = document.getElementById('raceLineCv');
   // 取当前主题的实际颜色：canvas 不继承 CSS 变量，只能手动读一次
   const cvar = n => getComputedStyle(document.documentElement)
     .getPropertyValue(n).trim() || '#888';
-  const coast = cvar('--accent');
   const clamp01 = v => v < 0 ? 0 : (v > 1 ? 1 : v);
   const mix = (c1, c2, k) => 'rgb(' + Math.round(c1[0] + (c2[0] - c1[0]) * k)
     + ',' + Math.round(c1[1] + (c2[1] - c1[1]) * k)
@@ -1882,21 +2261,28 @@ const CMP = __DATA__;
     k = clamp01(k || 0);
     if (ch === 'brake') return mix(PINK, RED, k);
     if (ch === 'throttle') return mix(CYAN, GREEN, k);
-    return coast;
+    return cvar('--accent');
   };
-  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-  segs.forEach(s => s.pts.forEach(p => {
-    if (p[0] == null) return;
-    if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
-    if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1];
-  }));
-  if (x1 > x0 && z1 > z0) {
-    const PAD = 24;
-    const sc = Math.min((cv.width - 2*PAD) / (x1 - x0), (cv.height - 2*PAD) / (z1 - z0));
-    const ox = (cv.width - (x1 - x0) * sc) / 2 - x0 * sc;
-    const oy = (cv.height - (z1 - z0) * sc) / 2 - z0 * sc;
-    const px = v => ox + v * sc, py = v => cv.height - (oy + v * sc);
-    ctx.lineCap = 'round'; ctx.lineWidth = 3.2;
+
+  function drawRaceLineInto(canvas, W, H) {
+    const ctx = canvas.getContext('2d');
+    const segs = (CMP.race_line || {}).segments || [];
+    ctx.clearRect(0, 0, W, H);
+    if (!segs.length) return;
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    segs.forEach(s => s.pts.forEach(p => {
+      if (p[0] == null) return;
+      if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+      if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1];
+    }));
+    if (!(x1 > x0 && z1 > z0)) return;
+    const PAD = W * 0.03 + 6;
+    const sc = Math.min((W - 2 * PAD) / (x1 - x0), (H - 2 * PAD) / (z1 - z0));
+    const ox = (W - (x1 - x0) * sc) / 2 - x0 * sc;
+    const oy = (H - (z1 - z0) * sc) / 2 - z0 * sc;
+    const px = v => ox + v * sc, py = v => H - (oy + v * sc);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(3.2, W / 240);
     segs.forEach(s => {
       const b = s.b || [], t = s.t || [];
       for (let i = 1; i < s.pts.length; i++) {
@@ -1913,6 +2299,22 @@ const CMP = __DATA__;
         ctx.stroke();
       }
     });
+  }
+
+  drawRaceLineInto(cv, cv.width, cv.height);
+
+  // 详情页的赛车线也能点击放大（与仪表盘用同一套放大组件）
+  if (window.registerZoom) {
+    registerZoom('raceLine', {
+      title: '参考圈赛车线', kind: 'canvas', ar: 760 / 440,
+      draw: function (c, W, H) { drawRaceLineInto(c, W, H); }
+    });
+    makeZoomable(cv, 'raceLine');
+    var dsvg = document.getElementById('diffSvg');
+    if (dsvg) {
+      registerZoom('diffSvg', { title: '圈间时间差曲线', kind: 'node', src: 'diffSvg' });
+      makeZoomable(dsvg, 'diffSvg');
+    }
   }
 
   // —— 关键点对比表（服务端已按圈内相对位置配好对）——
@@ -1946,6 +2348,321 @@ const CMP = __DATA__;
       + (worst.delta < 0 ? chip(worst) : '');
     sum.style.display = sum.innerHTML ? 'flex' : 'none';
   }
+})();
+</script>
+"""
+
+
+# 场次详情页的「遥测数据」卡片：逐帧原始数据可视化 + 分页表 + CSV 导出。
+#
+# 背景：接收器本来就逐帧把四十几个字段写进了 jsonl，但旧版详情页只把它
+# 汇总成「最高速度 / 平均速度」几个数字，用户看不到「第 37.5 秒、时速 182、
+# 油门 63%、刹车 0%」这种逐帧数据——等于存了看不见。
+#
+# 数据不内嵌进页面，走 /api/v1/sessions/<名>/{series,frames,csv}：
+#   · 单场 jsonl 能到 250MB，内嵌会把首屏拖垮；
+#   · 切圈 / 翻页本来就要重新取数，走接口只有一条代码路径。
+_TELEMETRY_TMPL = r"""
+<div class="card">
+  <h2>遥测数据
+    <span style="float:right;display:flex;gap:8px;align-items:center;text-transform:none">
+      <span id="teleMeta" style="font-weight:400;color:var(--muted)"></span>
+      <select id="teleLapSel" onchange="teleSetLap(this.value)"
+        style="font-weight:400;font-size:12px;padding:3px 7px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"></select>
+      <a id="teleCsv" class="tbtn" href="#" download>⬇ 导出 CSV</a>
+    </span>
+  </h2>
+  <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
+    接收器<b>逐帧</b>落盘的原始通道都在这里：时间、速度、转速、档位、油门 / 刹车百分比、
+    横向 / 纵向 G、油量。曲线默认跨整场，右上角可切到某一圈；
+    帧数很多时会自动<b>等间隔抽稀</b>后再画（是抽稀不是丢帧，曲线依然覆盖全程）。
+    点击曲线可放大，下方表格可翻页看原始帧。
+    横轴与「时间」列都是<b>相对时间</b>：整场 = 从场次开始算，单圈 = 从该圈起点算，
+    导出的 CSV 也是同一基准。
+  </p>
+  <div id="teleChart" class="telechart"></div>
+  <div class="telebar">
+    <b style="font-size:12px">原始帧</b>
+    <span id="telePageInfo" style="font-size:12px;color:var(--muted)"></span>
+    <span style="flex:1"></span>
+    <button class="tbtn" onclick="telePage(-1)">← 上一页</button>
+    <button class="tbtn" onclick="telePage(1)">下一页 →</button>
+  </div>
+  <div class="telewrap">
+    <table class="teletable"><thead id="teleHead"></thead><tbody id="teleBody"></tbody></table>
+  </div>
+</div>
+<style>
+.telechart svg { display:block; width:100%; height:auto; }
+.tbtn { border:1px solid var(--line); background:var(--card); color:inherit;
+  border-radius:6px; padding:3px 9px; cursor:pointer; font-family:inherit;
+  font-size:12px; text-decoration:none; display:inline-block; }
+.tbtn:hover { background:rgba(128,128,128,.16); }
+.telebar { display:flex; align-items:center; gap:8px; margin:12px 0 6px; }
+.telewrap { max-height:420px; overflow:auto; border:1px solid var(--line);
+  border-radius:8px; }
+.teletable { width:100%; border-collapse:collapse; font-size:12px; }
+.teletable th, .teletable td { padding:4px 8px;
+  border-bottom:1px solid var(--line); white-space:nowrap; }
+.teletable th { position:sticky; top:0; background:var(--card);
+  color:var(--muted); font-weight:500; font-size:11px; z-index:1; }
+.teletable td.num { font-family:var(--mono); }
+.teletable tr:hover td { background:rgba(128,128,128,.06); cursor:default; }
+</style>
+<script>
+// ---------- 场次详情页 · 遥测数据 ----------
+(function () {
+  var FILE = '__FILE__';
+  var API = '/api/v1/sessions/' + encodeURIComponent(FILE);
+  // 列下标与后端 _SERIES_COLS 一一对应，改动必须两边一起改
+  var IDX = {t:0, spd:1, rpm:2, thr:3, brk:4, gear:5, glat:6, glon:7, fuel:8, lap:9};
+  // 表格列（顺序即显示顺序）
+  var HEAD = [
+    ['t',    '时间(s)'],
+    ['spd',  '速度(km/h)'],
+    ['rpm',  '转速'],
+    ['gear', '档位'],
+    ['thr',  '油门(%)'],
+    ['brk',  '刹车(%)'],
+    ['glat', '横向G'],
+    ['glon', '纵向G'],
+    ['fuel', '油量(%)'],
+    ['lap',  '圈']
+  ];
+  // 曲线的分面配置：fix=固定量程，sym=以 0 对称（G 力）
+  var FACETS = [
+    {k:'spd',  label:'速度',   unit:'km/h', c:'#0d6efd'},
+    {k:'rpm',  label:'转速',   unit:'rpm',  c:'#e8590c'},
+    {k:'thr',  label:'油门',   unit:'%',    c:'#198754', fix:[0,100]},
+    {k:'brk',  label:'刹车',   unit:'%',    c:'#dc3545', fix:[0,100]},
+    {k:'gear', label:'档位',   unit:'',     c:'#7048e8'},
+    {k:'glon', label:'纵向 G', unit:'g',    c:'#c2255c', sym:true},
+    {k:'glat', label:'横向 G', unit:'g',    c:'#0c8599', sym:true},
+    {k:'fuel', label:'油量',   unit:'%',    c:'#f08c00'}
+  ];
+  var pageSize = 200, pageOff = 0, curLap = 0, rows = [], laps = [], ready = false;
+
+  function gv(n, fb) {
+    var v = getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    return v || fb;
+  }
+  function el(id) { return document.getElementById(id); }
+  function fmtCell(k, v) {
+    if (v === null || v === undefined || v === '') return '-';
+    if (k === 'glat' || k === 'glon') return (+v).toFixed(2);
+    if (k === 't') return (+v).toFixed(2);
+    if (k === 'thr' || k === 'brk' || k === 'fuel') return String(Math.round(v));
+    return String(Math.round(v));
+  }
+  function fmtTick(f, v) {
+    if (f.sym) return (v > 0 ? '+' : '') + (v === 0 ? '0' : (+v).toFixed(1));
+    if (f.k === 'rpm') return String(Math.round(v));
+    if (f.unit === 'g') return (+v).toFixed(1);
+    return String(Math.round(v));
+  }
+
+  // —— 全通道分面曲线 ——
+  // 每个通道独立 Y 轴：速度 0~250、转速 0~9000、踏板 0~100 量纲差两个数量级，
+  // 共用一把尺只会得到「油门线爬满格」的尺度假象。
+  function renderChart() {
+    var box = el('teleChart');
+    if (!box) return;
+    if (!ready) { box.innerHTML = '<div style="padding:26px;text-align:center;color:var(--muted)">正在读取逐帧数据…</div>'; return; }
+    if (!rows.length) { box.innerHTML = '<div style="padding:26px;text-align:center;color:var(--muted)">这一范围没有逐帧数据</div>'; return; }
+    var W = Math.max(360, box.clientWidth || 720);
+    var PADL = 4, PADR = 48, PW = W - PADL - PADR;
+    var FH = 56, GAP = 12, XLH = 20;
+    var t0 = rows[0][IDX.t], t1 = rows[rows.length - 1][IDX.t];
+    var span = Math.max(t1 - t0, 0.001);
+    var grid = gv('--cv-grid', 'rgba(128,128,128,.18)');
+    var tcol = gv('--cv-text', 'rgba(128,128,128,.6)');
+    function X(t) { return PADL + PW * (t - t0) / span; }
+
+    var total = FACETS.length * (FH + GAP) + XLH;
+    var s = '<svg width="' + W + '" height="' + total + '" viewBox="0 0 ' + W + ' ' + total + '">';
+    for (var fi = 0; fi < FACETS.length; fi++) {
+      var f = FACETS[fi], yi = IDX[f.k];
+      var vals = [], has = false;
+      for (var i = 0; i < rows.length; i++) {
+        var v = rows[i][yi];
+        if (v === null || v === undefined) continue;
+        has = true; vals.push(+v);
+      }
+      if (!has) continue;
+      var mn, mx;
+      if (f.fix) { mn = f.fix[0]; mx = f.fix[1]; }
+      else if (f.sym) {
+        var a = 0.5;
+        for (var j = 0; j < vals.length; j++) a = Math.max(a, Math.abs(vals[j]));
+        mn = -a; mx = a;
+      } else {
+        mn = vals[0]; mx = vals[0];
+        for (var j2 = 0; j2 < vals.length; j2++) {
+          if (vals[j2] < mn) mn = vals[j2];
+          if (vals[j2] > mx) mx = vals[j2];
+        }
+        if (mx - mn < 1e-6) { mx = mn + 1; }
+        // 上下各留 6% 余量，线不贴边
+        var pad = (mx - mn) * 0.06; mn -= pad; mx += pad;
+      }
+      var top = fi * (FH + GAP) + 13, bot = top + FH - 16;
+      // ⚠️ 用函数表达式而不是块内 function 声明：块级函数声明在不同
+      //    JS 引擎/严格模式下的作用域规则不一致，这里是循环体内，别踩。
+      var Y = function (v) { return bot - (bot - top) * ((v - mn) / (mx - mn)); };
+      // 网格 + 右侧刻度
+      for (var k = 0; k < 3; k++) {
+        var tv = mn + (mx - mn) * k / 2;
+        var gy = Y(tv).toFixed(1);
+        s += '<line x1="' + PADL + '" y1="' + gy + '" x2="' + (PADL + PW)
+          + '" y2="' + gy + '" stroke="' + grid + '" stroke-width="1"'
+          + (k === 0 ? '' : ' stroke-dasharray="3 3"') + '/>';
+        s += '<text x="' + (PADL + PW + 5) + '" y="' + (+gy + 3.5)
+          + '" font-size="10" fill="' + tcol + '">' + fmtTick(f, tv) + '</text>';
+      }
+      // 通道名（左上角，用本通道颜色，省掉一整个图例）
+      s += '<text x="' + (PADL + 2) + '" y="' + (top - 5) + '" font-size="10.5"'
+        + ' font-weight="600" fill="' + f.c + '">' + f.label
+        + (f.unit ? ' <tspan font-weight="400">' + f.unit + '</tspan>' : '') + '</text>';
+      // 数据线（缺值断开，不画成直线连过去）
+      var d = '', pen = false;
+      for (var q = 0; q < rows.length; q++) {
+        var vv = rows[q][yi];
+        if (vv === null || vv === undefined) { pen = false; continue; }
+        d += (pen ? 'L' : 'M') + X(rows[q][IDX.t]).toFixed(1) + ',' + Y(+vv).toFixed(1);
+        pen = true;
+      }
+      s += '<path d="' + d + '" fill="none" stroke="' + f.c
+        + '" stroke-width="1.4" stroke-linejoin="round"/>';
+    }
+    // 时间轴（共用一条，标 5 个刻度）
+    // ⚠️ 刻度值用「相对当前范围起点」的秒数：选了第 3 圈还标 162.7s 会让人
+    //    以为是场次时间，读圈内节奏（入弯/出弯在第几秒）就完全对不上。
+    //    x 坐标本身用的就是同一个 t0，所以相对化后刻度与曲线位置一致。
+    var axY = FACETS.length * (FH + GAP) + 13;
+    for (var m = 0; m <= 4; m++) {
+      var tv2 = span * m / 4;
+      var xx = X(t0 + tv2);
+      s += '<text x="' + xx.toFixed(1) + '" y="' + axY + '" font-size="10" fill="'
+        + tcol + '" text-anchor="' + (m === 0 ? 'start' : (m === 4 ? 'end' : 'middle'))
+        + '">' + tv2.toFixed(1) + 's</text>';
+    }
+    s += '</svg>';
+    box.innerHTML = s;
+  }
+
+  // —— 逐帧表格（服务端分页）——
+  function renderTable(data) {
+    var head = el('teleHead'), body = el('teleBody');
+    if (!head || !body) return;
+    if (!head.innerHTML) {
+      head.innerHTML = '<tr>' + HEAD.map(function (h) {
+        return '<th>' + h[1] + '</th>';
+      }).join('') + '</tr>';
+    }
+    body.innerHTML = (data.rows || []).map(function (r, i) {
+      return '<tr>' + HEAD.map(function (h) {
+        var ci = IDX[h[0]];
+        return '<td class="num">' + fmtCell(h[0], r[ci]) + '</td>';
+      }).join('') + '</tr>';
+    }).join('') || '<tr><td colspan="' + HEAD.length
+      + '" style="text-align:center;color:var(--muted)">无数据</td></tr>';
+    var from = data.total ? data.offset + 1 : 0;
+    var to = Math.min(data.offset + data.limit, data.total);
+    el('telePageInfo').textContent = '第 ' + from + '–' + to + ' 帧 / 共 '
+      + data.total + ' 帧' + (curLap ? '（第 ' + curLap + ' 圈）' : '');
+  }
+
+  function loadTable() {
+    var u = API + '/frames?offset=' + pageOff + '&limit=' + pageSize
+      + (curLap ? '&lap=' + curLap : '');
+    return fetch(u).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.error) { el('telePageInfo').textContent = d.error; return; }
+      renderTable(d);
+    }).catch(function () {
+      el('telePageInfo').textContent = '读取失败';
+    });
+  }
+
+  window.telePage = function (dir) {
+    var next = pageOff + dir * pageSize;
+    if (next < 0) return;
+    pageOff = next;
+    loadTable();
+  };
+
+  window.teleSetLap = function (v) {
+    curLap = parseInt(v, 10) || 0;
+    pageOff = 0;
+    loadSeries();
+    loadTable();
+  };
+
+  function loadSeries() {
+    ready = false;
+    renderChart();
+    var u = API + '/series?max_points=2400' + (curLap ? '&lap=' + curLap : '');
+    return fetch(u).then(function (r) { return r.json(); }).then(function (d) {
+      ready = true;
+      if (d.error) {
+        rows = [];
+        el('teleMeta').textContent = d.error;
+        renderChart();
+        return;
+      }
+      rows = d.rows || [];
+      laps = d.laps || [];
+      var sel = el('teleLapSel');
+      if (sel && !sel.options.length) {
+        var best = null;
+        for (var i = 0; i < laps.length; i++) {
+          if (best === null || laps[i].dur < best) best = laps[i].dur;
+        }
+        var h = '<option value="0">整场</option>';
+        for (var j = laps.length - 1; j >= 0; j--) {
+          h += '<option value="' + laps[j].lap + '">第 ' + laps[j].lap + ' 圈 · '
+            + laps[j].dur.toFixed(2) + 's'
+            + (laps[j].dur === best ? ' ★最快' : '') + '</option>';
+        }
+        sel.innerHTML = h;
+      }
+      var step = d.step || 1;
+      // 用 scope_frames（当前范围）而不是 total_frames（整场）——
+      // 选了第 3 圈还写整场的帧数会让人以为圈数据丢了。
+      el('teleMeta').textContent = (curLap ? '第 ' + curLap + ' 圈 · ' : '整场 · ')
+        + '共 ' + (d.scope_frames || d.total_frames || 0) + ' 帧 · 画了 '
+        + (d.rows || []).length + ' 点' + (step > 1 ? '（每 ' + step + ' 帧取 1）' : '');
+      var csv = el('teleCsv');
+      if (csv) csv.href = API + '/csv' + (curLap ? '?lap=' + curLap : '');
+      renderChart();
+    }).catch(function () {
+      ready = true;
+      rows = [];
+      renderChart();
+      el('teleMeta').textContent = '读取失败';
+    });
+  }
+
+  function boot() {
+    loadSeries();
+    loadTable();
+    var cz = el('teleChart');
+    if (cz && window.makeZoomable) {
+      window.registerZoom('teleChart', {
+        title: '遥测数据 · 全通道曲线', kind: 'node', src: 'teleChart'
+      });
+      makeZoomable(cz, 'teleChart');
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else { boot(); }
+
+  // 窗口变宽变窄要重画（SVG 是按容器像素宽拼的，不是 viewBox 自适应）
+  var rt = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(rt);
+    rt = setTimeout(renderChart, 180);
+  });
 })();
 </script>
 """
@@ -2129,8 +2846,12 @@ def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None) -
       {''.join(lap_rows)}</table>''' if lap_rows else
      '<p style="font-size:13px;color:var(--muted)">未能识别出完整的圈（可能只跑了几秒）</p>'}
 </div>"""
+    # 文件名要嵌进 JS 的单引号字符串里：把反斜杠和单引号剥掉，
+    # 免得带奇怪字符的文件名把 __FILE__ 那行拆掉、整段脚本挂掉。
+    js_file = path.name.replace("\\", "").replace("'", "")
     return _page_shell(f"场次 · {_html.escape(str(hdr.get('circuit') or 'unknown'))}",
-                       body + _COMPARE_TMPL.replace('__DATA__', cmp_json))
+                       body + _COMPARE_TMPL.replace('__DATA__', cmp_json)
+                       + _TELEMETRY_TMPL.replace('__FILE__', js_file))
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -2139,10 +2860,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <script>/*THEME_BOOT_JS*/</script>
+<script>/*ZOOM_JS*/</script>
 <title>GT7 遥测仪表盘</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 /*THEME_CSS*/
+/*ZOOM_CSS*/
 body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   background:var(--bg); color:var(--text); padding:var(--pad-body); }
 .bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap;
@@ -2806,15 +3529,22 @@ th { color:var(--muted); font-weight:500; }
     </div>
 
     <div class="card span2" id="c-map">
-    <h2>行车轨迹 <span id="mapinfo" style="float:right;font-weight:400"></span></h2>
+    <h2>行车轨迹
+      <span style="float:right;display:flex;gap:8px;align-items:center;text-transform:none">
+        <span id="mapinfo" style="font-weight:400;color:var(--muted)"></span>
+        <select id="mapLapSel" onchange="setMapLap(this.value)"
+          style="font-weight:400;font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"></select>
+        <select id="mapModeSel" onchange="setMapMode(this.value)"
+          style="font-weight:400;font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit">
+          <option value="g">按 G 力着色</option>
+          <option value="pedal">按踏板着色（赛车线）</option>
+        </select>
+      </span>
+    </h2>
     <canvas id="map" width="760" height="420"
       style="width:100%;max-width:760px;display:block;margin:0 auto"></canvas>
-    <div class="legend" style="justify-content:center;margin-top:6px">
-      <span><i style="background:#0d6efd"></i>低 G</span>
-      <span><i style="background:#198754"></i>中 G</span>
-      <span><i style="background:#fd7e14"></i>高 G</span>
-      <span><i style="background:#dc3545"></i>极高 G（重刹/急弯）</span>
-    </div>
+    <div class="legend" id="mapLegend" style="justify-content:center;margin-top:6px"></div>
+    <p id="mapHint" style="font-size:11.5px;color:var(--muted);margin-top:8px"></p>
   </div>
 
     <div class="card span2" id="c-chart">
@@ -2925,6 +3655,9 @@ const DEFAULT_PREFS = {
   theme: 'auto', accent: '', density: 'normal', fontScale: 100,
   speedUnit: 'kph', chartWindow: 300, ggMax: 3,
   chartSeries: {speed:true, rpm:true, throttle:true, brake:true},
+  // 行车轨迹的着色模式：'g' = 按 G 力 / 'pedal' = 按踏板（赛车线）。
+  // 存在偏好里，刷新页面不会跳回默认模式。
+  mapMode: 'g',
 };
 
 function hexToRgbStr(hex) {
@@ -2946,6 +3679,7 @@ function loadPrefs() {
   if (!THEMES.some(t => t.id === p.theme)) p.theme = 'auto';
   if (['compact','normal','cozy'].indexOf(p.density) < 0) p.density = 'normal';
   if (['kph','mph'].indexOf(p.speedUnit) < 0) p.speedUnit = 'kph';
+  if (['g','pedal'].indexOf(p.mapMode) < 0) p.mapMode = 'g';
   if (WINDOWS.indexOf(+p.chartWindow) < 0) p.chartWindow = 300;
   p.fontScale = Math.min(160, Math.max(80, +p.fontScale || 100));
   p.ggMax = Math.min(4, Math.max(1.5, +p.ggMax || 3));
@@ -2984,6 +3718,8 @@ function applyPrefs() {
   }
   $('speedUnit').textContent = spdUnit();
   GG_MAX = +prefs.ggMax;          // 抓地力图与 G 力球共用同一量程
+  const ms = $('mapModeSel'); if (ms) ms.value = prefs.mapMode || 'g';
+  refreshMapLegend();             // 图例/说明跟着着色模式换
   renderPrefPanel();
 }
 
@@ -3333,7 +4069,9 @@ function render(s) {
   }
 
   drawChart(s.history);
-  drawMap(s.path);
+  mapLastPath = s.path || [];
+  renderMapLapOptions(s.lap_times);
+  drawMap(mapLastPath);
   drawGG(s.gg);
 
   // —— G 力球：只更新「目标位置」与读数，真正的平滑动画在 ggLoop 里 ——
@@ -3472,27 +4210,74 @@ function gColor(g) {
   return 'rgb(' + (r | 0) + ',' + (gr | 0) + ',' + (b | 0) + ')';
 }
 
-// ---------- 行车轨迹（按 G 力着色）----------
-function drawMap(path) {
-  const cv = $('map'); if (!cv) return;
-  const ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height, PAD = 20;
-  ctx.clearRect(0, 0, W, H);
+// ---------- 踏板开度 → 颜色（与场次详情页的赛车线同一套口径）----------
+// 刹车「粉→红」（踩得越重越红），油门「青→绿」（踩得越深越绿）。
+// 🔴 与场次详情页 _COMPARE_TMPL 里的 PINK/RED/CYAN/GREEN 必须保持一致，
+//    否则同一辆车在实时页和历史页会是两种配色。
+var PEDAL_PINK = [255, 105, 180], PEDAL_RED = [255, 40, 40];
+var PEDAL_CYAN = [0, 188, 212], PEDAL_GREEN = [0, 200, 83];
+function pedalMix(c1, c2, k) {
+  k = k < 0 ? 0 : (k > 1 ? 1 : k);
+  return 'rgb(' + Math.round(c1[0] + (c2[0] - c1[0]) * k) + ',' +
+    Math.round(c1[1] + (c2[1] - c1[1]) * k) + ',' +
+    Math.round(c1[2] + (c2[2] - c1[2]) * k) + ')';
+}
+// 一段折线的颜色：刹车优先（trail braking 视觉上按刹车画）
+function pedalColor(b, t, coastCol) {
+  b = +b || 0; t = +t || 0;
+  if (b > 0.03 && b >= t) return pedalMix(PEDAL_PINK, PEDAL_RED, b);
+  if (t > 0.03) return pedalMix(PEDAL_CYAN, PEDAL_GREEN, t);
+  return coastCol;
+}
 
-  if (!path || path.length < 2) {
+// ---------- 行车轨迹 ----------
+// 两种着色模式，用户在下拉里自由切换：
+//   g      —— 按 G 力大小（蓝→绿→橙→红），看车在哪压榨抓地力
+//   pedal  —— 按踏板开度（刹车粉→红 / 油门青→绿），即「赛车线」
+// 轨迹点格式：[x, z, gmag, throttle, brake, lap, speed]。
+// 🔴 旧场次/旧接收器只有 [x, z, gmag] 三个值，缺失的踏板按 0 处理，
+//    此时 pedal 模式等价于整条线都是滑行色——不能因此报错或画不出图。
+//
+// mapLapNo：0 = 画整场累积轨迹；N = 只画第 N 圈（这就是「参考圈赛车线」）。
+// 它是每场重来的运行时状态，刻意不写进偏好（换一场圈号就无意义了）。
+let mapLapNo = 0;
+function mapPoint(p, i) {
+  return {
+    x: p[0], z: p[1], g: p[2] || 0,
+    th: p.length > 3 && p[3] != null ? p[3] : 0,
+    bk: p.length > 4 && p[4] != null ? p[4] : 0,
+    lap: p.length > 5 ? p[5] : null,
+    sp: p.length > 6 ? p[6] : null,
+    i: i,
+  };
+}
+
+function drawMapInto(cv, W, H, rawPath, mode, lapNo) {
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  const PAD = Math.round(W * 0.026) + 6;
+  const info = $('mapinfo');
+
+  // 选圈时只画那一圈（这就是「参考圈赛车线」）；否则画整场累积轨迹
+  let pts = (rawPath || []).map(mapPoint);
+  if (lapNo) pts = pts.filter(p => p.lap === lapNo);
+  if (pts.length < 2) {
     ctx.fillStyle = gvar('--cv-text', 'rgba(128,128,128,.65)');
-    ctx.font = '13px system-ui,-apple-system,sans-serif';
+    ctx.font = Math.round(H * 0.031) + 'px system-ui,-apple-system,sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('等待赛道数据…（车开动后自动绘制）', W / 2, H / 2);
-    $('mapinfo').textContent = '';
+    ctx.fillText(!rawPath || !rawPath.length
+      ? '等待赛道数据…（车开动后自动绘制）'
+      : (lapNo ? '这一圈还没有轨迹点' : '轨迹点不足'), W / 2, H / 2);
+    if (info && lapNo) info.textContent = '';
     return;
   }
 
   // 包围盒
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-  for (const p of path) {
-    if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
-    if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1];
+  for (const p of pts) {
+    if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+    if (p.z < z0) z0 = p.z; if (p.z > z1) z1 = p.z;
   }
   const spanX = Math.max(x1 - x0, 1), spanZ = Math.max(z1 - z0, 1);
   const sc = Math.min((W - 2 * PAD) / spanX, (H - 2 * PAD) / spanZ);
@@ -3503,45 +4288,114 @@ function drawMap(path) {
   const px = x => ox + x * sc;
   const py = z => H - (oy + z * sc);
 
-  // 逐段着色：每段取两端较大的 G 值
+  // 逐段着色
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.lineWidth = 2.4;
-  for (let i = 1; i < path.length; i++) {
-    const g = Math.max(path[i][2] || 0, path[i - 1][2] || 0);
-    ctx.strokeStyle = gColor(g);
+  ctx.lineWidth = Math.max(2.4, W / 320);
+  const coastCol = gvar('--accent', '#0d6efd');
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    if (mode === 'pedal') {
+      // 用两端均值，避免一个点抖动就换色
+      ctx.strokeStyle = pedalColor((a.bk + b.bk) / 2, (a.th + b.th) / 2, coastCol);
+    } else {
+      ctx.strokeStyle = gColor(Math.max(a.g, b.g));
+    }
     ctx.beginPath();
-    ctx.moveTo(px(path[i - 1][0]), py(path[i - 1][1]));
-    ctx.lineTo(px(path[i][0]), py(path[i][1]));
+    ctx.moveTo(px(a.x), py(a.z));
+    ctx.lineTo(px(b.x), py(b.z));
     ctx.stroke();
   }
 
-  // 起点（绿圈）与当前位置（白点）
-  const s0 = path[0], sN = path[path.length - 1];
+  // 起点（绿圈）与当前位置（底色填充 + 强调色描边）
+  const s0 = pts[0], sN = pts[pts.length - 1];
+  const r0 = Math.max(5, W / 152);
   ctx.fillStyle = gvar('--ok', '#198754');
-  ctx.beginPath(); ctx.arc(px(s0[0]), py(s0[1]), 5, 0, Math.PI * 2); ctx.fill();
-  // 当前位置：卡片底色填充 + 强调色描边，深浅主题上都看得见
+  ctx.beginPath(); ctx.arc(px(s0.x), py(s0.z), r0, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = gvar('--card', '#fff');
   ctx.strokeStyle = gvar('--accent', '#0d6efd'); ctx.lineWidth = 2.5;
-  ctx.beginPath(); ctx.arc(px(sN[0]), py(sN[1]), 5.5, 0, Math.PI * 2);
+  ctx.beginPath(); ctx.arc(px(sN.x), py(sN.z), r0 * 1.1, 0, Math.PI * 2);
   ctx.fill(); ctx.stroke();
 
-  $('mapinfo').textContent = path.length + ' 点 · 最高 ' +
-    Math.max.apply(null, path.map(p => p[2] || 0)).toFixed(1) + 'g';
+  if (info) {
+    let top = 0;
+    for (const p of pts) if (p.g > top) top = p.g;
+    info.textContent = pts.length + ' 点' +
+      (lapNo ? '（第 ' + lapNo + ' 圈）' : '') + ' · 最高 ' + top.toFixed(1) + 'g';
+  }
+}
+
+function drawMap(path) {
+  const cv = $('map'); if (!cv) return;
+  drawMapInto(cv, cv.width, cv.height, path, prefs.mapMode || 'g', mapLapNo);
+}
+
+// 最近一次收到的轨迹：切换着色模式 / 选圈时立刻重画，不必等下一帧数据
+// （状态文件的轨迹是 2Hz 才写一次，等下一帧要半秒，切换会显得「卡住」）。
+let mapLastPath = [];
+
+function refreshMapLegend() {
+  const lg = $('mapLegend'), hint = $('mapHint');
+  if (!lg) return;
+  if ((prefs.mapMode || 'g') === 'pedal') {
+    lg.innerHTML =
+      '<span><i style="width:30px;background:linear-gradient(90deg,#00bcd4,#00c853)"></i>油门（青 → 绿，越深越浓）</span>' +
+      '<span><i style="width:30px;background:linear-gradient(90deg,#ff69b4,#ff2828)"></i>刹车（粉 → 红，越重越红）</span>' +
+      '<span><i style="background:var(--accent)"></i>滑行</span>';
+    if (hint) hint.textContent = '线色来自逐帧记录的踏板开度百分比：刹车踩得越重越红，' +
+      '油门踩得越深越绿，两个都不踩的滑行段用强调色。选「整场」看本次全部行驶轨迹；' +
+      '选某一圈就得到那一圈的「参考圈赛车线」——用来复盘自己每一脚的给油/刹车。';
+  } else {
+    lg.innerHTML =
+      '<span><i style="background:#0d6efd"></i>低 G</span>' +
+      '<span><i style="background:#198754"></i>中 G</span>' +
+      '<span><i style="background:#fd7e14"></i>高 G</span>' +
+      '<span><i style="background:#dc3545"></i>极高 G（重刹/急弯）</span>';
+    if (hint) hint.textContent = '线色是车身受到的合力大小：越红说明这一处越接近抓地力极限。' +
+      '想改成看油门 / 刹车，切到右边的「按踏板着色」。';
+  }
+}
+
+function renderMapLapOptions(lt) {
+  const sel = $('mapLapSel'); if (!sel) return;
+  lt = lt || [];
+  const best = lt.length > 1 ? Math.min.apply(null, lt.map(x => x[1])) : null;
+  let html = '<option value="0">整场</option>';
+  for (let i = lt.length - 1; i >= 0; i--) {     // 新圈排在前面
+    const n = lt[i][0], ms = lt[i][1];
+    html += '<option value="' + n + '">第 ' + n + ' 圈 · ' + fmtMs(ms) +
+      (ms === best ? ' ★最快' : '') + '</option>';
+  }
+  sel.innerHTML = html;
+  // 换场次后原先选中的圈可能已不存在，退回「整场」
+  if (mapLapNo && !lt.some(x => x[0] === mapLapNo)) mapLapNo = 0;
+  sel.value = String(mapLapNo);
+}
+
+function setMapMode(v) {
+  prefs.mapMode = (v === 'pedal') ? 'pedal' : 'g';
+  savePrefs();
+  refreshMapLegend();
+  drawMap(mapLastPath);
+}
+
+function setMapLap(v) {
+  mapLapNo = +v || 0;
+  drawMap(mapLastPath);
 }
 
 // ---------- G-G 散点图（抓地力圆）----------
 // 保留原样：把整场比赛的 (横向G, 纵向G) 打成散点，
 // 用来看这辆车/这条赛道把轮胎用到什么程度（抓地力圆）。
-function drawGG(gg) {
-  const cv = $('gg'); if (!cv) return;
+function drawGGInto(cv, W, H, gg) {
+  if (!cv) return;
   const ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height;
   const cx = W / 2, cy = H / 2;
   const GMAX = GG_MAX;                    // 量程跟着个性化面板走
   const R = Math.min(W, H) / 2 - 16;
   const sc = R / GMAX;
   const CV_TEXT = gvar('--cv-text', 'rgba(128,128,128,.65)');
+  const FS = Math.max(10, Math.round(W / 68));   // 放大时字号同步放大
   ctx.clearRect(0, 0, W, H);
 
   ctx.lineWidth = 1;
@@ -3558,22 +4412,23 @@ function drawGG(gg) {
 
   if (gg && gg.length) {
     const n = gg.length;
+    const dot = Math.max(1.7, W / 400);
     for (let i = 0; i < n; i++) {
       const lat = gg[i][0], lon = gg[i][1];
       const x = cx + lat * sc;
       const y = cy - lon * sc;
       ctx.globalAlpha = 0.12 + 0.55 * (i / n);
       ctx.fillStyle = gColor(Math.hypot(lat, lon));
-      ctx.beginPath(); ctx.arc(x, y, 1.7, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, dot, 0, Math.PI * 2); ctx.fill();
     }
     ctx.globalAlpha = 1;
   }
 
   ctx.fillStyle = CV_TEXT;
-  ctx.font = '10px system-ui,-apple-system,sans-serif';
+  ctx.font = FS + 'px system-ui,-apple-system,sans-serif';
   ctx.textAlign = 'center';
   ctx.fillText('加速', cx, cy - R - 5);
-  ctx.fillText('刹车', cx, cy + R + 12);
+  ctx.fillText('刹车', cx, cy + R + FS + 2);
   ctx.textAlign = 'left';
   ctx.fillText('右转', cx + R + 3, cy + 3);
   ctx.textAlign = 'right';
@@ -3581,9 +4436,15 @@ function drawGG(gg) {
   if (!gg || !gg.length) {
     ctx.fillStyle = CV_TEXT;
     ctx.textAlign = 'center';
-    ctx.font = '12px system-ui,-apple-system,sans-serif';
     ctx.fillText('过弯后自动生成', cx, cy - 6);
   }
+}
+
+let lastGG = [];        // 最近一次 G-G 散点（放大时按新尺寸重画要用）
+function drawGG(gg) {
+  lastGG = gg || [];
+  const cv = $('gg'); if (!cv) return;
+  drawGGInto(cv, cv.width, cv.height, lastGG);
 }
 
 // ---------- G 力球（实时摇晃，仿 SU7 那种）----------
@@ -3611,22 +4472,24 @@ function ggTheme() {
   };
 }
 
-function drawBall() {
-  const cv = $('gball'); if (!cv) return;
+function drawBallInto(cv, W, H) {
+  if (!cv) return;
   const ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height;
+  // 原始设计尺寸 680×620；放大重画时所有半径/线宽/字号按 k 同步放大，
+  // 否则放大版会变成「一堆细线 + 蚂蚁字」。
+  const k = W / 680;
+  const R = Math.min(W, H) / 2 - 22 * k;
   const cx = W / 2, cy = H / 2;
-  const R = Math.min(W, H) / 2 - 22;
   const sc = R / GG_MAX;
   const th = ggTheme();
   ctx.clearRect(0, 0, W, H);
 
   // 浅碗底盘
   ctx.fillStyle = th.bowl;
-  ctx.beginPath(); ctx.arc(cx, cy, R + 9, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, R + 9 * k, 0, Math.PI * 2); ctx.fill();
 
   // 参考环
-  ctx.lineWidth = 1;
+  ctx.lineWidth = Math.max(1, k);
   for (let g = 1; g <= GG_MAX; g++) {
     ctx.strokeStyle = (g === GG_MAX) ? th.edge : th.ring;
     ctx.beginPath(); ctx.arc(cx, cy, sc * g, 0, Math.PI * 2); ctx.stroke();
@@ -3645,7 +4508,7 @@ function drawBall() {
     ctx.globalAlpha = 0.04 + 0.26 * (i / Math.max(1, n));
     ctx.fillStyle = gColor(Math.hypot(t.x, t.y));
     ctx.beginPath();
-    ctx.arc(cx + t.x * sc, cy - t.y * sc, 2.4, 0, Math.PI * 2);
+    ctx.arc(cx + t.x * sc, cy - t.y * sc, 2.4 * k, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
@@ -3654,39 +4517,43 @@ function drawBall() {
   const bx = cx + ggBall.x * sc;
   const by = cy - ggBall.y * sc;
   const gmag = Math.hypot(ggBall.x, ggBall.y);
-  ctx.shadowColor = th.shadow; ctx.shadowBlur = 12; ctx.shadowOffsetY = 3;
-  const grad = ctx.createRadialGradient(bx - 5, by - 6, 1.5, bx, by, 17);
+  ctx.shadowColor = th.shadow; ctx.shadowBlur = 12 * k; ctx.shadowOffsetY = 3 * k;
+  const grad = ctx.createRadialGradient(bx - 5 * k, by - 6 * k, 1.5 * k, bx, by, 17 * k);
   grad.addColorStop(0, 'rgba(255,255,255,.95)');
   grad.addColorStop(0.45, gColor(gmag));
   grad.addColorStop(1, gColor(gmag));
   ctx.fillStyle = grad;
-  ctx.beginPath(); ctx.arc(bx, by, 16, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(bx, by, 16 * k, 0, Math.PI * 2); ctx.fill();
   ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
 
   // 中心→球的连线，强化方向感
   if (gmag > 0.08) {
     ctx.strokeStyle = 'rgba(140,140,140,.55)';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1.5 * k;
     ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(bx, by); ctx.stroke();
   }
 
   // 方位标签
   ctx.fillStyle = th.text;
-  ctx.font = '10px system-ui,-apple-system,sans-serif';
+  ctx.font = Math.max(10, Math.round(10 * k)) + 'px system-ui,-apple-system,sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('加速', cx, cy - R - 10);
-  ctx.fillText('刹车', cx, cy + R + 18);
+  ctx.fillText('加速', cx, cy - R - 10 * k);
+  ctx.fillText('刹车', cx, cy + R + 18 * k);
   ctx.textAlign = 'left';
-  ctx.fillText('右转', cx + R + 5, cy + 3);
+  ctx.fillText('右转', cx + R + 5 * k, cy + 3);
   ctx.textAlign = 'right';
-  ctx.fillText('左转', cx - R - 5, cy + 3);
+  ctx.fillText('左转', cx - R - 5 * k, cy + 3);
 
   if (!ggReady) {
     ctx.fillStyle = th.text;
     ctx.textAlign = 'center';
-    ctx.font = '12px system-ui,-apple-system,sans-serif';
     ctx.fillText('等待车辆数据…', cx, cy - 4);
   }
+}
+
+function drawBall() {
+  const cv = $('gball'); if (!cv) return;
+  drawBallInto(cv, cv.width, cv.height);
 }
 
 // 平滑动画：让球「摇」起来，而不是硬跳
@@ -3901,7 +4768,30 @@ applyLayout();            // 启动时按保存的布局排列一次
 // 放在最后：applyPrefs() 会读写 GG_MAX / 依赖已声明完的函数，
 // 提前调用会撞上 let 的暂时性死区。
 applyPrefs();             // 再把主题/单位/图表偏好应用到页面上
+
+// —— 图表点击放大：登记「怎么画」，屏幕上那份与放大版共用同一段代码 ——
+// kw/h 是各图的设计比例，放大时按它算目标尺寸（避免拉伸变形）。
+registerZoom('map', {
+  title: '行车轨迹', kind: 'canvas', ar: 760 / 420,
+  draw: function (cv, W, H) { drawMapInto(cv, W, H, mapLastPath, prefs.mapMode || 'g', mapLapNo); }
+});
+registerZoom('gg', {
+  title: 'G-G 图（抓地力圆）', kind: 'canvas', ar: 680 / 620,
+  draw: function (cv, W, H) { drawGGInto(cv, W, H, lastGG); }
+});
+registerZoom('gball', {
+  title: 'G 力球', kind: 'canvas', ar: 680 / 620,
+  draw: function (cv, W, H) { drawBallInto(cv, W, H); }
+});
+// 实时曲线是 SVG：克隆 DOM 交给浏览器矢量放大，比重新拼一遍字符串更省事也更清晰
+registerZoom('chart', { title: '实时曲线', kind: 'node', src: 'chart' });
+
+makeZoomable($('map'), 'map');
+makeZoomable($('gg'), 'gg');
+makeZoomable($('gball'), 'gball');
+makeZoomable($('chart'), 'chart');
 </script>
+/*ZOOM_HTML*/
 </body>
 </html>
 """

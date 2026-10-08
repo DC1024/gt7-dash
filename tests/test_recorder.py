@@ -111,6 +111,29 @@ class TestGeoAccumulation:
         feed(r, dec, menu_frames(600, t + 5))            # 场次还在，但车在菜单
         assert len(r._path) == p1, "菜单帧不得写入轨迹（同坐标垃圾点污染）"
 
+    def test_path_point_carries_pedals_and_lap(self, rec, dec, make_recorder):
+        """轨迹点必须带踏板/圈号/速度 —— 仪表盘的「参考圈赛车线」靠它上色。
+
+        只有 [x, z, g] 三个值的旧格式画不出踏板渐变（只能按 G 力上色），
+        所以这里把字段顺序钉死：[x, z, g, throttle, brake, lap, speed]。
+        """
+        r = make_recorder(off_track_timeout=15.0)
+        t = time.time()
+        # 全程重刹 + 半油门，圈号 3，速度约 40m/s≈144km/h
+        frames = [(build_packet(True, 40.0, 100 + i * 0.5, 50 + i * 0.3,
+                                lap=3, last_lap=95000, throttle=0.5, brake=0.9),
+                   t + i / 60) for i in range(300)]
+        feed(r, dec, frames)
+        assert r._path, "应当累积出轨迹点"
+        p = r._path[-1]
+        assert len(p) == 7, f"轨迹点应是 7 元组，实际 {len(p)}"
+        x, z, g, th, bk, lap, sp = p
+        assert isinstance(lap, int) and lap == 3
+        assert abs(th - 0.5) < 0.01, f"油门应保留约 0.5，实际 {th}"
+        assert abs(bk - 0.9) < 0.01, f"刹车应保留约 0.9，实际 {bk}"
+        assert 140 < sp < 150, f"速度应约 144km/h，实际 {sp}"
+        assert g >= 0
+
 
 class TestLapTimes:
     def test_lap_time_recorded_once_per_change(self, rec, dec, make_recorder):
