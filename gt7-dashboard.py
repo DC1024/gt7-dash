@@ -494,6 +494,11 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                 ),
                 "car_name": car_name,
                 "best_lap_s": best,
+                # 异常场次：没有任何完成圈（best=None），或唯一圈 <20s
+                # （本应用口径 <20s 不算有效圈）。这类是菜单/停车场/刚点火的
+                # 残片，可一键清掉，但又怕误删正在跑的场——所以只标记 + 提供
+                # 「只看异常」筛选 + 一键清理到回收站（可恢复），不自动删。
+                "anomalous": best is None or (isinstance(best, (int, float)) and best < 20),
                 "time_str": time_str,
                 # —— 用户标注 ——
                 "favorite": bool(m.get("favorite")),
@@ -727,6 +732,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
 （`favorite: bool`、`custom_name: string`），收藏的场次排在最前。
 列表每项还带 `car_name`（车型短名，从 `cars.csv` 查 ShortName，查不到为空串）。
+`anomalous: bool` 表示异常场次（没有任何完成圈 / 唯一圈 <20s，多为菜单、停车场、
+刚点火的残片），历史场次页会打「异常」徽标并提供「清理异常场次 → 回收站」入口。
 
 ### 参数
 
@@ -1485,6 +1492,10 @@ _SESSIONS_PAGE_JS = """
   border-radius:6px; padding:3px 9px; cursor:pointer; font-family:inherit;
   margin-left:4px; font-size:12.5px; }
 .sbtn:hover { background:rgba(128,128,128,.16); }
+.anom-badge { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
+  font-size:11px; font-weight:600; background:rgba(220,53,69,.15); color:var(--bad);
+  border:1px solid var(--bad); vertical-align:middle; }
+tr[data-anom="1"] td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 </style>
 <script>
 // 点击场次链接立刻显示加载遮罩：
@@ -1595,9 +1606,27 @@ function saveRetention() {
   }).catch(function (e) { alert('请求失败：' + e); });
 }
 loadTrashSettings();
-function filterFav(only) {
-  document.querySelectorAll('tr[data-fav]').forEach(function (tr) {
-    tr.style.display = (!only || tr.dataset.fav === '1') ? '' : 'none';
+function applySessFilters() {
+  var fav = document.getElementById('favOnly').checked;
+  var anom = document.getElementById('anomOnly').checked;
+  document.querySelectorAll('#sessTable tr[data-fav]').forEach(function (tr) {
+    var okFav = !fav || tr.dataset.fav === '1';
+    var okAnom = !anom || tr.dataset.anom === '1';
+    tr.style.display = (okFav && okAnom) ? '' : 'none';
+  });
+}
+function cleanAnom() {
+  var rows = Array.prototype.slice.call(
+    document.querySelectorAll('#sessTable tr[data-anom="1"]'));
+  if (!rows.length) { alert('当前没有异常场次'); return; }
+  var names = rows.map(function (r) { return r.dataset.file; }).filter(Boolean);
+  if (!confirm('将 ' + names.length + ' 个异常场次移入回收站？\\n（保留期内可恢复）')) return;
+  var done = 0;
+  names.forEach(function (f) {
+    fetch('/api/v1/sessions/' + encodeURIComponent(f) + '/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+    }).then(function () { if (++done === names.length) location.reload(); })
+      .catch(function () { if (++done === names.length) location.reload(); });
   });
 }
 function sessDel(file) {
@@ -1887,10 +1916,12 @@ def build_sessions_page(hist: Path) -> str:
         disp = s.get("display_name") or s["circuit"]
         disp_attr = disp.replace('"', "&quot;")
         star = ' <span style="color:#d4a017">★</span>' if s["favorite"] else ""
+        anom = s.get("anomalous")
+        badge = ' <span class="anom-badge">异常</span>' if anom else ""
         rows.append(
-            f"""<tr data-fav="{'1' if s['favorite'] else '0'}">
+            f"""<tr data-fav="{'1' if s['favorite'] else '0'}" data-anom="{'1' if anom else '0'}" data-file="{s['file']}">
       <td><b><a href="/session?file={s['file']}"
-         style="color:var(--accent)">{disp}</a></b>{star}</td>
+         style="color:var(--accent)">{disp}</a></b>{star}{badge}</td>
       <td style="font-size:12.5px">{s.get('car_name') or '<span class="dim">-</span>'}</td>
       <td>{s['modified']}</td>
       <td class="num">{s['size_kb']} KB</td>
@@ -1910,10 +1941,18 @@ def build_sessions_page(hist: Path) -> str:
     body = f"""
 <div class="card">
   <h2>共 {len(sessions)} 个场次
+    <label style="float:right;font-weight:400;font-size:12px;cursor:pointer;margin-left:10px">
+      <input type="checkbox" id="anomOnly" onchange="applySessFilters()"> 只看异常场次
+    </label>
     <label style="float:right;font-weight:400;font-size:12px;cursor:pointer">
-      <input type="checkbox" id="favOnly" onchange="filterFav(this.checked)"> 只看收藏 ★
+      <input type="checkbox" id="favOnly" onchange="applySessFilters()"> 只看收藏 ★
     </label></h2>
-  <table>
+  <div style="margin:2px 0 8px">
+    <button class="sbtn" style="border-color:var(--bad);color:var(--bad)"
+      onclick="cleanAnom()">🧹 清理异常场次 → 回收站</button>
+    <span id="anomHint" style="font-size:12px;color:var(--muted);margin-left:6px"></span>
+  </div>
+  <table id="sessTable">
     <tr><th>场次</th><th>车型</th><th>采集时间</th>
         <th style="text-align:right">大小</th>
         <th style="text-align:right">操作</th></tr>
