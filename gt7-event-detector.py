@@ -78,12 +78,13 @@ class EventType(str, Enum):
     HARD_BRAKING = "hard_braking"       # 极限刹车
     COLLISION = "collision"             # 碰撞
     SPIN = "spin"                       # 打滑/失控
-    OVERTAKE = "overtake"               # 超车
-    LAP_RECORD = "lap_record"           # 个人最快圈
-    PIT_LIKE = "pit_like"               # 进站（换胎/调整）
+    TYRE_ABUSE = "tyre_abuse"           # 轮胎滥用（单轮滑移显著异于其他）
+    OVERTAKE = "overtake"               # 超车（未实现，见 README）
+    LAP_RECORD = "lap_record"           # 个人最快圈（未实现）
+    PIT_LIKE = "pit_like"               # 进站（未实现）
     HEAVY_THROTTLE = "heavy_throttle"   # 大油门出弯
     OFF_TRACK = "off_track"             # 出界
-    TANK_SLAP = "tank_slap"             # 压路肩石/草地（车身大幅侧倾）
+    TANK_SLAP = "tank_slap"             # 压路肩石/草地（未实现）
 
 
 @dataclass
@@ -141,13 +142,18 @@ DEFAULT = Thresholds()
 # 滑移率计算
 # ---------------------------------------------------------------------------
 
-# 轮胎半径（米）→ 用于把 rad/s 换成 m/s
+# 轮胎半径（米）→ 用于把 rad/s 换成 m/s。
+# 🔴 这只是**兜底默认值**。真实标定必须用自由滚动帧最小二乘
+#    （gt7analysis.calibrate_wheel_radii，前后轴**分别**标定——实测
+#    R前 0.3391 / R后 0.3435 m，比值 0.987）。EventDetector(radii=(rf, rr))
+#    注入标定值；不注入时滑移率会被整体偏置约 1.3%，而抱死的典型信号
+#    本身只有百分之几，偏置不可忽略。
 _TYRE_RADIUS_M = 0.33
 
 
-def wheel_linear_speed(wheel_rad_s: float) -> float:
+def wheel_linear_speed(wheel_rad_s: float, radius: float = _TYRE_RADIUS_M) -> float:
     """单轮线速度 m/s。"""
-    return wheel_rad_s * _TYRE_RADIUS_M
+    return wheel_rad_s * radius
 
 
 def vehicle_speed_ms(speed_kph: float) -> float:
@@ -155,36 +161,52 @@ def vehicle_speed_ms(speed_kph: float) -> float:
     return speed_kph / 3.6
 
 
-def slip_ratios(s: Sample) -> list[float]:
+def slip_ratios(s: Sample, radius_front: float | None = None,
+                radius_rear: float | None = None) -> list[float]:
+    """四轮滑移率（**带符号**），顺序 FL/FR/RL/RR。
+
+    🔴 定义与 /slip（gt7analysis.wheel_slip）同一套：s = (ω·R − v) / v，
+       v>0 才有意义，v≈0 时恒 0。**正 = 轮子转得比车快（空转/打滑）**，
+       **负 = 比车慢（抱死）**——旧版取绝对值，分不出空转和抱死，
+       会让 SPIN 事件把刹车抱死也算进去，别改回去。
+
+    🔴 前轮用 radius_front、后轮用 radius_rear（None 则回退兜底值
+       _TYRE_RADIUS_M）。GT7 前后胎规格常不同，必须分轴标定。
     """
-    四轮滑移率 = |轮速 - 车速| / max(轮速, 车速)
-    正值表示该轮在打滑（驱动轮空转或抱死）。
-    """
+    rf = _TYRE_RADIUS_M if radius_front is None else radius_front
+    rr = _TYRE_RADIUS_M if radius_rear is None else radius_rear
     v = vehicle_speed_ms(s.speed_kph)
     out = []
-    for w in s.wheel_speed:
-        vs = wheel_linear_speed(w)
-        denom = max(abs(vs), abs(v), 1.0)
-        out.append(abs(vs - v) / denom)
+    for i, w in enumerate(s.wheel_speed):
+        vs = wheel_linear_speed(w, rf if i < 2 else rr)
+        out.append((vs - v) / v if v > 0 else 0.0)
     return out
 
 
-def mean_slip(s: Sample) -> float:
-    """四轮平均滑移率。
+def abs_slip_ratios(s: Sample, radius_front: float | None = None,
+                    radius_rear: float | None = None) -> list[float]:
+    """|滑移率|——只关心「有没有滑」，不关心方向的场景用（如出界检测）。"""
+    return [abs(x) for x in slip_ratios(s, radius_front, radius_rear)]
 
-    注意：平均会稀释单轮打滑。四轮同时打滑在真实赛道很少见，
-    所以需要配合 max_slip 使用（见 wheel_slip_delta 判定）。
+
+def mean_slip(s: Sample, radius_front: float | None = None,
+              radius_rear: float | None = None) -> float:
+    """四轮**带符号**滑移率的均值。
+
+    注意：均值会稀释单轮打滑、且正负会互相抵消；判「打滑最严重的轮子」
+    请配合 max_slip / abs_slip_ratios 使用。
     """
-    return sum(slip_ratios(s)) / 4.0
+    return sum(slip_ratios(s, radius_front, radius_rear)) / 4.0
 
 
-def max_slip(s: Sample) -> float:
-    """单轮最大滑移率。
+def max_slip(s: Sample, radius_front: float | None = None,
+             radius_rear: float | None = None) -> float:
+    """单轮最大**正**滑移率（= 最严重的空转/打滑方向）。
 
-    比 mean_slip 更能反映「某一侧轮胎失去抓地」这种真实失控形态。
+    比 mean_slip 更能反映「某一侧轮胎失去抓地」这种真实失控形态：
     真实赛道上四轮同时打滑罕见，平均值会把这个信号抹平。
     """
-    return max(slip_ratios(s))
+    return max(slip_ratios(s, radius_front, radius_rear))
 
 
 def lateral_g(s: Sample) -> float:
@@ -207,6 +229,11 @@ def find_lap_boundaries(samples: list[Sample]) -> list[tuple[int, int, float]]:
     """
     切分各圈。返回 [(起始索引, 结束索引, 该圈用时)]。
     依据 lap_count 变化 + 起终点位置突变（回到起点附近）。
+
+    ⚠️ 已知局限：只看 lap_count 变化，**不剔除假圈**——前圈（开局排队
+       静止）、末圈（完赛滑行离场）、菜单态（lap=0xFFFF）都会被当成圈。
+       dashboard 集成**不用这个函数**：那边用 clean_laps（按圈长偏离
+       中位数判假）分组好再喂进来。独立使用本模块时请注意这个差别。
     """
     if not samples:
         return []
@@ -231,14 +258,20 @@ def filter_sustained(
     samples: list[Sample],
     predicate: Any,
     min_duration: float = 0.25,
+    sample_hz: float | None = None,
 ) -> list[tuple[int, int]]:
     """
     找出 predicate 连续成立且持续 >= min_duration 的区间。
     predicate: Sample -> bool
     返回 [(起始索引, 结束索引)]
     这样能过滤掉瞬时噪声尖峰。
+
+    🔴 sample_hz 必须传调用方实际配置的采样率（EventDetector 会传
+       self.th.sample_hz）。旧版在这里读模块级 DEFAULT.sample_hz，
+       导致改 Thresholds 里的采样率不生效——别改回去。
     """
-    min_frames = max(2, int(min_duration * DEFAULT.sample_hz))
+    hz = DEFAULT.sample_hz if sample_hz is None else sample_hz
+    min_frames = max(2, int(min_duration * hz))
     runs: list[tuple[int, int]] = []
     run_start = None
 
@@ -258,23 +291,8 @@ def filter_sustained(
     return runs
 
 
-def time_gaps(
-    samples: list[Sample],
-    a_idx: int,
-    b_idx: int,
-    max_gap: float = 1.5,
-) -> list[tuple[float, float]]:
-    """
-    在 [a_idx, b_idx] 区间里找数据空洞（时间间隔过大）。
-    这就是「不连续的数据块」，每个空洞代表一个独立片段。
-    返回 [(空洞起始时间, 空洞结束时间)]
-    """
-    gaps = []
-    for i in range(a_idx + 1, min(b_idx + 1, len(samples))):
-        dt = samples[i].t - samples[i - 1].t
-        if dt > max_gap:
-            gaps.append((samples[i - 1].t, samples[i].t))
-    return gaps
+# （time_gaps 已删除：为「不连续数据块分段」而写，从未被任何检测器
+#   调用过——死代码就删掉，git 历史里找得回来。）
 
 
 # ---------------------------------------------------------------------------
@@ -282,10 +300,43 @@ def time_gaps(
 # ---------------------------------------------------------------------------
 
 class EventDetector:
-    """从遥测序列中检测驾驶事件。"""
+    """从遥测序列中检测驾驶事件。
 
-    def __init__(self, th: Thresholds | None = None):
+    radii: 可选 (front_m, rear_m) 标定半径——来自
+    gt7analysis.calibrate_wheel_radii 的自由滚动帧最小二乘结果。
+    不传则全部轮子用兜底值 _TYRE_RADIUS_M（滑移率整体偏置 ~1.3%，
+    只适合没有 wheel_rads 标定条件的场合）。
+    """
+
+    def __init__(self, th: Thresholds | None = None,
+                 radii: tuple[float, float] | None = None):
         self.th = th or DEFAULT
+        if radii is not None:
+            rf, rr = radii
+            if rf <= 0 or rr <= 0:
+                raise ValueError(f"标定半径必须为正：{radii!r}")
+        self.radii = radii
+
+    def _slip(self, s: Sample) -> list[float]:
+        """带符号四轮滑移率（用构造时注入的标定半径）。"""
+        if self.radii is not None:
+            return slip_ratios(s, self.radii[0], self.radii[1])
+        return slip_ratios(s)
+
+    def _abs_slip(self, s: Sample) -> list[float]:
+        if self.radii is not None:
+            return abs_slip_ratios(s, self.radii[0], self.radii[1])
+        return abs_slip_ratios(s)
+
+    def _mean_slip(self, s: Sample) -> float:
+        if self.radii is not None:
+            return mean_slip(s, self.radii[0], self.radii[1])
+        return mean_slip(s)
+
+    def _max_slip(self, s: Sample) -> float:
+        if self.radii is not None:
+            return max_slip(s, self.radii[0], self.radii[1])
+        return max_slip(s)
 
     # -- 单一事件检测 -----------------------------------------------------
 
@@ -399,13 +450,14 @@ class EventDetector:
         runs = filter_sustained(
             samples,
             lambda s: lateral_g(s) > self.th.spin_lat_g
-            and max_slip(s) > self.th.spin_slip_ratio,
+            and self._max_slip(s) > self.th.spin_slip_ratio,
             min_duration=0.4,
+            sample_hz=self.th.sample_hz,
         )
         for a, b in runs:
             seg = samples[a : b + 1]
             peak = max(seg, key=lateral_g)
-            slips = slip_ratios(peak)
+            slips = self._slip(peak)
             worst = slips.index(max(slips))
             wheel_names = ["左前", "右前", "左后", "右后"]
             out.append(
@@ -420,7 +472,7 @@ class EventDetector:
                         "峰值速度_kph": round(peak.speed_kph, 1),
                         "打滑最严重轮胎": wheel_names[worst],
                         "该轮滑移率": round(slips[worst], 3),
-                        "四轮平均滑移率": round(mean_slip(peak), 3),
+                        "四轮平均滑移率": round(self._mean_slip(peak), 3),
                         "方向": round(peak.steer_angle, 1),
                     },
                     comment_hint="车辆处于失控边缘，判断这次转向超出了抓地极限",
@@ -429,26 +481,35 @@ class EventDetector:
         return out
 
     def detect_offtrack(self, samples: list[Sample]) -> list[Event]:
-        """出界：低速 + 高滑移（压草地/路肩）。"""
+        """出界：低速 + 高滑移（压草地/路肩）。
+
+        🔴 判据用 |滑移率| 的均值（abs_slip_ratios）：压草地上前轮抱死（负）
+        后轮空转（正）很常见，带符号均值会正负抵消把信号抹没。
+
+        注意：dashboard 集成里 OFF_TRACK 由 track_deviation 的 dlat
+        （|dlat| > ~5m）主导，本滑移判据只在没有几何参照的场合兜底。
+        """
         out = []
         runs = filter_sustained(
             samples,
             lambda s: s.speed_kph < self.th.offtrack_max_speed
-            and mean_slip(s) > self.th.offtrack_slip,
+            and sum(self._abs_slip(s)) / 4.0 > self.th.offtrack_slip,
             min_duration=0.4,
+            sample_hz=self.th.sample_hz,
         )
         for a, b in runs:
             s = samples[a]
+            mean_abs = sum(self._abs_slip(s)) / 4.0
             out.append(
                 Event(
                     t_start=samples[a].t,
                     t_end=samples[b].t,
                     type=EventType.OFF_TRACK,
-                    confidence=min(1.0, mean_slip(samples[a : b + 1].__getitem__(0)) * 4),
+                    confidence=min(1.0, mean_abs * 4),
                     lap=s.lap_count,
                     evidence={
                         "速度_kph": round(s.speed_kph, 1),
-                        "滑移率": round(mean_slip(s), 3),
+                        "平均|滑移率|": round(mean_abs, 3),
                         "转向角": round(s.steer_angle, 1),
                     },
                     comment_hint="车辆驶出赛道表面，抓地力大幅下降",
@@ -463,6 +524,7 @@ class EventDetector:
             samples,
             lambda s: s.throttle > 0.95 and s.speed_kph > 60 and s.gear >= 2,
             min_duration=0.5,
+            sample_hz=self.th.sample_hz,
         )
         for a, b in runs:
             peak = max(samples[a : b + 1], key=lambda s: s.speed_kph)
@@ -484,31 +546,39 @@ class EventDetector:
         return out
 
     def detect_tyre_abuse(self, samples: list[Sample]) -> list[Event]:
-        """轮胎滥用：单轮滑移率显著高于其他（针对单轮打滑/内外轮差异）。"""
+        """轮胎滥用：单轮滑移率显著高于其他（针对单轮打滑/内外轮差异）。
+
+        🔴 事件类型是 TYRE_ABUSE——旧版错误地发 EventType.SPIN，
+           会在时间线上和真正的失控事件混淆，别改回去。
+        """
         out = []
         th = self.th.wheel_slip_delta
 
         def bad(s: Sample) -> bool:
-            slips = slip_ratios(s)
+            slips = self._slip(s)
             return max(slips) - min(slips) > th and s.speed_kph > 80
 
-        runs = filter_sustained(samples, bad, min_duration=0.3)
+        runs = filter_sustained(
+            samples, bad, min_duration=0.3, sample_hz=self.th.sample_hz
+        )
         wheel_names = ["左前", "右前", "左后", "右后"]
         for a, b in runs:
-            peak = max(samples[a : b + 1], key=lambda s: max(slip_ratios(s)))
-            slips = slip_ratios(peak)
+            peak = max(samples[a : b + 1], key=lambda s: max(self._slip(s)))
+            slips = self._slip(peak)
             worst = slips.index(max(slips))
             out.append(
                 Event(
                     t_start=samples[a].t,
                     t_end=samples[b].t,
-                    type=EventType.SPIN,
+                    type=EventType.TYRE_ABUSE,
                     confidence=0.6,
                     lap=peak.lap_count,
                     evidence={
                         "打滑轮胎": wheel_names[worst],
                         "该轮滑移率": round(slips[worst], 3),
                         "其他轮滑移率": round(min(slips), 3),
+                        # tyre_temp：GT7 遥测有该字段，但 dashboard 适配层
+                        # 目前不映射（占位 [0,0,0,0]），有值才看，恒 0 别当真
                         "四轮胎温_C": [round(t) for t in peak.tyre_temp],
                     },
                     comment_hint="四轮附着差异过大，可能是单轮压到路肩或草地",
@@ -536,6 +606,7 @@ class EventDetector:
             EventType.COLLISION: 10,
             EventType.SPIN: 8,
             EventType.OFF_TRACK: 7,
+            EventType.TYRE_ABUSE: 5,
             EventType.HEAVY_THROTTLE: 4,
             EventType.HARD_BRAKING: 3,
         }
@@ -612,7 +683,7 @@ def analyze_laps(samples: list[Sample], detector: EventDetector) -> list[LapResu
                 min_speed=min(s.speed_kph for s in seg),
                 avg_throttle=statistics.fmean(s.throttle for s in seg),
                 avg_brake=statistics.fmean(s.brake for s in seg),
-                avg_slip=statistics.fmean(mean_slip(s) for s in seg),
+                avg_slip=statistics.fmean(detector._mean_slip(s) for s in seg),
                 max_lat_g=max(lateral_g(s) for s in seg),
                 max_long_g=min(longitudinal_g(s) for s in seg),
                 tyre_temp_avg=statistics.fmean(
@@ -627,6 +698,7 @@ def analyze_laps(samples: list[Sample], detector: EventDetector) -> list[LapResu
                             EventType.COLLISION,
                             EventType.SPIN,
                             EventType.OFF_TRACK,
+                            EventType.TYRE_ABUSE,
                         )
                     ]
                 ),

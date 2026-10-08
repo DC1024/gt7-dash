@@ -554,6 +554,102 @@ def _slip_percentiles(xs: list[float]) -> dict:
             "p95": q(0.95), "max": round(s[-1], 3)}
 
 
+def _wheel_slip_rows(laps: dict[int, list[dict]]):
+    """全部帧 → (per_lap 行, 自由滚动帧, 总帧数)。
+
+    行格式 (t, v, ω前轴, ω后轴, throttle, brake, |glon|, |glat|)。
+    只被 wheel_slip 与 calibrate_wheel_radii 使用——两处共用一份行构造，
+    别再各写一份。
+    """
+    per_lap: dict[int, list[tuple]] = {}
+    for ln, fs in sorted(laps.items()):
+        buf: list[tuple] = []
+        for f in fs:
+            r = f.get("wheel_rads")
+            if not r or len(r) < 4:
+                continue
+            v = (f.get("speed_kph") or 0.0) / 3.6
+            g = f.get("g_force") or (0.0, 0.0, 0.0)
+            glon = abs(g[0]) if len(g) > 0 else 0.0
+            glat = abs(g[1]) if len(g) > 1 else 0.0
+            buf.append((f.get("t") or 0.0, v, (r[0] + r[1]) / 2.0,
+                        (r[2] + r[3]) / 2.0, f.get("throttle") or 0.0,
+                        f.get("brake") or 0.0, glon, glat))
+        if buf:
+            per_lap[ln] = buf
+    free = [r for rows in per_lap.values() for r in rows
+            if r[4] < _SLIP_FREE_THR and r[5] < _SLIP_FREE_BRK
+            and r[1] > _SLIP_FREE_V_MIN and r[6] < _SLIP_FREE_G
+            and r[7] < _SLIP_FREE_G]
+    total_rows = sum(len(v) for v in per_lap.values())
+    return per_lap, free, total_rows
+
+
+def _calibrate_radii_from_free(free: list, total_rows: int):
+    """自由滚动帧上最小二乘标定 → (rf, rr, calib 展示字典)。
+
+    🔴 rf/rr 是**未取整**的原始值，计算滑移必须用它们；calib 里带 round(4)
+       的展示值。自由滚动帧不足时 rf/rr 返回 0，calib.reason 写明原因、
+       ok=False——调用方据此放弃（不产出滑移结论）。
+    """
+    def _calib(pick) -> float:
+        num = sum(r[1] * pick(r) for r in free)
+        den = sum(pick(r) ** 2 for r in free)
+        return num / den if den > 0 else 0.0
+
+    rf, rr = _calib(lambda r: r[2]), _calib(lambda r: r[3])
+    calib: dict = {
+        "front_m": round(rf, 4), "rear_m": round(rr, 4),
+        "ratio": round(rf / rr, 4) if rr else None,
+        "free_frames": len(free), "total_frames": total_rows,
+        "free_pct": round(len(free) / total_rows * 100, 1) if total_rows else 0.0,
+        "ok": False, "reason": "",
+    }
+    if len(free) < 50 or rf <= 0 or rr <= 0:
+        calib["reason"] = (f"自由滚动帧只有 {len(free)} 帧，标定不可靠"
+                          f"（需要 ≥50 帧）")
+        return rf, rr, calib
+
+    def s_front(r) -> float:
+        return (r[2] * rf - r[1]) / r[1] if r[1] > 0 else 0.0
+
+    def s_rear(r) -> float:
+        return (r[3] * rr - r[1]) / r[1] if r[1] > 0 else 0.0
+
+    # 自洽性：标定用的自由滚动帧上滑移应≈0
+    f_mean = sum(s_front(r) for r in free) / len(free)
+    r_mean = sum(s_rear(r) for r in free) / len(free)
+    calib["free_slip_front"] = round(f_mean, 4)
+    calib["free_slip_rear"] = round(r_mean, 4)
+    calib["ok"] = abs(f_mean) < 0.02 and abs(r_mean) < 0.02
+    if not calib["ok"]:
+        calib["reason"] = (f"自由滚动帧滑移均值偏离 0 过多"
+                           f"（前 {f_mean:+.4f} / 后 {r_mean:+.4f}），标定可能被污染")
+    return rf, rr, calib
+
+
+def calibrate_wheel_radii(laps: dict[int, list[dict]]) -> dict:
+    """公共入口：自由滚动帧上自标定前后轴轮胎半径。
+
+    与 /slip（wheel_slip）共用同一套行构造与标定逻辑（单一事实源）；
+    事件检测器的适配层用它拿到标定半径，别在第二处再写一份最小二乘。
+
+    返回 {available, front_m, rear_m(未取整), ratio, free_frames, ok, reason,
+          free_slip_front, free_slip_rear}。available=False 时不要用半径。
+    """
+    per_lap, free, total_rows = _wheel_slip_rows(laps)
+    if not per_lap:
+        return {"available": False,
+                "reason": "本场次没有 wheel_rads（四轮角速度）字段"}
+    rf, rr, calib = _calibrate_radii_from_free(free, total_rows)
+    usable = len(free) >= 50 and rf > 0 and rr > 0
+    out = dict(calib)
+    out["available"] = usable
+    out["front_m"] = rf        # 未取整：滑移计算用
+    out["rear_m"] = rr
+    return out
+
+
 def wheel_slip(laps: dict[int, list[dict]], nmax_events: int = 5,
                max_per_lap: int = 120) -> dict:
     """用四轮角速度检测空转与抱死。
@@ -579,49 +675,14 @@ def wheel_slip(laps: dict[int, list[dict]], nmax_events: int = 5,
     ⚠️ 抽稀会漏掉 1~2 帧的尖峰（抱死常常就这么短）。所以图表负责趋势、
        events 负责峰值的分工不能倒过来 —— 尖峰必须从 events 读，别从曲线读。
     """
-    per_lap: dict[int, list[tuple]] = {}
-    for ln, fs in sorted(laps.items()):
-        buf: list[tuple] = []
-        for f in fs:
-            r = f.get("wheel_rads")
-            if not r or len(r) < 4:
-                continue
-            v = (f.get("speed_kph") or 0.0) / 3.6
-            g = f.get("g_force") or (0.0, 0.0, 0.0)
-            glon = abs(g[0]) if len(g) > 0 else 0.0
-            glat = abs(g[1]) if len(g) > 1 else 0.0
-            buf.append((f.get("t") or 0.0, v, (r[0] + r[1]) / 2.0,
-                        (r[2] + r[3]) / 2.0, f.get("throttle") or 0.0,
-                        f.get("brake") or 0.0, glon, glat))
-        if buf:
-            per_lap[ln] = buf
+    per_lap, free, total_rows = _wheel_slip_rows(laps)
     if not per_lap:
         return {"available": False,
                 "reason": "本场次没有 wheel_rads（四轮角速度）字段"}
 
-    # —— 1. 自由滚动帧上自标定前后轴半径 ——
-    free = [r for rows in per_lap.values() for r in rows
-            if r[4] < _SLIP_FREE_THR and r[5] < _SLIP_FREE_BRK
-            and r[1] > _SLIP_FREE_V_MIN and r[6] < _SLIP_FREE_G
-            and r[7] < _SLIP_FREE_G]
-    total_rows = sum(len(v) for v in per_lap.values())
-
-    def _calib(pick) -> float:
-        num = sum(r[1] * pick(r) for r in free)
-        den = sum(pick(r) ** 2 for r in free)
-        return num / den if den > 0 else 0.0
-
-    rf, rr = _calib(lambda r: r[2]), _calib(lambda r: r[3])
-    calib: dict = {
-        "front_m": round(rf, 4), "rear_m": round(rr, 4),
-        "ratio": round(rf / rr, 4) if rr else None,
-        "free_frames": len(free), "total_frames": total_rows,
-        "free_pct": round(len(free) / total_rows * 100, 1) if total_rows else 0.0,
-        "ok": False, "reason": "",
-    }
+    # —— 1. 自由滚动帧上自标定前后轴半径（公共实现，见 calibrate_wheel_radii）——
+    rf, rr, calib = _calibrate_radii_from_free(free, total_rows)
     if len(free) < 50 or rf <= 0 or rr <= 0:
-        calib["reason"] = (f"自由滚动帧只有 {len(free)} 帧，标定不可靠"
-                          f"（需要 ≥50 帧）")
         return {"available": False, "reason": calib["reason"],
                 "calibration": calib}
 
@@ -631,15 +692,8 @@ def wheel_slip(laps: dict[int, list[dict]], nmax_events: int = 5,
     def s_rear(r) -> float:
         return (r[3] * rr - r[1]) / r[1] if r[1] > 0 else 0.0
 
-    # 自洽性：标定用的自由滚动帧上滑移应≈0
-    f_mean = sum(s_front(r) for r in free) / len(free)
-    r_mean = sum(s_rear(r) for r in free) / len(free)
-    calib["free_slip_front"] = round(f_mean, 4)
-    calib["free_slip_rear"] = round(r_mean, 4)
-    calib["ok"] = abs(f_mean) < 0.02 and abs(r_mean) < 0.02
-    if not calib["ok"]:
-        calib["reason"] = (f"自由滚动帧滑移均值偏离 0 过多"
-                           f"（前 {f_mean:+.4f} / 后 {r_mean:+.4f}），标定可能被污染")
+    # （自洽性检查在 _calibrate_radii_from_free 里已完成，calib 已带
+    #   free_slip_front/rear 与 ok——这里别再算第二遍。）
 
     # —— 2. 逐圈统计 + 事件（连续帧聚成一次，否则一次抱死会被算成 60 次）——
     lap_rows: list[dict] = []
