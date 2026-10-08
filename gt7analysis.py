@@ -848,7 +848,8 @@ def _seg_closest(ax: float, az: float, bx: float, bz: float,
 
 
 def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
-                    step: float = _DEV_STEP) -> dict:
+                    step: float = _DEV_STEP,
+                    offtrack_m: float = 5.0) -> dict:
     """本圈相对参考圈的**横向偏移**（米，带符号）——「走线偏差」。
 
     做法（几何对齐，不是按距离对齐）：
@@ -883,6 +884,13 @@ def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
        line: [[x, z, dlat, inside], ...],   # 本圈走线，沿参考线弧长等距
        grid_m: [s, ...],                    # 与 line 一一对应的弧长
        drift_m}                             # 距离积分漂移诊断
+       + offtrack_runs（|dlat|>offtrack_m 的出界段，见下）
+
+    offtrack_runs：`[{"from_dist_m","to_dist_m","max_abs_dlat",
+                      "from_s_m","to_s_m"}]`。dist 是**本圈自己的累计距离**
+    （能映射回本圈时间），s 是参考线弧长（能定位在赛道哪里）。
+    事件时间线的 OFF_TRACK 用它做几何判据——比「低速+高滑移」可靠：
+    压草地未必滑移大，高速冲出弯也出界。最短 8 m 过滤噪声尖刺。
     """
     empty = {"step_m": step, "line": [], "grid_m": [], "segments": [],
              "reliable": False, "reason": "",
@@ -890,7 +898,8 @@ def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
              "rms_dlat": 0.0, "p95_abs_dlat": 0.0, "max_abs_dlat": 0.0,
              "mean_dlat": 0.0, "inside_pct": None, "drift_m": 0.0,
              "start_arc_m": 0.0, "start_gap_m": 0.0, "end_gap_m": 0.0,
-             "ref_self_cross_m": None, "worst_win": None}
+             "ref_self_cross_m": None, "worst_win": None,
+             "offtrack_runs": []}
     if not ref_pts or not cur_pts or len(ref_pts) < 10 or len(cur_pts) < 10:
         empty["reason"] = "点太少"
         return empty
@@ -1034,10 +1043,39 @@ def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
         "grid_m": grid,
         "segments": [],
         "worst_win": None,
+        "offtrack_runs": [],
     }
     # 不可信就不给分段与最差段：一组标了「不可比」的数字本身就没意义
     if not reliable:
         return out
+
+    # 出界段：|dlat| > offtrack_m 的连续帧聚段。用**本圈累计距离**记端点
+    # （调用方插值回时间），最短 8 m 过滤单帧抖动。
+    runs = []
+    run = None
+    for r in rows:
+        if abs(r[1]) > offtrack_m:
+            if run is None:
+                run = {"from_dist_m": r[5], "to_dist_m": r[5],
+                       "max_abs_dlat": abs(r[1]),
+                       "from_s_m": r[0], "to_s_m": r[0]}
+            else:
+                run["to_dist_m"] = r[5]
+                run["to_s_m"] = r[0]
+                run["max_abs_dlat"] = max(run["max_abs_dlat"], abs(r[1]))
+        else:
+            if run is not None and run["to_dist_m"] - run["from_dist_m"] >= 8.0:
+                runs.append(run)
+            run = None
+    if run is not None and run["to_dist_m"] - run["from_dist_m"] >= 8.0:
+        runs.append(run)
+    out["offtrack_runs"] = [{
+        "from_dist_m": round(x["from_dist_m"], 1),
+        "to_dist_m": round(x["to_dist_m"], 1),
+        "max_abs_dlat": round(x["max_abs_dlat"], 2),
+        "from_s_m": round(x["from_s_m"], 1),
+        "to_s_m": round(x["to_s_m"], 1),
+    } for x in runs]
 
     # 参考线等弧长采样（步长取 ref_len/step 个点，约 1400 个），
     # 给前端画「灰线底图 + 彩色偏差」用。strided 采样即可，

@@ -42,7 +42,8 @@ _SHARED_SECTIONS = [
     ("分段计时与轮胎滑移", "## 分段计时与轮胎滑移", "## 单圈行车轨迹"),
     ("单圈行车轨迹", "## 单圈行车轨迹", "## 圈间对比自选两圈"),
     ("圈间对比自选两圈", "## 圈间对比自选两圈", "## 赛道自动识别"),
-    ("赛道自动识别", "## 赛道自动识别", "## 使用示例"),
+    ("赛道自动识别", "## 赛道自动识别", "## 驾驶事件时间线"),
+    ("驾驶事件时间线", "## 驾驶事件时间线", "## 使用示例"),
 ]
 
 
@@ -90,6 +91,17 @@ def test_track_identify_rows_in_both(embedded, doc_file):
         assert "`GET /api/v1/sessions/<文件名>/track`" in text
         assert "`POST /api/v1/tracks/<id>/rename`" in text
         assert "命中阈值取 `0.05`" in text
+
+
+def test_events_row_in_both_tables(embedded, doc_file):
+    row = ("| `GET /api/v1/sessions/<文件名>/events?lap=N` | "
+           "**驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；"
+           "`lap` 缺省 = 全部圈 |")
+    assert row in embedded, "内嵌文档缺 /events 表格行"
+    assert row in doc_file, "API文档.md 缺 /events 表格行"
+    for text in (embedded, doc_file):
+        assert "off_track` 由走线偏差主导" in text
+        assert "冷路径 ~10s" in text
 
 
 def test_ref_lap_param_mentions_cmp_lap(embedded, doc_file):

@@ -1566,6 +1566,221 @@ def session_track(path: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 驾驶事件时间线（gt7-event-detector.py 适配层）
+# ---------------------------------------------------------------------------
+
+_DETECTOR_MOD: Any = None
+_DETECTOR_TRIED = False
+
+_EVENT_TYPE_NAMES: dict[str, str] = {
+    "hard_braking": "极限刹车", "collision": "碰撞", "spin": "打滑/失控",
+    "tyre_abuse": "轮胎滥用", "heavy_throttle": "大油门出弯",
+    "off_track": "出界",
+}
+
+
+def _load_detector():
+    """importlib 加载 gt7-event-detector.py（文件名带连字符，不能 import）。
+
+    🔴 exec_module 前必须先 sys.modules[name] = mod：模块里有 @dataclass，
+       dataclass 处理 `X | None` 注解时会回头查 sys.modules，不注册直接
+       AttributeError。文件缺失/加载失败返回 None（部署目录可裁剪该文件），
+       事件卡显示「不可用」而不是 500。
+    """
+    global _DETECTOR_MOD, _DETECTOR_TRIED
+    if _DETECTOR_TRIED:
+        return _DETECTOR_MOD
+    _DETECTOR_TRIED = True
+    p = Path(__file__).with_name("gt7-event-detector.py")
+    if not p.exists():
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "gt7_event_detector", p)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["gt7_event_detector"] = mod
+        spec.loader.exec_module(mod)
+        _DETECTOR_MOD = mod
+    except Exception:
+        _DETECTOR_MOD = None
+    return _DETECTOR_MOD
+
+
+def _frame_to_sample(det, f, i: int):
+    """Frame → 检测器 Sample。只映射检测器真正会读的字段。
+
+    🔴 tyre_temp 不在 _FRAME_COL_KIND（全库只有事件卡想读它），**不能读
+       帧**——FrameStore 会把「读了但没存」的字段记进 MISSED_FIELDS，
+       tests/test_frame_store.py 直接失败。占位 [0,0,0,0]：tyre_abuse
+       证据里胎温恒 0，别当真。steer_angle 数据里没有，恒 0。
+    """
+    return det.Sample(
+        t=f.get("t") or 0.0, seq=i,
+        speed_kph=f.get("speed_kph") or 0.0,
+        rpm=f.get("rpm") or 0.0,
+        gear=int(f.get("gear") or 0),
+        lap_count=int(f.get("lap") or 0),
+        throttle=f.get("throttle") or 0.0,
+        brake=f.get("brake") or 0.0,
+        wheel_speed=list(f.get("wheel_rads") or (0.0, 0.0, 0.0, 0.0)),
+        g_force=list(f.get("g_force") or (0.0, 0.0, 0.0)),
+        tyre_temp=[0.0, 0.0, 0.0, 0.0],
+    )
+
+
+def _dist_to_t(pts: list[dict], dist: float) -> float:
+    """累计距离 → 该圈帧时间（线性插值；超界取端点）。
+
+    lap_samples 的 pts 与圈帧一一对应，dist 单调（dt 异常区间不计距离，
+    会持平——bisect 用右端点即可）。
+    """
+    import bisect
+    ds = [p["dist"] for p in pts]
+    k = min(bisect.bisect_left(ds, dist), len(pts) - 1)
+    if k <= 0:
+        return pts[0]["t"]
+    d0, d1 = ds[k - 1], ds[k]
+    if d1 <= d0:
+        return pts[k]["t"]
+    frac = (dist - d0) / (d1 - d0)
+    return pts[k - 1]["t"] + (pts[k]["t"] - pts[k - 1]["t"]) * frac
+
+
+def _events_compute(det, path: Path, grouped: dict, memo: dict,
+                    lap_no: int | None) -> dict[str, Any]:
+    """session_events 的慢路径（结果由调用方记忆化）。"""
+    import gt7analysis
+
+    # —— 标定半径（与 /slip 共用一次标定，记忆化到同一份 memo）——
+    calib = memo.get("radii")
+    if calib is None:
+        calib = gt7analysis.calibrate_wheel_radii(grouped)
+        memo["radii"] = calib
+    radii = None
+    if calib.get("available"):
+        radii = (calib["front_m"], calib["rear_m"])
+    detector = det.EventDetector(radii=radii)
+
+    # 参考圈 = 最快圈（与「圈间对比 / 走线偏差」卡片同一口径，只算一次）
+    best_lap = None
+    stats = analyze_session(path)
+    best = (stats.get("best_lap") or {}) if stats else {}
+    if best.get("lap") in grouped:
+        best_lap = int(best["lap"])
+
+    lap_nos = sorted(grouped.keys()) if lap_no is None else (
+        [lap_no] if lap_no in grouped else [])
+    events: list[dict[str, Any]] = []
+    for ln in lap_nos:
+        fs = grouped[ln]
+        if len(fs) < 2:
+            continue
+        samples = [_frame_to_sample(det, f, i) for i, f in enumerate(fs)]
+        t0 = samples[0].t
+        # 滑移 / 碰撞 / 刹车 / 大油门类。不走 detect_offtrack：
+        # OFF_TRACK 由走线偏差主导（见下），检测器自带的「低速+高滑移」
+        # 判据只在偏差不可信时兜底。
+        evs = (detector.detect_impact(samples)
+               + detector.detect_spin(samples)
+               + detector.detect_hard_braking(samples)
+               + detector.detect_tyre_abuse(samples)
+               + detector.detect_heavy_throttle(samples))
+        for e in evs:
+            events.append({
+                "lap": ln, "t_rel": round(e.t_start - t0, 3),
+                "t_end_rel": round(e.t_end - t0, 3),
+                "type": e.type.value,
+                "confidence": round(e.confidence, 3),
+                "evidence": e.evidence, "hint": e.comment_hint,
+                "src": "telemetry",
+            })
+        # —— OFF_TRACK：|dlat|>5m 的持续段（session_deviation 的 memo 复用，
+        #    走线偏差卡片看过同一圈就 0ms）——
+        dev = session_deviation(path, ref_lap=best_lap, cmp_lap=ln)
+        if dev.get("reliable"):
+            pts = gt7analysis.lap_samples(fs)
+            for run in dev.get("offtrack_runs") or []:
+                a = _dist_to_t(pts, run["from_dist_m"])
+                b = _dist_to_t(pts, run["to_dist_m"])
+                events.append({
+                    "lap": ln, "t_rel": round(a - t0, 3),
+                    "t_end_rel": round(b - t0, 3),
+                    "type": "off_track",
+                    "confidence": min(1.0, run["max_abs_dlat"] / 15.0),
+                    "evidence": {
+                        "最大横向偏移_m": run["max_abs_dlat"],
+                        "赛道位置_m": run["from_s_m"],
+                    },
+                    "hint": "车辆驶出赛道表面，抓地力大幅下降",
+                    "src": "geometry",
+                })
+        else:
+            for e in detector.detect_offtrack(samples):
+                events.append({
+                    "lap": ln, "t_rel": round(e.t_start - t0, 3),
+                    "t_end_rel": round(e.t_end - t0, 3),
+                    "type": e.type.value,
+                    "confidence": round(e.confidence, 3),
+                    "evidence": e.evidence, "hint": e.comment_hint,
+                    "src": "slip",
+                })
+    events.sort(key=lambda e: (e["lap"], e["t_rel"]))
+    calib_out = {k: calib.get(k) for k in
+                 ("available", "front_m", "rear_m", "ratio", "ok", "reason")}
+    if calib_out.get("front_m") is not None:
+        calib_out["front_m"] = round(calib_out["front_m"], 4)
+        calib_out["rear_m"] = round(calib_out["rear_m"], 4)
+    return {
+        "available": True,
+        "calibration": calib_out,
+        "laps": (sorted(int(n) for n in grouped.keys())
+                 if lap_no is None else [int(lap_no)]),
+        "lap_scope": int(lap_no) if lap_no else 0,
+        "events": events,
+        "type_names": _EVENT_TYPE_NAMES,
+        # 阈值透明化：API 消费方要知道事件是按什么门槛判出来的
+        "thresholds": dict(vars(detector.th)),
+    }
+
+
+def session_events(path: Path, lap_no: int | None = None) -> dict[str, Any]:
+    """驾驶事件时间线：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界。
+
+    口径与数据源：
+      · 圈分组与圈速表 / 赛车线共用 _valid_laps（clean_laps）——检测器
+        自带的 find_lap_boundaries 不剔假圈，**别用它**。
+      · 滑移率用前后轴分标定半径（calibrate_wheel_radii）；不注入时整体
+        偏置 ~1.3%，而抱死信号本身就只有百分之几。
+      · 🔴 OFF_TRACK 由走线偏差主导（|dlat|>5m 持续段）：压草地未必滑移
+        大，高速冲出弯也出界。偏差不可信（残圈 / 对齐失败）时才退回
+        检测器的「低速+高滑移」判据（事件带 src 区分）。
+      · 🔴 结果按场次记忆化。冷路径要逐帧构造 21 万个 Sample 并各跑一遍
+        滑移检测（实测 ~10s），所以事件卡**展开时才取**；命中 0ms。
+    """
+    det = _load_detector()
+    if det is None:
+        return {"available": False,
+                "reason": "gt7-event-detector.py 不在部署目录"}
+    try:
+        laps_list, grouped, _ = _valid_laps(path)
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+    _, store = _load_frames(path)
+    if not store:
+        return {"available": False, "reason": "no frames"}
+    memo = store._memo
+    key = ("events", lap_no)
+    hit = memo.get(key)
+    if hit is None:
+        hit = _events_compute(det, path, grouped, memo, lap_no)
+        memo[key] = hit
+    hit = dict(hit)
+    hit["laps_list"] = [int(x["lap"]) for x in laps_list]
+    return hit
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -1821,6 +2036,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
+| `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -2006,6 +2222,37 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 - 场次→赛道映射也在这个文件里：**详情页首次打开时识别并落库**，
   列表页只读映射展示赛道名，绝不触发识别本身（那要解析整场 jsonl）。
 - 无有效圈的场次返回 `{error}`，不落库、不影响页面。
+
+## 驾驶事件时间线
+
+`GET /api/v1/sessions/<文件名>/events?lap=N` —— 从遥测里检测驾驶事件，
+给复盘提供时间锚点。检测引擎是仓库里的 `gt7-event-detector.py`
+（dashboard 用 importlib 就地加载；文件被裁剪掉时返回
+`{"available": false, "reason": …}`，前端整卡隐藏，不报 500）。
+
+| 字段 | 说明 |
+|---|---|
+| `available` | 检测器文件缺失 / 无帧时为 `false`，`reason` 写明原因 |
+| `calibration` | 前后轴标定半径（与 `/slip` 共用同一次标定）；`available=false` 时滑移用兜底半径 |
+| `events[]` | `{lap, t_rel, t_end_rel, type, confidence, evidence, hint, src}`，按 (圈, 圈内秒) 排序 |
+| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界） |
+| `t_rel` / `t_end_rel` | 事件起止相对**该圈起点**的秒数（与 `/series?lap=N` 同一时间基准） |
+| `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底） |
+| `laps` / `lap_scope` | 本次覆盖的圈号清单 / `?lap=N` 的筛选值（0 = 全场） |
+| `thresholds` | 本次检测用的全部阈值（透明化，别猜） |
+
+- 圈口径与圈速表 / 赛车线**共用 `clean_laps`**——检测器自带的
+  `find_lap_boundaries` 不剔假圈，菜单态 / 前圈不会混进来。
+- 滑移率用前后轴分标定半径（`calibrate_wheel_radii`，与 `/slip` 同一次
+  记忆化结果）；带符号定义与 `/slip` 一致：正 = 空转，负 = 抱死。
+- **`off_track` 由走线偏差主导**：本圈相对参考圈 `|dlat| > 5m` 的持续段
+  （最短 8m）判出界。压草地未必滑移大、高速冲出弯也出界——检测器自带的
+  「低速 + 高滑移」判据只在偏差不可信时兜底（此时 `src=slip`）。
+- 🔴 结果按场次记忆化：**冷路径 ~10s**（逐帧构造 21 万个 Sample 逐圈跑
+  检测），所以事件卡**展开时才取**；同场次再取 0ms。别把它塞进详情页
+  首屏串行链路。
+- `evidence` 里 `tyre_abuse` 的 `四轮胎温_C` 恒为 `[0,0,0,0]`（占位：
+  列式存储没存胎温），别当真；`spin` 的 `方向`（转向角）数据里没有，恒 0。
 
 ## 使用示例
 
@@ -2461,7 +2708,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     path.endswith("/series") or path.endswith("/frames")
                     or path.endswith("/csv") or path.endswith("/raceline")
                     or path.endswith("/sectors") or path.endswith("/slip")
-                    or path.endswith("/deviation") or path.endswith("/track")):
+                    or path.endswith("/deviation") or path.endswith("/track")
+                    or path.endswith("/events")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
@@ -2469,6 +2717,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 #   /deviation（走线偏差）：三张分析卡片各自展开时才取，
                 #   同样不拖累整页渲染。
                 # 外加 /track：赛道自动识别（首次会算指纹并落库）。
+                # 外加 /events：驾驶事件时间线（展开时才取，冷路径 ~10s）。
                 # 🔴 必须排在下面那条「通用 /api/v1/sessions/<名>」之前，
                 #    否则会被当成场次名吞掉。
                 seg = path.split("/")
@@ -2529,6 +2778,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                           step=st), cors=True)
                 elif path.endswith("/track"):
                     self._send_json(session_track(target), cors=True)
+                elif path.endswith("/events"):
+                    self._send_json(session_events(target, lap_no=lap_no),
+                                    cors=True)
                 elif path.endswith("/csv"):
                     body = session_csv(target, lap_no=lap_no).encode("utf-8")
                     fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"

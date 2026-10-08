@@ -137,6 +137,7 @@
 | `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
+| `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -322,6 +323,37 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 - 场次→赛道映射也在这个文件里：**详情页首次打开时识别并落库**，
   列表页只读映射展示赛道名，绝不触发识别本身（那要解析整场 jsonl）。
 - 无有效圈的场次返回 `{error}`，不落库、不影响页面。
+
+## 驾驶事件时间线
+
+`GET /api/v1/sessions/<文件名>/events?lap=N` —— 从遥测里检测驾驶事件，
+给复盘提供时间锚点。检测引擎是仓库里的 `gt7-event-detector.py`
+（dashboard 用 importlib 就地加载；文件被裁剪掉时返回
+`{"available": false, "reason": …}`，前端整卡隐藏，不报 500）。
+
+| 字段 | 说明 |
+|---|---|
+| `available` | 检测器文件缺失 / 无帧时为 `false`，`reason` 写明原因 |
+| `calibration` | 前后轴标定半径（与 `/slip` 共用同一次标定）；`available=false` 时滑移用兜底半径 |
+| `events[]` | `{lap, t_rel, t_end_rel, type, confidence, evidence, hint, src}`，按 (圈, 圈内秒) 排序 |
+| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界） |
+| `t_rel` / `t_end_rel` | 事件起止相对**该圈起点**的秒数（与 `/series?lap=N` 同一时间基准） |
+| `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底） |
+| `laps` / `lap_scope` | 本次覆盖的圈号清单 / `?lap=N` 的筛选值（0 = 全场） |
+| `thresholds` | 本次检测用的全部阈值（透明化，别猜） |
+
+- 圈口径与圈速表 / 赛车线**共用 `clean_laps`**——检测器自带的
+  `find_lap_boundaries` 不剔假圈，菜单态 / 前圈不会混进来。
+- 滑移率用前后轴分标定半径（`calibrate_wheel_radii`，与 `/slip` 同一次
+  记忆化结果）；带符号定义与 `/slip` 一致：正 = 空转，负 = 抱死。
+- **`off_track` 由走线偏差主导**：本圈相对参考圈 `|dlat| > 5m` 的持续段
+  （最短 8m）判出界。压草地未必滑移大、高速冲出弯也出界——检测器自带的
+  「低速 + 高滑移」判据只在偏差不可信时兜底（此时 `src=slip`）。
+- 🔴 结果按场次记忆化：**冷路径 ~10s**（逐帧构造 21 万个 Sample 逐圈跑
+  检测），所以事件卡**展开时才取**；同场次再取 0ms。别把它塞进详情页
+  首屏串行链路。
+- `evidence` 里 `tyre_abuse` 的 `四轮胎温_C` 恒为 `[0,0,0,0]`（占位：
+  列式存储没存胎温），别当真；`spin` 的 `方向`（转向角）数据里没有，恒 0。
 
 ## 使用示例
 
