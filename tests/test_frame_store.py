@@ -1,0 +1,277 @@
+"""列式帧存储（FrameStore）的正确性测试。
+
+背景：原来把场次 jsonl 解析成 `list[dict]` 缓存在内存里，一场 217475 帧的
+场次要 1550 MB（7467 字节/帧），两条缓存上限就是 3.1 GB —— 在一台 7.4 GB
+且没有 swap 的机器上这是会把服务打死的量级。
+
+改成列式存储 + 只读 Frame 视图后内存降到几十 MB。但换了存储就换了出错的
+方式，所以这里逐帧逐字段把新旧两种解析结果对一遍：
+  · 已存储字段的键存在性、值的**类型**与数值必须完全一致
+    （含 int/float 之分 —— lap 读成 3.0 会让圈号显示成 3.0）
+  · 「键缺席」与「值是 null」必须区分（dict 语义）
+  · 全流程不能读到未存储的字段（读了会被记进 MISSED_FIELDS）
+"""
+import json
+import tracemalloc
+
+import pytest
+
+# 全库没有任何一处读、因此不该被存储的字段（存了纯属白占内存）
+NEVER_READ = ["tyre_temp", "tyre_press", "tyre_wear", "wheel_rads", "wheel_revs",
+              "susp_height", "velocity", "seq", "position", "lap_count",
+              "oil_pressure", "water_temp", "oil_temp", "hand_brake", "in_gear",
+              "time_of_day", "turbo_boost", "num_cars", "quali_pos"]
+
+HEADER = {"session_id": "abcdef01", "circuit": "test", "car": 1302,
+          "powertrain": "fuel", "started_at": 1000.0}
+
+
+def _frame(lap, i, fps, t):
+    """造一帧：字段齐全，含标量 / 数组 / 布尔 / 字符串 / null。"""
+    ph = i / fps
+    return {
+        "t": round(t, 4), "seq": int(t * 1000), "lap": lap,
+        "speed_kph": round(180.0 + 20 * ph, 2),
+        "rpm": round(5000 + 1000 * ph, 1), "gear": 4,
+        "throttle": round(max(0.0, 1 - 2 * ph), 3),
+        "brake": round(max(0.0, 2 * ph - 1), 3),
+        "g_force": [round(0.5 - ph, 3), round(ph - 0.5, 3), 0.0],
+        "gas_level": round(60.0 - ph, 2), "gas_capacity": 100.0,
+        "car_x": round(100 + i * 0.5, 4), "car_z": 50.0, "car_y": 3.5,
+        "car_code": 2181, "layout": "A", "has_coords": True,
+        "best_lap": 142155 if lap > 1 else None,
+        # 下面这些字段全库没有一处读，写进来是为了证明「不存它们也没人读」
+        "tyre_temp": [85.0, 86.0, 85.5, 86.5], "tyre_press": [2.1] * 4,
+        "wheel_rads": [100.0, 100.0, 99.0, 99.0], "susp_height": [0.03] * 4,
+        "velocity": [10.0, 0.0, 20.0], "oil_pressure": 6.9, "water_temp": 85.0,
+        "position": None, "car_on_track": True, "num_cars": 20, "flags": 393,
+    }
+
+
+def _write_session(path, laps=3, fps=1200, hz=60.0, mutate=None):
+    rows = []
+    t = 1000.0
+    for lap in range(1, laps + 1):
+        for i in range(fps):
+            f = _frame(lap, i, fps, t)
+            if mutate:
+                mutate(f, lap, i)
+            rows.append(json.dumps(f, ensure_ascii=False))
+            t += 1 / hz
+    path.write_text(json.dumps(HEADER, ensure_ascii=False) + "\n"
+                    + "\n".join(rows) + "\n", encoding="utf-8")
+    return path
+
+
+def _plain(path):
+    """老口径：json 解析成 list[dict]（作为比对基准）。"""
+    lines = path.read_text(encoding="utf-8").strip().split("\n")
+    return json.loads(lines[0]), [json.loads(x) for x in lines[1:] if x.strip()]
+
+
+@pytest.fixture
+def sess(dash, tmp_path):
+    dash._FRAMES_CACHE.clear()
+    dash.MISSED_FIELDS.clear()
+
+    def mutate(f, lap, i):
+        if lap == 2 and i == 5:
+            del f["car_z"]              # 键缺席（不能算成 null）
+        if lap == 3 and i == 7:
+            # ⚠️ 只能用 car_code 这类真有可能是 null 的字段。
+            #    别拿 speed_kph 试 —— analyze_session 里 max(speeds) 遇到 None
+            #    会直接 TypeError（旧实现也一样，不是本次改动引入的），
+            #    而真实遥测里速度从不为空，测它没有意义。
+            f["car_code"] = None
+
+    return _write_session(tmp_path / "20261008_010000_unknown_abcdef02.jsonl",
+                          mutate=mutate)
+
+
+class TestFidelity:
+    """与旧的 list[dict] 逐帧逐字段比对 —— 这是本次重构的根本保证。"""
+
+    def test_帧数与表头一致(self, dash, sess):
+        header, store = dash._load_frames(sess)
+        ref_header, ref = _plain(sess)
+        assert header == ref_header
+        assert len(store) == len(ref) == 3 * 1200
+
+    def test_已存储字段逐帧完全一致(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        _, ref = _plain(sess)
+        miss = object()
+        checked = 0
+        for i, rf in enumerate(ref):
+            fr = store[i]
+            for k in dash._FRAME_COL_KIND:
+                a = rf.get(k, miss)
+                if a is miss:               # 基准里这帧就没这个键
+                    assert k not in fr, f"第 {i} 帧 {k} 不该存在"
+                    continue
+                if a is None:
+                    assert fr[k] is None, f"第 {i} 帧 {k} 应为 None，实际 {fr[k]!r}"
+                elif isinstance(a, float):
+                    b = fr[k]
+                    # 用 hex 比：能抓住 float32 那类「看着差不多」的精度损失
+                    assert b == a and float(b).hex() == a.hex(), \
+                        f"第 {i} 帧 {k} 数值不等：{a!r} vs {b!r}"
+                elif isinstance(a, list):
+                    assert fr[k] == a, f"第 {i} 帧 {k} 不等：{a!r} vs {fr[k]!r}"
+                else:
+                    b = fr[k]
+                    assert b == a and type(b) is type(a), \
+                        f"第 {i} 帧 {k} 类型/值不符：" \
+                        f"{a!r}({type(a).__name__}) vs {b!r}({type(b).__name__})"
+                checked += 1
+        assert checked > 0
+
+    def test_整型字段不会被写成浮点(self, dash, sess):
+        """lap/gear/car_code 是整数；读成 3.0 会让圈号显示成 3.0、
+        还会让 car_name_of(2181.0) 查不到车型。"""
+        _, store = dash._load_frames(sess)
+        for f in (store[0], store[1500], store[-1]):
+            for k in ("lap", "gear", "car_code"):
+                assert isinstance(f[k], int), f"{k} 应是 int，实际 {type(f[k])}"
+            for k in ("t", "speed_kph", "throttle", "gas_level"):
+                assert isinstance(f[k], float), f"{k} 应是 float，实际 {type(f[k])}"
+
+    def test_布尔与字符串类型不丢(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        assert store[0]["has_coords"] is True
+        assert store[0]["layout"] == "A"
+
+    def test_键缺席与值为null要区分(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        _, ref = _plain(sess)
+        # 第 2 圈第 5 帧删掉了 car_z → 键缺席
+        gi = 1200 + 5
+        assert "car_z" not in ref[gi]
+        assert "car_z" not in store[gi], "缺席的键不该被算成存在"
+        with pytest.raises(KeyError):
+            store[gi]["car_z"]
+        assert store[gi].get("car_z") is None
+        assert store[gi].get("car_z", "缺省") == "缺省"
+        # 第 3 圈第 7 帧 car_code = None → 键存在但值是 null
+        ni = 2400 + 7
+        assert "car_code" in ref[ni] and ref[ni]["car_code"] is None
+        assert "car_code" in store[ni], "值为 null 的键仍然算存在"
+        assert store[ni]["car_code"] is None
+        assert store[ni].get("car_code", "缺省") is None, \
+            "键存在但值为 null 时 .get 应返回 None 而不是默认值"
+        assert store[0].get("根本没有这个字段", "缺省") == "缺省"
+
+    def test_整场都是null的字段(self, dash, tmp_path):
+        """整列 null 用哨兵标记，不该为此存 21 万个下标。"""
+        p = _write_session(tmp_path / "allnull.jsonl", laps=1, fps=200,
+                           mutate=lambda f, lap, i: f.update({"car_code": None}))
+        dash._FRAMES_CACHE.clear()
+        _, store = dash._load_frames(p)
+        assert store.n == 200
+        assert store._null["car_code"] is dash._ALL, "整场 null 应走哨兵分支"
+        assert store[0]["car_code"] is None
+        assert store[199].get("car_code", "缺省") is None
+
+    def test_切片与索引语义同list(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        flat = [f["t"] for f in store]
+        assert [f["t"] for f in store[10:13]] == flat[10:13]
+        assert [f["t"] for f in store[::500]] == flat[::500]
+        assert store[-1]["t"] == flat[-1]
+        with pytest.raises(IndexError):
+            store[len(store)]
+        assert bool(dash.FrameStore.empty()) is False
+        assert len(dash.FrameStore.empty()) == 0
+
+
+class TestNoUnstoredFieldRead:
+    """存储清单（15 个字段）必须覆盖全流程真正读到的字段。"""
+
+    def test_全流程没有读到未存储的字段(self, dash, sess):
+        dash.MISSED_FIELDS.clear()
+        dash._FRAMES_CACHE.clear()
+        st = dash.analyze_session(sess)
+        assert "error" not in st, st
+        dash.compare_session(sess, ref_lap_no=1, cmp_lap_no=2)
+        dash.race_line_session(sess, 1)
+        dash.session_series(sess, None, 500)
+        dash.session_series(sess, 1, 500)
+        dash.session_frames(sess, 0, 50)
+        dash.session_frames(sess, 0, 50, lap_no=1)
+        dash.session_csv(sess)
+        dash.session_csv(sess, lap_no=1)
+        dash._valid_laps(sess)
+        dash.build_session_page(sess, st)
+        assert dash.MISSED_FIELDS == set(), (
+            f"以下字段被读了但没存，请在 _FRAME_COL_KIND 里补上："
+            f"{sorted(dash.MISSED_FIELDS)}")
+
+    def test_没有白白存储没人读的字段(self, dash):
+        for k in NEVER_READ:
+            assert k not in dash._FRAME_COL_KIND, f"{k} 没有任何一处读，不该存"
+
+    def test_读了没存的字段会被记录(self, dash, sess):
+        """守卫本身要有效：故意读一个没存的字段，必须被记下来。"""
+        dash.MISSED_FIELDS.clear()
+        _, store = dash._load_frames(sess)
+        assert store[0].get("tyre_temp") is None      # 拿到 None（不是真值）
+        assert "tyre_temp" in dash.MISSED_FIELDS, "守卫漏报了"
+        dash.MISSED_FIELDS.clear()
+
+
+class TestMemory:
+    def test_列式存储明显省内存(self, dash, tmp_path):
+        p = _write_session(tmp_path / "mem.jsonl", laps=4, fps=1500)
+
+        tracemalloc.start()
+        dicts = _plain(p)[1]
+        dict_mem = tracemalloc.get_traced_memory()[0]
+        tracemalloc.stop()
+
+        dash._FRAMES_CACHE.clear()
+        tracemalloc.start()
+        _, store = dash._load_frames(p)
+        store_mem = tracemalloc.get_traced_memory()[0]
+        tracemalloc.stop()
+
+        assert len(dicts) == len(store) == 6000
+        ratio = dict_mem / max(store_mem, 1)
+        assert ratio > 4, (f"列式应比 list[dict] 省得多："
+                           f"{store_mem/1024:.0f} KB vs {dict_mem/1024:.0f} KB"
+                           f"（仅 {ratio:.1f} 倍）")
+
+
+class TestSentinel:
+    """0xFFFF 哨兵值归一（与 lap 同一个家族的老问题）。"""
+
+    @pytest.mark.parametrize("raw,want", [
+        (65535, 0), (65000, 0), (64999, 64999), (20, 20), (1, 1),
+        (None, 0), (0, 0),
+    ])
+    def test_u16_归一(self, dash, raw, want):
+        assert dash._u16(raw) == want
+
+    def test_lap_no_复用同一口径(self, dash):
+        assert dash._lap_no({"lap": 65535}) == 0
+        assert dash._lap_no({"lap": 3}) == 3
+        assert dash._lap_no({}) == 0
+
+    def test_v1_live_里的哨兵被归一(self, dash):
+        snap = {"connected": True, "powertrain": "fuel", "frames": 1,
+                "latest": {"num_cars": 65535, "quali_pos": 65535,
+                           "g_force": [0.1, 0.2, 0.0]},
+                "grid_start": 65535}
+        d = dash._v1_live(snap)
+        assert d["car"]["race"]["num_cars"] == 0
+        assert d["car"]["race"]["grid_position"] == 0
+        assert d["car"]["race"]["grid_start"] == 0
+
+    def test_v1_live_里的正常名次不受影响(self, dash):
+        snap = {"connected": True, "powertrain": "fuel", "frames": 1,
+                "latest": {"num_cars": 20, "quali_pos": 7,
+                           "g_force": [0.1, 0.2, 0.0]},
+                "grid_start": 12}
+        d = dash._v1_live(snap)
+        assert d["car"]["race"]["num_cars"] == 20
+        assert d["car"]["race"]["grid_position"] == 7
+        assert d["car"]["race"]["grid_start"] == 12

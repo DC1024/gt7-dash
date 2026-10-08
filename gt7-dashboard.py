@@ -50,7 +50,9 @@ import signal
 import sys
 import threading
 import time
+from array import array
 from collections import deque
+from collections.abc import Sequence
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -270,37 +272,313 @@ HUB: TelemetryHub
 # 历史场次
 # ---------------------------------------------------------------------------
 
-# 场次 jsonl 解析缓存：path -> (mtime, size, header, frames)。
+# 场次 jsonl 解析缓存：path -> (mtime, size, header, store)。
 # 🔴 /session 一次请求会跑 analyze_session + compare_session 两个分析，
-#    各自把 30MB jsonl 读一遍纯属浪费；切换参考圈(?ref_lap=N)更是
+#    各自把 250MB jsonl 读一遍纯属浪费；切换参考圈(?ref_lap=N)更是
 #    反复重读同一文件。缓存解析结果后，二次请求只算不读，
 #    页面响应从秒级降到亚秒级。jsonl 落盘后不可变，mtime+size 失效足够。
-_FRAMES_CACHE: dict[str, tuple[float, int, dict, list]] = {}
+_FRAMES_CACHE: dict[str, tuple[float, int, dict, "FrameStore"]] = {}
+# ThreadingHTTPServer 是多线程的：缓存的读-改-写必须加锁，否则并发请求下
+# dict 可能在迭代中被另一个线程修改（RuntimeError / 读到半成品条目）。
+_CACHE_LOCK = threading.RLock()
+
+# —— 逐帧字段里「全库真正会读」的那些 ——
+# 实测一场 217475 帧的场次有 52 个逐帧字段，但代码从头到尾只读了下面 15 个。
+# 剩下 37 个（tyre_press / seq / position / hand_brake / susp_height …）
+# 全库没有一处读，存进内存纯属白占 —— 而内存正是原来的瓶颈。
+#
+# 🔴 以后要读新字段，必须加进 _FRAME_COL_KIND，否则读到的是 None。
+#    忘了加也不会静默出错：FrameStore 会把「读了但没存的字段」记进 MISSED_FIELDS，
+#    tests/test_frame_store.py 会因此失败。
+# 每个存储字段的落地方式：'n'=float64 标量列 / 'a'=float64 数组列（如 g_force）
+# / 'b'=布尔 / 's'=字符串（内部表 + 索引）
+_FRAME_COL_KIND: dict[str, str] = {
+    "t": "n", "lap": "n", "speed_kph": "n", "rpm": "n",
+    "throttle": "n", "brake": "n", "gear": "n",
+    "car_x": "n", "car_z": "n",
+    "gas_level": "n", "gas_capacity": "n", "car_code": "n",
+    "g_force": "a",
+    "has_coords": "b",
+    "layout": "s",
+}
+_FRAME_FIELDS = frozenset(_FRAME_COL_KIND)
+
+# 「代码读了、但没存」的字段名（进程级）。空 = 存储清单是完整的。
+MISSED_FIELDS: set[str] = set()
+_warned_fields: set[str] = set()
+
+# 内部哨兵：区分「键不存在」与「键存在但值是 null」——这是 dict 语义的一部分，
+# 必须分清，否则 f.get("x") 会给错默认值。
+_ABSENT = object()
+# 「整场所有帧都命中」的标记，用来避免为「整场都是 null」（如纯电车的油量口径）
+# 或「整场都缺席」的字段存 21 万个下标。
+_ALL = object()
 
 
-def _load_frames(path: Path) -> tuple[dict, list]:
-    """读场次 jsonl（header + 全部帧），带 2 条目缓存。"""
+def _marked(marks, i: int) -> bool:
+    """第 i 帧是否命中 marks（None = 没标记过；_ALL = 全部命中；set = 查表）。"""
+    if marks is None:
+        return False
+    return marks is _ALL or i in marks
+
+
+class Frame:
+    """一帧的**只读视图**：不复制数据，按需从列里取值。
+
+    为什么不继续用 dict：一场 217k 帧 × 52 键的 dict 实测要 1550 MB
+    （7467 字节/帧）。视图只是个 (store, index) 二元组，按需读列，
+    不产生 per-frame 的 dict —— 这是内存能降下来的关键。
+
+    语义上与原来的 dict 完全一致：`f["k"]` 键不存在抛 KeyError，
+    `f.get("k")` 键存在但值为 null 时返回 None、键不存在时返回默认值。
+    """
+
+    __slots__ = ("_s", "_i")
+
+    def __init__(self, store: "FrameStore", i: int) -> None:
+        self._s = store
+        self._i = i
+
+    def __getitem__(self, k: str):
+        v = self._s._value(k, self._i)
+        if v is _ABSENT:
+            raise KeyError(k)
+        return v
+
+    def get(self, k: str, default=None):
+        v = self._s._value(k, self._i)
+        return default if v is _ABSENT else v
+
+    def __contains__(self, k: str) -> bool:
+        return self._s._value(k, self._i) is not _ABSENT
+
+    def __repr__(self) -> str:
+        return f"<Frame #{self._i}>"
+
+
+class FrameStore(Sequence):
+    """场次帧的列式存储（float64），对外表现得像一个 list[Frame]。
+
+    精度（实测，见 _ui_check/probe_precision2.py）：
+      · 数值一律 float64（`array('d')`）。逐个数值比对 `float.hex()`，
+        与「json.loads 出来的原始 float」**位级完全相同** —— 零精度损失、
+        零显示损失，/series、/frames、CSV 的数值文本一个字符都不变。
+      · 🔴 不能用 float32：t 是 Unix 时间戳(≈1.79e9)，float32 在那个量级的
+        最小间隔是 128 秒（帧间隔才 0.0167 秒）；而且 json.dumps(float32(354.0125))
+        会吐出 "354.01251220703125"，直接把 API/CSV 的数值文本搞脏。
+      · 派生指标也验证过：圈长差 ±2e-6 m、滑移率差 1e-7，可忽略。
+    """
+
+    __slots__ = ("header", "n", "fields", "_num", "_arr", "_bool", "_tbl",
+                 "_txi", "_null", "_absent")
+
+    def __init__(self, header: dict, n: int, num: dict, arr: dict, bl: dict,
+                 tbl: dict, txi: dict, null: dict, absent: dict,
+                 fields: set[str]) -> None:
+        self.header = header
+        self.n = n
+        self.fields = fields
+        self._num = num
+        self._arr = arr
+        self._bool = bl
+        self._tbl = tbl
+        self._txi = txi
+        self._null = null
+        self._absent = absent
+
+    @classmethod
+    def empty(cls, header: dict | None = None) -> "FrameStore":
+        return cls(header or {}, 0, {}, {}, {}, {}, {}, {}, {}, set())
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [Frame(self, j) for j in range(*i.indices(self.n))]
+        i = int(i)
+        if i < 0:
+            i += self.n
+        if not 0 <= i < self.n:
+            raise IndexError(i)
+        return Frame(self, i)
+
+    def __iter__(self):
+        for i in range(self.n):
+            yield Frame(self, i)
+
+    def __bool__(self) -> bool:
+        return self.n > 0
+
+    def _value(self, k: str, i: int):
+        """取一帧某字段的值。
+
+        🔴 「键缺席」与「值是 null」必须分开：前者 `.get()` 返回默认值、
+           `[]` 抛 KeyError；后者 `.get()` 返回 None、`[]` 返回 None。
+           混为一谈会让 `f.get("x") or 0` 之类的写法结果不同。
+        """
+        if _marked(self._absent.get(k), i):
+            return _ABSENT
+        if _marked(self._null.get(k), i):
+            return None
+        col = self._num.get(k)
+        if col is not None:
+            return col[i]
+        cols = self._arr.get(k)
+        if cols is not None:
+            return [c[i] for c in cols]
+        bl = self._bool.get(k)
+        if bl is not None:
+            return bool(bl[i])
+        txi = self._txi.get(k)
+        if txi is not None:
+            return self._tbl[k][txi[i]]
+        # 走到这里：这个字段没被存储。若它确实存在于本场次，说明存储清单漏了。
+        if k in self.fields:
+            MISSED_FIELDS.add(k)
+            if k not in _warned_fields:
+                _warned_fields.add(k)
+                print(f"[frames] ⚠️ 读了未存储的字段 {k!r}：请把它加进 "
+                      f"_FRAME_COL_KIND，否则本处静默拿到 None",
+                      file=sys.stderr, flush=True)
+            return None
+        return _ABSENT
+
+
+def _parse_frames(path: Path) -> tuple[dict, FrameStore]:
+    """把场次 jsonl 解析成 header + FrameStore（列式，单遍流式读取）。
+
+    ⚠️ 必须逐行解析。旧实现是 read_text() 再 split("\\n")：光把 244MB 读成
+       21 万个字符串就先占了 500MB 峰值，列式省下来的内存又被还回去一半。
+
+    🔴 整型列必须单独存（`array('q')`）。jsonl 里 `lap`/`gear`/`car_code` 是
+       **整数**，若一律塞进 float64 列，读出来就变成 3.0 —— analyze_session
+       输出的圈号会写成 3.0，`car_name_of(2181.0)` 更是直接查不到车型。
+       列的类型按「该列是否只出现过整数」自动判定，遇到小数才升级为 double。
+    """
+    num: dict[str, array] = {}          # 标量列
+    isint: dict[str, bool | None] = {}  # 该列是否整列都是整数（None = 还没见到非空值）
+    arr: dict[str, list[array]] = {}    # 数组列（如 g_force）
+    arrint: dict[str, list[bool | None]] = {}
+    bl: dict[str, bytearray] = {}
+    tbl: dict[str, list] = {}
+    txi: dict[str, array] = {}
+    tmap: dict[str, dict] = {}
+    null: dict[str, list[int]] = {}
+    absent: dict[str, list[int]] = {}
+    fields: set[str] = set()
+    header: dict = {}
+    n = 0
+    is_header = True
+
+    def _track_type(flags, key: str, v) -> None:
+        """记录「这一列到目前为止是不是全是整数」，解析完再据此定列类型。
+
+        bool 不算整数（JSON 里 true/false 与 0/1 不是一回事）。
+        一旦出现过小数就锁定为 False，不再翻转。
+        """
+        if isinstance(v, bool) or v is None:
+            return
+        if flags[key] is False:
+            return
+        if flags[key] is None:
+            flags[key] = isinstance(v, int)
+
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            if is_header:
+                header = json.loads(line)
+                is_header = False
+                continue
+            d = json.loads(line)
+            fields |= d.keys()
+            for k, kind in _FRAME_COL_KIND.items():
+                v = d.get(k, _ABSENT)
+                if v is _ABSENT:
+                    absent.setdefault(k, []).append(n)
+                if v is _ABSENT or v is None:
+                    null.setdefault(k, []).append(n)
+                    v = None
+                if kind == "n":
+                    if k not in num:
+                        num[k] = array("d")
+                        isint[k] = None
+                    if v is None:
+                        num[k].append(0.0)
+                    else:
+                        _track_type(isint, k, v)
+                        num[k].append(float(v))
+                elif kind == "a":
+                    cols = arr.get(k)
+                    flags = arrint.get(k)
+                    vals = v if isinstance(v, list) else []
+                    if cols is None:
+                        cols = arr[k] = []
+                        flags = arrint[k] = []
+                    for j in range(len(cols), len(vals)):   # 列数由最长的帧决定
+                        cols.append(array("d", [0.0] * n))  # 补齐已解析过的帧
+                        flags.append(None)
+                    for j, c in enumerate(cols):
+                        x = vals[j] if j < len(vals) else None
+                        if x is None:
+                            c.append(0.0)
+                        else:
+                            _track_type(flags, j, x)
+                            c.append(float(x))
+                elif kind == "b":
+                    bl.setdefault(k, bytearray()).append(1 if v else 0)
+                else:  # 's'
+                    tb = tbl.setdefault(k, [])
+                    m = tmap.setdefault(k, {})
+                    key = v if isinstance(v, str) else None
+                    if key not in m:
+                        m[key] = len(tb)
+                        tb.append(key)
+                    txi.setdefault(k, array("l")).append(m[key])
+            n += 1
+
+    if n == 0:
+        return header, FrameStore.empty(header)
+    # 整列都是整数的列改存 array('q')：否则 lap/gear/car_code 读出来是 3.0，
+    # analyze_session 输出的圈号会写成 3.0，car_name_of(2181.0) 也查不到车型。
+    # 解析时统一按 double 收，这里一次性转 —— 值都是整数，转换无损。
+    for k, col in num.items():
+        if isint.get(k) is True:
+            num[k] = array("q", [int(x) for x in col])
+    for k, cols in arr.items():
+        flags = arrint.get(k) or []
+        arr[k] = [array("q", [int(x) for x in c]) if flags[j] is True else c
+                  for j, c in enumerate(cols)]
+    # 整场都是 null / 整场都缺席的字段：用一个哨兵代替 21 万个下标
+    nulls = {k: (_ALL if len(v) >= n else set(v)) for k, v in null.items()}
+    absents = {k: (_ALL if len(v) >= n else set(v)) for k, v in absent.items()}
+    return header, FrameStore(header, n, num, arr, bl, tbl, txi,
+                              nulls, absents, fields)
+
+
+def _load_frames(path: Path) -> tuple[dict, FrameStore]:
+    """读场次 jsonl（header + 全部帧），带 2 条目缓存，返回列式 FrameStore。"""
     key = str(path)
     try:
         st = path.stat()
         sig = (st.st_mtime, st.st_size)
     except OSError:
-        return {}, []
-    hit = _FRAMES_CACHE.get(key)
-    if hit and (hit[0], hit[1]) == sig:
-        return hit[2], hit[3]
+        return {}, FrameStore.empty()
+    with _CACHE_LOCK:
+        hit = _FRAMES_CACHE.get(key)
+        if hit and (hit[0], hit[1]) == sig:
+            return hit[2], hit[3]
     try:
-        lines = path.read_text(encoding="utf-8").strip().split("\n")
-    except OSError:
-        return {}, []
-    if len(lines) < 2:
-        return {}, []
-    header = json.loads(lines[0])
-    frames = [json.loads(x) for x in lines[1:] if x.strip()]
-    while len(_FRAMES_CACHE) >= 2:      # 只留最近 2 个场次，防内存膨胀
-        _FRAMES_CACHE.pop(next(iter(_FRAMES_CACHE)))
-    _FRAMES_CACHE[key] = (sig[0], sig[1], header, frames)
-    return header, frames
+        header, store = _parse_frames(path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}, FrameStore.empty()
+    with _CACHE_LOCK:
+        while len(_FRAMES_CACHE) >= 2:   # 只留最近 2 个场次，防内存膨胀
+            _FRAMES_CACHE.pop(next(iter(_FRAMES_CACHE)))
+        _FRAMES_CACHE[key] = (sig[0], sig[1], header, store)
+    return header, store
 
 
 def compare_session(path: Path, ref_lap_no: int | None = None,
@@ -414,8 +692,9 @@ def _best_lap_of(path: Path) -> float | None:
     except OSError:
         return None
     key = (st.st_mtime, st.st_size)
-    if key in _BEST_LAP_CACHE:
-        return _BEST_LAP_CACHE[key]
+    with _CACHE_LOCK:
+        if key in _BEST_LAP_CACHE:
+            return _BEST_LAP_CACHE[key]
     best: float | None = None
     cur: int | None = None
     t0 = t_prev = 0.0
@@ -445,7 +724,8 @@ def _best_lap_of(path: Path) -> float | None:
         _close()
     except OSError:
         return None
-    _BEST_LAP_CACHE[key] = best
+    with _CACHE_LOCK:
+        _BEST_LAP_CACHE[key] = best
     return best
 
 
@@ -677,6 +957,19 @@ def _fuel_pct(f: dict) -> float | None:
     return round((f.get("gas_level") or 0.0) / cap * 100.0, 1)
 
 
+# GT7 的 u16 字段用 0xFFFF(65535) 表示「不适用」：菜单态会把
+# lap / num_cars / quali_pos 一起写成 65535。这类值漏到表格、CSV 或公开 API 里
+# 就是垃圾数据（实测一场 217k 帧的场次里有 452 帧处于这种状态，全在开跑前）。
+# 前端有同款的 okPos() 过滤，后端这几处也必须自己挡一道。
+_U16_SENTINEL = 65000
+
+
+def _u16(v) -> int:
+    """u16 字段的哨兵值归一：>= 65000 一律当 0（0 = 不适用）。"""
+    n = int(v or 0)
+    return 0 if n >= _U16_SENTINEL else n
+
+
 def _lap_no(f: dict) -> int:
     """帧的圈号。菜单态哨兵值（0xFFFF=65535 等）归 0，避免表格/CSV 里冒出 65535。
 
@@ -684,8 +977,7 @@ def _lap_no(f: dict) -> int:
     这类圈整圈丢弃，但**逐帧**接口是按原始帧输出的，不归一化就会漏出来。
     统一按 0 处理（0 = 未进入计时圈），与前端「菜单态显示占位」的口径一致。
     """
-    n = int(f.get("lap") or 0)
-    return 0 if n >= 65000 else n
+    return _u16(f.get("lap"))
 
 
 def _frame_row(f: dict, t0: float) -> list:
@@ -908,9 +1200,11 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
             "race": {"time_of_day_ms": L.get("time_of_day", 0),
                      # 🔴 0x84 在比赛中是「当前名次」（随排名实时变），
                      #    真正的发车位见 grid_start（开跑瞬间快照）
-                     "grid_position": L.get("quali_pos", 0),
-                     "grid_start": snap.get("grid_start", 0),
-                     "num_cars": L.get("num_cars", 0)},
+                     # 三个都是 u16，菜单态会读成 0xFFFF → 必须归一，
+                     # 否则第三方会拿到「发车位 65535」「65535 辆车」。
+                     "grid_position": _u16(L.get("quali_pos")),
+                     "grid_start": _u16(snap.get("grid_start")),
+                     "num_cars": _u16(L.get("num_cars"))},
             "tyre_temp_c": L.get("tyre_temp", []),
             "suspension_height_m": L.get("susp_height", []),
             "wheel_rev_per_s": L.get("wheel_rads", []),
