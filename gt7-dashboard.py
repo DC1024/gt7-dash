@@ -666,14 +666,14 @@ def compare_session(path: Path, ref_lap_no: int | None = None,
     不能因为它挂掉影响详情页主体。
     """
     try:
-        _, store = _load_frames(path)
-        frames = store.lap_frames()
+        _, grouped, _ = _valid_laps(path)
         import gt7analysis
         # 赛车线抽稀在 gt7analysis.race_line 内部做（decimate=6）。
         # 🔴 不能在这里对每段各自 [::6]：分段后各自抽稀会把每段末尾
         #    到下一个边界的点丢掉，一圈上千个分色段留下上千个断隔。
-        r = gt7analysis.analyze_compare(frames, ref_lap_no=ref_lap_no,
-                                        cur_lap_no=cmp_lap_no)
+        # 圈分组走 _valid_laps 的记忆化结果，不再自己跑一遍 clean_laps。
+        r = gt7analysis.analyze_compare(None, ref_lap_no=ref_lap_no,
+                                        cur_lap_no=cmp_lap_no, grouped=grouped)
         return r
     except Exception as e:
         return {"error": str(e)}
@@ -689,11 +689,10 @@ def race_line_session(path: Path, lap_no: int, decimate: int = 6) -> dict[str, A
     🔴 与 compare_session 共用 _load_frames 的解析缓存，不额外读盘。
     """
     try:
-        _, store = _load_frames(path)
-        frames = store.lap_frames()
+        _, grouped, _ = _valid_laps(path)
         import gt7analysis
-        return gt7analysis.race_line_of_lap(frames, int(lap_no),
-                                            decimate=decimate)
+        return gt7analysis.race_line_of_lap(None, int(lap_no),
+                                            decimate=decimate, grouped=grouped)
     except Exception as e:
         return {"error": str(e)}
 
@@ -963,8 +962,10 @@ def analyze_session(path: Path) -> dict[str, Any]:
             car_name = gt7analysis.car_name_of(car_code, str(path.parent / "cars.csv"))
 
         # —— 按圈分组（clean_laps 自动剔除前圈 / 完赛离场圈 / 菜单态）——
-        import gt7analysis
-        laps = gt7analysis.clean_laps(frames)
+        # 🔴 走 _valid_laps 而不是直接调 clean_laps：分组只取决于文件内容，
+        #    而一次详情页渲染里 compare_session / race_line_session 要的是
+        #    同一份分组。各自算一遍 = 把 21 万帧重扫两到三遍。
+        _, laps, _ = _valid_laps(path)
 
         lap_times = []
         for lap_no, fs in sorted(laps.items()):

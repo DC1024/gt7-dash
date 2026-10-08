@@ -381,13 +381,17 @@ def race_line(pts: list[dict], decimate: int = 6, eps: float = 0.04) -> dict:
     return {"segments": segments}
 
 
-def race_line_of_lap(frames: list[dict], lap_no: int,
-                     decimate: int = 6) -> dict:
+def race_line_of_lap(frames: list[dict] | None = None, lap_no: int = 0,
+                     decimate: int = 6,
+                     grouped: dict[int, list[dict]] | None = None) -> dict:
     """指定圈的赛车线（给「行车轨迹」卡片单独切圈用，不必重算整页分析）。
 
     圈口径复用 clean_laps，与详情页其它分析同一套，避免圈号对不上。
+
+    `grouped` 可选：调用方已有 clean_laps 的结果就直接传进来（`frames` 可不传）。
+    切圈是交互动作，每次都拿 21 万帧重跑一遍 clean_laps 太亏。
     """
-    laps = clean_laps(frames)
+    laps = clean_laps(frames) if grouped is None else grouped
     fs = laps.get(lap_no)
     if not fs or len(fs) < 2:
         return {"lap": lap_no, "segments": []}
@@ -438,18 +442,24 @@ def match_pv_pairs(peaks_ref: list[dict], peaks_cur: list[dict],
     return pairs
 
 
-def analyze_compare(frames: list[dict], ref_lap_no: int | None = None,
-                    cur_lap_no: int | None = None, step: float = 10.0) -> dict:
+def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = None,
+                    cur_lap_no: int | None = None, step: float = 10.0,
+                    grouped: dict[int, list[dict]] | None = None) -> dict:
     """门面：分组 → 每圈采样 → 选参考圈/对比圈 → 时间差 + 峰谷 + 赛车线。
 
     `ref_lap_no` 缺省 = 最快圈；`cur_lap_no` 缺省 = 最后一圈（圈号最大的有效圈）。
     两者都允许由调用方（HTTP 查询参数 / UI 下拉）指定，这样用户可以
     任选两圈对比，而不是只能拿最后一圈跟最快圈比。
 
+    `grouped` 可选：调用方若手上已经有 clean_laps 的结果（例如详情页从
+    _valid_laps 的记忆化缓存里取），直接传进来即可 —— 此时 `frames` 可以不传。
+    详情页一次渲染里 analyze_session 与这里都要同一份分组，不共用就是白扫
+    21 万帧两遍。
+
     clean_laps 会剔除首/末假圈（前圈、完赛离场圈）与菜单态，
     否则 25s 的完赛余圈会被当成「最快圈」画出离场的小段赛车线。
     """
-    laps = clean_laps(frames)
+    laps = clean_laps(frames) if grouped is None else grouped
     samples = {n: lap_samples(fs) for n, fs in laps.items()
                if len(fs) >= 30}                     # 少于 30 帧的伪圈跳过
     if not samples:
