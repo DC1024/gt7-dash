@@ -7,6 +7,13 @@
 ![GHCR](https://img.shields.io/badge/镜像-ghcr.io-blue)
 ![License](https://img.shields.io/badge/许可-MIT-green)
 
+## ⬇️ 下载（Windows 免安装）
+
+不想用 Docker 的话，可直接从 [Releases](https://github.com/DC1024/gt7-dash/releases)
+下载 `gt7-dash-windows-x64.zip`：绿色免安装，含仪表盘 / 接收器 / 解密器三个 exe。
+解压后先双击 `run-recorder.bat` 接收数据，再双击 `run-dashboard.bat` 打开
+http://127.0.0.1:8787 查看。
+
 ## ✨ 特性
 
 - **实时仪表盘**：转速表 / 速度 / 档位 / 踏板 / G 力球（随 G 值摇晃）/

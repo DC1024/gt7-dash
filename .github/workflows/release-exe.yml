@@ -1,0 +1,70 @@
+name: Release (Windows EXE)
+
+# 打 tag（v*）时：构建 Windows 三个 exe → 打成 zip → 自动创建 GitHub Release。
+# 也可在 Actions 页手动触发（仅产出 artifact，不发 Release）。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write            # 创建 Release 需要
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gt7-decrypt/go.mod
+          cache-dependency-path: gt7-decrypt/go.sum
+
+      - name: 安装 PyInstaller
+        run: pip install --upgrade pyinstaller
+
+      - name: 打包仪表盘 exe
+        run: pyinstaller --noconfirm --clean --onefile --name gt7-dashboard --hidden-import gt7analysis gt7-dashboard.py
+
+      - name: 打包接收器 exe
+        run: pyinstaller --noconfirm --clean --onefile --name gt7-recorder gt7-recorder.py
+
+      - name: 交叉编译解密器（windows/amd64）
+        working-directory: gt7-decrypt
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags "-s -w" -o ../gt7-decrypt.exe .
+
+      - name: 组装 zip 包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bundle | Out-Null
+          Copy-Item dist/gt7-dashboard.exe bundle/
+          Copy-Item dist/gt7-recorder.exe  bundle/
+          Copy-Item gt7-decrypt.exe        bundle/
+          Copy-Item packaging/windows/*    bundle/
+          Compress-Archive -Path bundle/* -DestinationPath gt7-dash-windows-x64.zip -Force
+          Get-ChildItem bundle | Select-Object Name, Length
+
+      - name: 上传构建产物（手动触发时留档）
+        uses: actions/upload-artifact@v4
+        with:
+          name: gt7-dash-windows-x64
+          path: gt7-dash-windows-x64.zip
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gt7-dash-windows-x64.zip
+          name: GT7 Dash ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,6 @@
+# Windows 批处理必须用 CRLF，否则 cmd 执行可能异常
+*.bat text eol=crlf
+
+# 二进制产物别做换行转换
+*.zip binary
+*.exe binary
