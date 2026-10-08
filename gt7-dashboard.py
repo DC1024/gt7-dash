@@ -709,6 +709,15 @@ def _parse_frames(path: Path) -> tuple[dict, FrameStore]:
 
     with open_session(path) as fh:          # .jsonl.gz 归档也能读
         for line in fh:
+            # 🔴 正在录制的场次：最后一行可能是**写了一半**的。
+            #    记录器每帧 `fh.write(json.dumps(...) + "\n")`，所以
+            #    「最后一行没有换行符」= 还没写完 → 必须丢掉。
+            #    不丢的后果是灾难性的：`json.loads` 抛 JSONDecodeError，
+            #    被 _load_frames 的 except 兜住之后返回 **空 store**，
+            #    于是整场（20 万帧）在页面上显示成 0 帧、接口报「帧加载失败」。
+            #    实测：末尾截断 60 字节 → frames 4183 → 0。
+            if not line.endswith("\n"):
+                break
             if not line.strip():
                 continue
             if is_header:
@@ -1314,6 +1323,11 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                 "time_str": time_str,
                 # 已归档 = 磁盘上是 .jsonl.gz（无损，只是占地方小了 ~8 倍）
                 "archived": f.name.endswith(".gz"),
+                # 是否就是**正在录制**的那一场。
+                # 外部消费者（赛道工程师）靠它挑出「当前这场」去取参考圈，
+                # 否则只能靠 modified 猜——猜错就会拿上一场的参考圈去对齐这一场，
+                # 而且是静默错。live 是场次级判断，所以同一时刻至多一条为 true。
+                "live": bool(live and (now - stat.st_mtime) < 20.0),
                 # —— 用户标注 ——
                 "favorite": bool(m.get("favorite")),
                 "custom_name": m.get("custom_name") or "",
@@ -1679,6 +1693,63 @@ def session_series(path: Path, lap_no: int | None = None,
         "sampled_frames": len(rows),
         "step": step,
     }
+
+
+def session_profile(path: Path, lap_no: int | None = None,
+                    step_m: float = 5.0,
+                    prominence_kph: float = 12.0) -> dict[str, Any]:
+    """一圈的「按赛道位置索引」剖面 —— 给**外部消费者**用的打包接口。
+
+    为什么要有这个端点（而不是让消费方自己算）：
+        赛道工程师（gt7-coach）要的是「一圈的几何折线 + 等距遥测 + 刹车点/弯心/
+        给油点」。这些东西 here 已经有了（clean_laps / lap_samples /
+        find_peaks_valleys / 距离重采样），消费方自己重写一遍不仅费力，还会
+        因为实时侧只有 10Hz 轮询而**精度更差**、第一圈完全没有参考。所以一次性
+        打包发出去，谁都不用重复建图。
+
+    🔴 距离轴是**几何弧长**（car_x/car_z 相邻弦长累积），不是 /series 的速度积分。
+       速度积分一圈漂移 60~300 m（实测），拿它做「本圈 1200 m vs 参考圈 1200 m」
+       对齐，实际赛道上能差十几米 —— 实时刹车点预告会直接指错位置。
+       两种口径都返回（length_m / length_by_speed_m），差值当诊断指标。
+
+    `lap` 缺省 = 最快圈（与 /raceline 同一约定）。
+    """
+    try:
+        laps, grouped, _t0 = _valid_laps(path)
+    except Exception as e:
+        return {"error": str(e)}
+    if not grouped:
+        return {"error": "没有可用的圈数据"}
+    if lap_no is None:
+        lap_no = (analyze_session(path).get("best_lap") or {}).get("lap")
+    if not lap_no or int(lap_no) not in grouped:
+        return {"error": f"第 {lap_no} 圈没有可用数据",
+                "available_laps": sorted(grouped.keys())}
+
+    _, store = _load_frames(path)
+    if not store:
+        return {"error": "帧加载失败"}
+    key = ("profile", int(lap_no), round(float(step_m), 2),
+           round(float(prominence_kph), 2))
+
+    def _compute() -> dict:
+        import gt7analysis
+        prof = gt7analysis.lap_profile(
+            grouped[int(lap_no)], lap_no=int(lap_no), step_m=step_m,
+            prominence_kph=prominence_kph)
+        # 🔴 整个响应体一起进记忆化，而不是只在里面存 lap_profile 的输出、
+        #    外面再拼一层 meta：那样每次请求都会新建一个 dict，
+        #    「命中缓存」这件事就变得测不出来（内容相等但对象不同）。
+        out: dict[str, Any] = {
+            "meta": {"api_version": 1, "file": path.name,
+                     "available_laps": sorted(grouped.keys()),
+                     "laps": laps},
+        }
+        out.update(prof)
+        return out
+
+    # 🔴 返回的是**记忆化对象本身**，调用方一律当只读用（处理器只做 JSON 序列化）。
+    return store.memo_compute(key, _compute)
 
 
 def session_frames(path: Path, offset: int = 0, limit: int = 200,
@@ -2674,6 +2745,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `POST /api/v1/sessions/<文件名>/video` | **绑定录像**：body 给 `{file, offset_s}` 或 `{file, video_lead_s}` 或 `{file, video_start_iso}` 或 `{file, video_start_epoch}` 或 `{file, probe:true}`；`{clear:true}` 解绑 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 | `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
+| `GET /api/v1/sessions/<文件名>/profile?lap=N&step=5&prominence=12` | 一圈的**按赛道位置索引**剖面：几何折线 + 等距遥测 + 刹车入点 / 弯心 / 给油点。`lap` 缺省 = 最快圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -2982,6 +3054,47 @@ t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这�
 - 🔴 **轮胎磨损广播协议里没有**（296 字节包无 wear 字段），这张卡**不含换胎
   判定**——轮胎寿命请看游戏内 HUD 自行判断。胎温（`tyre_temp`）协议里有，
   但列式存储未存、且温度 ≠ 磨损，不要拿它当磨损用。
+
+## 圈剖面（给赛道工程师 / 第三方按位置索引一圈）
+
+`GET /api/v1/sessions/<文件名>/profile?lap=N&step=5&prominence=12`
+
+赛道工程师（gt7-coach）要的是「一圈的几何折线 + 等距遥测 + 刹车点/弯心/给油点」。
+这些东西本服务里**都已经有了**（`clean_laps` / `lap_samples` / `find_peaks_valleys` /
+距离重采样），消费方自己重写一遍不仅费力，还会因为实时侧只有 10Hz 轮询而精度更差、
+第一圈完全没有参考。所以一次性打包发出去，谁都不用重复建图。
+
+### 🔴 距离轴是几何弧长，不是速度积分
+
+`/series`、`/sectors`、`/deviation` 用的是 `dist += v·Δt` 积分，**一圈漂移 60~300 m**。
+拿它做「本圈 1200 m vs 参考圈 1200 m」对齐，实际赛道上能差十几米 —— 实时刹车点
+预告会直接指错位置。`/profile` 改用 `car_x`/`car_z` 相邻弦长累积的**几何弧长**，
+只依赖坐标，与速度无关，不漂移。两个口径都返回：
+
+| 字段 | 口径 |
+|---|---|
+| `length_m` | 几何弧长（本接口的距离轴） |
+| `length_by_speed_m` | 速度积分（老口径，留作对照） |
+| `length_drift_pct` | 两者相差百分比；绝对值超过 3% 会在 `warnings` 里明说 |
+
+### 返回结构
+
+| 字段 | 说明 |
+|---|---|
+| `grid_m` | 等距网格（步长 `step`，米） |
+| `speed_kph` / `throttle` / `brake` / `t_rel_s` / `glat` / `glon` | 与 `grid_m` **一一对齐**的通道 |
+| `pt.x` / `pt.z` | 同一网格上的几何折线，消费方用它做实时最近点定位；本圈无坐标时为空数组 |
+| `markers.brake_in[]` | 刹车入点：`s_in_m` / `s_out_m` / `speed_in_kph` / `peak_brake` / `duration_s` / `v_min_kph` |
+| `markers.apex[]` | 弯心：`s_m` / `speed_kph` / `glat` / `radius_m` / `turn`（左/右）。半径由 `κ = G_lat·g/v²` 反推 —— 协议里**没有转向角** |
+| `markers.throttle_on[]` | 出弯给油点：`s_m` / `speed_kph` / `after_apex_m` |
+| `markers.peak[]` / `markers.valley[]` | 原始速度极值点（峰/谷交替） |
+| `warnings[]` | 降级与口径提示。**空数组才是干净的**，非空必须往界面上显 |
+
+`step` 缺省 5 m（clamp 到 1~100），`prominence` 缺省 12 km/h（clamp 到 1~60，
+峰谷显著度阈值）。点太多（>3000）会自动放大步长，实际值回填在 `step_m`。
+
+圈长不足 200 m、或帧数不足 20、或该圈不在有效圈里时返回 `{"error": ...}`
+（圈不在时会额外给 `available_laps`），**不返回半成品关键点**。
 
 ## 使用示例
 
@@ -3704,7 +3817,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     or path.endswith("/deviation") or path.endswith("/track")
                     or path.endswith("/events") or path.endswith("/pitstops")
                     or path.endswith("/compare")
-                    or path.endswith("/highlights") or path.endswith("/video")):
+                    or path.endswith("/highlights") or path.endswith("/video")
+                    or path.endswith("/profile")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
@@ -3863,7 +3977,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_json(
                         session_frames(target, offset=off, limit=lim,
                                        lap_no=lap_no, sel=sel), cors=True)
-                else:
+                elif path.endswith("/profile"):
+                    # 圈剖面：几何折线 + 等距遥测 + 刹车点/弯心/给油点。
+                    # 给外部消费者（gt7-coach）一次性拿走，不必自己建图。
+                    try:
+                        pm = float(query.get("step", ["5"])[0])
+                    except ValueError:
+                        pm = 5.0
+                    try:
+                        pk = float(query.get("prominence", ["12"])[0])
+                    except ValueError:
+                        pk = 12.0
+                    self._send_json(
+                        session_profile(target, lap_no=lap_no,
+                                        step_m=max(1.0, min(pm, 100.0)),
+                                        prominence_kph=max(1.0, min(pk, 60.0))),
+                        cors=True)
+                elif path.endswith("/series"):
                     try:
                         mx = int(query.get("max_points", ["2400"])[0])
                     except ValueError:

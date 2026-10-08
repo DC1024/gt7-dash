@@ -44,8 +44,23 @@ _SHARED_SECTIONS = [
     ("圈间对比自选两圈", "## 圈间对比自选两圈", "## 赛道自动识别"),
     ("赛道自动识别", "## 赛道自动识别", "## 驾驶事件时间线"),
     ("驾驶事件时间线", "## 驾驶事件时间线", "## 进站与名次"),
-    ("进站与名次", "## 进站与名次", "## 使用示例"),
+    ("进站与名次", "## 进站与名次", "## 圈剖面（给赛道工程师 / 第三方按位置索引一圈）"),
+    ("圈剖面", "## 圈剖面（给赛道工程师 / 第三方按位置索引一圈）", "## 使用示例"),
 ]
+
+
+def test_profile_row_in_both_tables(embedded, doc_file):
+    """圈剖面是「赛道工程师」的取数入口，表格行与段落两边都要在。"""
+    row = ("| `GET /api/v1/sessions/<文件名>/profile?lap=N&step=5&prominence=12` | "
+           "一圈的**按赛道位置索引**剖面：几何折线 + 等距遥测 + 刹车入点 / 弯心 / "
+           "给油点。`lap` 缺省 = 最快圈 |")
+    for text in (embedded, doc_file):
+        assert row in text
+        assert "## 圈剖面（给赛道工程师 / 第三方按位置索引一圈）" in text
+        # 几何弧长 vs 速度积分这个坑必须写在文档里，否则后来者会照 /series 的口径抄
+        assert "几何弧长" in text
+        assert "length_by_speed_m" in text
+        assert "length_drift_pct" in text
 
 
 @pytest.mark.parametrize("name,start,end", _SHARED_SECTIONS)

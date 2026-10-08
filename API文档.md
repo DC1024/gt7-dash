@@ -149,6 +149,7 @@
 | `POST /api/v1/sessions/<文件名>/video` | **绑定录像**：body 给 `{file, offset_s}` 或 `{file, video_lead_s}` 或 `{file, video_start_iso}` 或 `{file, video_start_epoch}` 或 `{file, probe:true}`；`{clear:true}` 解绑 |
 | `GET /api/v1/sessions/<文件名>/pitstops` | **进站与名次**：进站检测（油量环跳）/ stint 分析 / 实时名次时间线 |
 | `GET /api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | **圈间对比数据**（时间差曲线 + 关键点配对）；详情页切参考圈/对比圈时只取这一份（轻量，且 `race_line=0` 可再省 73% 流量），不刷新整页 |
+| `GET /api/v1/sessions/<文件名>/profile?lap=N&step=5&prominence=12` | 一圈的**按赛道位置索引**剖面：几何折线 + 等距遥测 + 刹车入点 / 弯心 / 给油点。`lap` 缺省 = 最快圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -457,6 +458,47 @@ t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这�
 - 🔴 **轮胎磨损广播协议里没有**（296 字节包无 wear 字段），这张卡**不含换胎
   判定**——轮胎寿命请看游戏内 HUD 自行判断。胎温（`tyre_temp`）协议里有，
   但列式存储未存、且温度 ≠ 磨损，不要拿它当磨损用。
+
+## 圈剖面（给赛道工程师 / 第三方按位置索引一圈）
+
+`GET /api/v1/sessions/<文件名>/profile?lap=N&step=5&prominence=12`
+
+赛道工程师（gt7-coach）要的是「一圈的几何折线 + 等距遥测 + 刹车点/弯心/给油点」。
+这些东西本服务里**都已经有了**（`clean_laps` / `lap_samples` / `find_peaks_valleys` /
+距离重采样），消费方自己重写一遍不仅费力，还会因为实时侧只有 10Hz 轮询而精度更差、
+第一圈完全没有参考。所以一次性打包发出去，谁都不用重复建图。
+
+### 🔴 距离轴是几何弧长，不是速度积分
+
+`/series`、`/sectors`、`/deviation` 用的是 `dist += v·Δt` 积分，**一圈漂移 60~300 m**。
+拿它做「本圈 1200 m vs 参考圈 1200 m」对齐，实际赛道上能差十几米 —— 实时刹车点
+预告会直接指错位置。`/profile` 改用 `car_x`/`car_z` 相邻弦长累积的**几何弧长**，
+只依赖坐标，与速度无关，不漂移。两个口径都返回：
+
+| 字段 | 口径 |
+|---|---|
+| `length_m` | 几何弧长（本接口的距离轴） |
+| `length_by_speed_m` | 速度积分（老口径，留作对照） |
+| `length_drift_pct` | 两者相差百分比；绝对值超过 3% 会在 `warnings` 里明说 |
+
+### 返回结构
+
+| 字段 | 说明 |
+|---|---|
+| `grid_m` | 等距网格（步长 `step`，米） |
+| `speed_kph` / `throttle` / `brake` / `t_rel_s` / `glat` / `glon` | 与 `grid_m` **一一对齐**的通道 |
+| `pt.x` / `pt.z` | 同一网格上的几何折线，消费方用它做实时最近点定位；本圈无坐标时为空数组 |
+| `markers.brake_in[]` | 刹车入点：`s_in_m` / `s_out_m` / `speed_in_kph` / `peak_brake` / `duration_s` / `v_min_kph` |
+| `markers.apex[]` | 弯心：`s_m` / `speed_kph` / `glat` / `radius_m` / `turn`（左/右）。半径由 `κ = G_lat·g/v²` 反推 —— 协议里**没有转向角** |
+| `markers.throttle_on[]` | 出弯给油点：`s_m` / `speed_kph` / `after_apex_m` |
+| `markers.peak[]` / `markers.valley[]` | 原始速度极值点（峰/谷交替） |
+| `warnings[]` | 降级与口径提示。**空数组才是干净的**，非空必须往界面上显 |
+
+`step` 缺省 5 m（clamp 到 1~100），`prominence` 缺省 12 km/h（clamp 到 1~60，
+峰谷显著度阈值）。点太多（>3000）会自动放大步长，实际值回填在 `step_m`。
+
+圈长不足 200 m、或帧数不足 20、或该圈不在有效圈里时返回 `{"error": ...}`
+（圈不在时会额外给 `available_laps`），**不返回半成品关键点**。
 
 ## 使用示例
 

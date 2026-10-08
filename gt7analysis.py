@@ -155,6 +155,10 @@ def lap_samples(frames: list[dict]) -> list[dict]:
             "throttle": f.get("throttle", 0.0),
             "brake": f.get("brake", 0.0),
             "glong": g[0] if len(g) > 0 else 0.0,
+            # 横向 G（g_force[1]）。g_force 的分量顺序是 **纵向在前**：
+            # 记录器写的是 [a_long/9.81, a_lat/9.81, 0]。
+            # 有符号，用来判左右弯（正 = 左转，已用「外侧轮转得更快」验证过）。
+            "glat": g[1] if len(g) > 1 else 0.0,
             # 合成 G 大小（横向 + 纵向）：与记录器写赛道轨迹点的算法一致，
             # 用来给「按 G 力着色」的赛车线上色。
             "gmag": round(math.hypot(g[0] if len(g) > 0 else 0.0,
@@ -1369,4 +1373,236 @@ def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = N
         "peaks_cur": peaks_cur,
         "pv_pairs": match_pv_pairs(peaks_ref, peaks_cur, ref_total, cur_total),
         "race_line": race_line(samples[ref_lap_no]),
+    }
+
+
+# ===========================================================================
+# 圈剖面（lap profile）—— 供赛道工程师/第三方按「赛道位置」索引一圈
+# ===========================================================================
+#
+# 🔴 与上面所有函数最本质的区别：距离轴改用**几何弧长**，不是速度积分。
+#
+#    速度积分（`dist += v·Δt`）一圈漂移 **60~300 m**（实测，见 track_deviation）。
+#    拿它做「本圈跑到 1200 m」和「参考圈的 1200 m」对齐，实际赛道上能差十几米 ——
+#    刹车点预告会直接报错位置。几何弧长只依赖 car_x/car_z 的相邻弦长，不漂移。
+#
+#    旧口径全部保留（`dist` 还是速度积分），本模块新增 `s_geo` 通道；
+#    `/profile` 端点默认用几何弧长，并把两者的差值当诊断指标报出来。
+
+_ARC_GAP_M = 100.0   # 单帧位移超过这个数（>3600 km/h）判为坐标跳变，不计入弧长
+
+
+def lap_arc_length(pts: list[dict]) -> tuple[list[float], bool]:
+    """把 lap_samples 的点序列转成几何弧长（米）。
+
+    返回 `(弧长列表, 是否真的用了几何)`。
+    坐标缺失（None / 整圈全 0）时退化为速度积分的 `dist`，并返回 False ——
+    调用方**必须**把这个降级暴露出去，不能假装还是几何口径。
+    """
+    if not pts:
+        return [], False
+    xs = [p.get("x") for p in pts]
+    zs = [p.get("z") for p in pts]
+    vals = xs + zs
+    usable = all(isinstance(v, (int, float)) for v in vals)
+    if usable:
+        usable = (max(abs(v) for v in xs)
+                  + max(abs(v) for v in zs)) > 1e-6
+    if not usable:
+        return [float(p.get("dist") or 0.0) for p in pts], False
+
+    out = [0.0]
+    acc = 0.0
+    prev_x, prev_z = xs[0], zs[0]
+    for i in range(1, len(pts)):
+        cx, cz = xs[i], zs[i]
+        step = math.hypot(cx - prev_x, cz - prev_z)
+        if step < _ARC_GAP_M:
+            acc += step
+        prev_x, prev_z = cx, cz
+        out.append(acc)
+    return out, True
+
+
+def _nearest_index(dists: list[float], d: float) -> int:
+    """dists（升序）里最接近 d 的下标。"""
+    if not dists:
+        return 0
+    i = bisect.bisect_left(dists, d)
+    if i <= 0:
+        return 0
+    if i >= len(dists):
+        return len(dists) - 1
+    return i if (dists[i] - d) < (d - dists[i - 1]) else i - 1
+
+
+def _find_brake_zones(pts: list[dict], s: list[float],
+                      thr: float = 0.2, min_gap_frames: int = 3,
+                      min_dur_s: float = 0.15) -> list[dict]:
+    """刹车区：brake >= thr 的连续段。段内允许 min_gap_frames 帧的断续（噪声）。"""
+    out: list[dict] = []
+    n = len(pts)
+    i = 0
+    while i < n:
+        if (pts[i].get("brake") or 0.0) < thr:
+            i += 1
+            continue
+        j, gap = i, 0
+        while j + 1 < n:
+            if (pts[j + 1].get("brake") or 0.0) >= thr:
+                j += 1
+                gap = 0
+            elif gap < min_gap_frames:
+                j += 1
+                gap += 1
+            else:
+                break
+        j -= gap
+        if j < i:
+            j = i
+        dur = (pts[j].get("t_rel") or 0.0) - (pts[i].get("t_rel") or 0.0)
+        if dur >= min_dur_s:
+            seg = pts[i:j + 1]
+            out.append({
+                "s_in_m": round(s[i], 1),
+                "s_out_m": round(s[j], 1),
+                "speed_in_kph": round(pts[i].get("speed_kph") or 0.0, 1),
+                "peak_brake": round(max(p.get("brake") or 0.0 for p in seg), 3),
+                "duration_s": round(dur, 3),
+                "v_min_kph": round(min(p.get("speed_kph") or 0.0 for p in seg), 1),
+            })
+        i = j + 1
+    return out
+
+
+def lap_profile(frames: list[dict], lap_no: int = 0, step_m: float = 5.0,
+                prominence_kph: float = 12.0, max_points: int = 3000) -> dict:
+    """一圈的「按赛道位置索引」剖面 —— 一次性喂饱赛道工程师。
+
+    产出三样东西：
+      1. **几何折线** `pt.x` / `pt.z`   —— 消费方用它做实时最近点定位
+      2. **等距网格上的遥测** `speed_kph` / `throttle` / `brake` / `t_rel_s` / `glat`
+      3. **关键点** `markers`          —— 刹车入点 / 弯心（半径+左右）/ 给油点
+
+    这样消费方（gt7-coach）不需要自己从头攒图：不用等第一圈跑完、
+    不用被 10Hz 的实时轮询限精度、也不用重写一遍峰谷检测。
+
+    `frames` 必须是**同一圈**的帧（用 clean_laps/split_laps 切好）。
+    """
+    pts = lap_samples(frames)
+    if len(pts) < 20:
+        return {"error": "帧数不足，无法建立圈剖面", "frames": len(pts)}
+
+    s_geo, geo_ok = lap_arc_length(pts)
+    total = s_geo[-1]
+    if total < 200.0:
+        return {"error": "圈长不足 200 m", "length_m": round(total, 1),
+                "geometry_used": geo_ok}
+
+    # 抽稀保护：小步长 + 长赛道会产出上万点，按需放大步长
+    step = max(1.0, float(step_m))
+    if total / step > max_points:
+        step = total / max_points
+    grid: list[float] = []
+    d = 0.0
+    while d < total:
+        grid.append(round(d, 1))
+        d += step
+
+    def col(key: str, ndigits: int = 2, cast=float) -> list:
+        vals: list[float] = []
+        for p in pts:
+            v = p.get(key)
+            vals.append(float(v) if isinstance(v, (int, float)) else 0.0)
+        return [round(_interp(s_geo, vals, g), ndigits) for g in grid]
+
+    # 几何可能缺失（有些场次没坐标）→ 折线给空列表，而不是塞一串 0
+    xs = [p.get("x") for p in pts]
+    zs = [p.get("z") for p in pts]
+    have_geo = geo_ok and all(isinstance(v, (int, float)) for v in xs + zs)
+
+    # 峰谷（在几何距离轴上重跑，而不是在速度积分轴上）
+    pts_geo = [{**p, "dist": si} for p, si in zip(pts, s_geo)]
+    extrema = find_peaks_valleys(pts_geo, prominence_kph=prominence_kph)
+
+    # 弯心：谷点 + 由横向 G 反推的半径与左右
+    # κ = G_lat · g / v²；半径 = 1/|κ|，|κ| 太小时视为直线（不给半径）
+    apexes: list[dict] = []
+    for e in extrema:
+        if e.get("kind") != "valley":
+            continue
+        k = _nearest_index(s_geo, e["distance"])
+        v_ms = max(float(pts[k].get("v") or 0.0), 1.0)
+        glat = float(pts[k].get("glat") or 0.0)
+        kappa = glat * 9.80665 / (v_ms * v_ms)
+        item: dict = {"s_m": round(e["distance"], 1),
+                      "speed_kph": round(e["speed_kph"], 1),
+                      "glat": round(glat, 3)}
+        if abs(kappa) > 5e-4:
+            item["radius_m"] = round(1.0 / abs(kappa), 1)
+            item["turn"] = "左" if glat > 0 else "右"
+        else:
+            item["radius_m"] = None
+            item["turn"] = "直线"
+        apexes.append(item)
+
+    # 出弯给油点：每个弯心之后第一次 throttle >= 0.5
+    thr_grid = col("throttle", 3)
+    spd_grid = col("speed_kph", 1)
+    throttle_on: list[dict] = []
+    for a in apexes:
+        start = _nearest_index(grid, a["s_m"])
+        for gi in range(start, len(grid)):
+            if thr_grid[gi] >= 0.5:
+                throttle_on.append({
+                    "s_m": grid[gi],
+                    "speed_kph": spd_grid[gi],
+                    "after_apex_m": round(grid[gi] - a["s_m"], 1),
+                })
+                break
+
+    warnings: list[str] = []
+    if not geo_ok:
+        warnings.append("本圈无坐标，距离轴降级为速度积分（会漂移），"
+                        "实时定位精度不可保证")
+    drift = None
+    if total > 0:
+        drift = round((pts[-1]["dist"] - total) / total * 100.0, 2)
+        if abs(drift) > 3.0:
+            warnings.append(f"速度积分与几何弧长相差 {drift}%"
+                            f"（{pts[-1]['dist'] - total:.0f} m），已按几何口径输出")
+
+    return {
+        "lap": lap_no,
+        "frames": len(pts),
+        # —— 两种圈长口径都给出，差值就是诊断指标 ——
+        "length_m": round(total, 1),
+        "length_by_speed_m": round(pts[-1]["dist"], 1),
+        "length_drift_pct": drift,
+        "geometry_used": geo_ok,
+        "lap_time_s": round(pts[-1]["t_rel"], 3),
+        "step_m": round(step, 2),
+        # —— 等距网格 ——
+        "grid_m": grid,
+        "speed_kph": col("speed_kph", 1),
+        "throttle": thr_grid,
+        "brake": col("brake", 3),
+        "t_rel_s": col("t_rel", 3),
+        "glat": col("glat", 3),
+        "glon": col("glong", 3),
+        "pt": {
+            "x": [round(_interp(s_geo, [float(v) for v in xs], g), 2)
+                  for g in grid] if have_geo else [],
+            "z": [round(_interp(s_geo, [float(v) for v in zs], g), 2)
+                  for g in grid] if have_geo else [],
+        },
+        "markers": {
+            "brake_in": _find_brake_zones(pts, s_geo),
+            "apex": apexes,
+            "throttle_on": throttle_on,
+            # 原始极值也给出来，方便前端自己画「直线段 / 减速段」
+            "peak": [e for e in extrema if e.get("kind") == "peak"],
+            "valley": [e for e in extrema if e.get("kind") == "valley"],
+        },
+        "warnings": warnings,
     }
