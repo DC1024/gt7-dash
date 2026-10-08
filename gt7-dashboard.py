@@ -1710,11 +1710,13 @@ _COMPARE_TMPL = """
   </h2>
   <canvas id="raceLineCv" width="760" height="440"></canvas>
   <div class="legend" style="justify-content:center;margin-top:6px">
-    <span><i style="background:var(--ok)"></i>油门</span>
-    <span><i style="background:var(--bad)"></i>刹车</span>
+    <span><i style="width:30px;background:linear-gradient(90deg,#00bcd4,#00c853)"></i>油门（青 → 绿，越深越浓）</span>
+    <span><i style="width:30px;background:linear-gradient(90deg,#ff69b4,#ff2828)"></i>刹车（粉 → 红，越重越红）</span>
     <span><i style="background:var(--accent)"></i>滑行</span>
   </div>
   <p class="dim" style="font-size:11.5px;margin-top:8px">
+    线色来自参考圈记录的<b>踏板开度百分比</b>：刹车踩得越重越偏红（轻点刹车偏粉），
+    油门踩得越深越偏绿（浅踩偏青）；两段踏板都不踩的滑行段用强调色。
     可自选要看第几圈的赛车线。默认取最快圈；切换会刷新本页并把整页分析
     （时间差曲线 / 峰谷表）都以所选圈为基准重算。</p>
 </div>
@@ -1858,14 +1860,30 @@ const CMP = __DATA__;
     svg.innerHTML = html;
   }
 
-  // —— 三色赛车线 ——
+  // —— 踏板渐变赛车线 ——
+  // 线色直接来自记录的油门 / 刹车开度百分比：刹车「粉→红」（踩得越重越红），
+  // 油门「青→绿」（踩得越深越绿），两个都不踩 = 滑行（用强调色）。
+  // 后端 race_line 已按通道切段，并把每点的开度 b[] / t[] 与 pts[] 一一对齐；
+  // 这里逐「子线段」取两端开度均值插值上色，于是得到连续渐变而不是三块死色。
   const cv = document.getElementById('raceLineCv'), ctx = cv.getContext('2d');
   const segs = (CMP.race_line || {}).segments || [];
   ctx.clearRect(0, 0, cv.width, cv.height);
   // 取当前主题的实际颜色：canvas 不继承 CSS 变量，只能手动读一次
   const cvar = n => getComputedStyle(document.documentElement)
     .getPropertyValue(n).trim() || '#888';
-  const cmap = {brake: cvar('--bad'), throttle: cvar('--ok'), coast: cvar('--accent')};
+  const coast = cvar('--accent');
+  const clamp01 = v => v < 0 ? 0 : (v > 1 ? 1 : v);
+  const mix = (c1, c2, k) => 'rgb(' + Math.round(c1[0] + (c2[0] - c1[0]) * k)
+    + ',' + Math.round(c1[1] + (c2[1] - c1[1]) * k)
+    + ',' + Math.round(c1[2] + (c2[2] - c1[2]) * k) + ')';
+  const PINK = [255, 105, 180], RED = [255, 40, 40];    // 刹车：粉 → 红
+  const CYAN = [0, 188, 212], GREEN = [0, 200, 83];     // 油门：青 → 绿
+  const segColor = (ch, k) => {
+    k = clamp01(k || 0);
+    if (ch === 'brake') return mix(PINK, RED, k);
+    if (ch === 'throttle') return mix(CYAN, GREEN, k);
+    return coast;
+  };
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   segs.forEach(s => s.pts.forEach(p => {
     if (p[0] == null) return;
@@ -1878,17 +1896,22 @@ const CMP = __DATA__;
     const ox = (cv.width - (x1 - x0) * sc) / 2 - x0 * sc;
     const oy = (cv.height - (z1 - z0) * sc) / 2 - z0 * sc;
     const px = v => ox + v * sc, py = v => cv.height - (oy + v * sc);
-    ctx.lineCap = 'round'; ctx.lineWidth = 3;
+    ctx.lineCap = 'round'; ctx.lineWidth = 3.2;
     segs.forEach(s => {
-      ctx.strokeStyle = cmap[s.color] || '#888';
-      ctx.beginPath();
-      let started = false;
-      s.pts.forEach(p => {
-        if (p[0] == null) return;
-        if (!started) { ctx.moveTo(px(p[0]), py(p[1])); started = true; }
-        else ctx.lineTo(px(p[0]), py(p[1]));
-      });
-      ctx.stroke();
+      const b = s.b || [], t = s.t || [];
+      for (let i = 1; i < s.pts.length; i++) {
+        const a = s.pts[i - 1], c = s.pts[i];
+        if (a[0] == null || c[0] == null) continue;
+        // 子线段强度 = 两端开度均值：刹车段读 b[]，油门段读 t[]
+        let k = 0;
+        if (s.color === 'brake') k = ((b[i - 1] || 0) + (b[i] || 0)) / 2;
+        else if (s.color === 'throttle') k = ((t[i - 1] || 0) + (t[i] || 0)) / 2;
+        ctx.strokeStyle = segColor(s.color, k);
+        ctx.beginPath();
+        ctx.moveTo(px(a[0]), py(a[1]));
+        ctx.lineTo(px(c[0]), py(c[1]));
+        ctx.stroke();
+      }
     });
   }
 

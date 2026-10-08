@@ -75,6 +75,32 @@ class TestRaceLine:
         colors = {s["color"] for s in seg["segments"]}
         assert {"brake", "throttle"} <= colors or {"brake", "coast"} <= colors
 
+    def test_pedal_arrays_aligned_with_points(self):
+        """每段必须带与 pts 等长的 b[]/t[]，前端才能逐点插值上渐变。"""
+        pts = lap_samples(make_lap_frames(1, 1200, 180.0, brake_zone=(300, 500)))
+        segs = race_line(pts)["segments"]
+        assert segs, "至少要有一段"
+        for s in segs:
+            assert len(s["b"]) == len(s["pts"]) == len(s["t"]), "b/t/pts 必须一一对齐"
+            assert all(0.0 <= v <= 1.0 for v in s["b"] + s["t"]), "开度必须规整到 0~1"
+        brake_segs = [s for s in segs if s["color"] == "brake"]
+        assert brake_segs, "刹车区应产生 brake 段"
+        assert max(max(s["b"]) for s in brake_segs) > 0.7, "重刹段应保留高刹车开度"
+
+    def test_segments_share_boundary_point(self):
+        """相邻段要共享边界点，否则换色处会出现肉眼可见的缺口。"""
+        pts = lap_samples(make_lap_frames(1, 1200, 180.0, brake_zone=(300, 500)))
+        segs = race_line(pts)["segments"]
+        for a, b in zip(segs, segs[1:]):
+            assert a["pts"][-1] == b["pts"][0], "换色处首尾必须相接"
+
+    def test_clamp01_tolerates_percent_and_garbage(self):
+        from gt7analysis import _clamp01
+        assert _clamp01(0.42) == 0.42
+        assert _clamp01(85) == 0.85, "误传百分数要兼容"
+        assert _clamp01(-3) == 0.0 and _clamp01(999) == 1.0
+        assert _clamp01(None) == 0.0 and _clamp01("x") == 0.0
+
 
 class TestAnalyzeCompare:
     def test_facade_shape(self):

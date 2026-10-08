@@ -294,47 +294,80 @@ def find_peaks_valleys(pts: list[dict], window: int = 7,
     return final
 
 
-# —— 三色赛车线 ——————————————————————————————
+# —— 踏板渐变赛车线 ————————————————————————————
 
-def race_line(pts: list[dict], brake_g: float = -0.25,
-              throttle_g: float = 0.12, decimate: int = 6) -> dict:
-    """参考圈赛车线：按纵向 G 分色。
+def _clamp01(v) -> float:
+    """把踏板开度规整到 0~1（顺手兼容误传成 0~100 百分数的情况）。"""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if x > 1.5:                     # 看起来是百分数（0~100）
+        x /= 100.0
+    return 0.0 if x < 0 else (1.0 if x > 1 else x)
 
-    刹车(glong < brake_g) = 红 · 油门(> throttle_g) = 绿 · 其余 = 滑行(蓝)。
-    返回 {"segments": [{"color": ..., "pts": [[x, z], ...]}]}
+
+def _smooth3(xs: list[float]) -> list[float]:
+    """三点滑动平均（首尾取自身），削弱逐点抖动导致的分段碎裂。"""
+    n = len(xs)
+    if n < 3:
+        return xs
+    return [(xs[max(0, i - 1)] + xs[i] + xs[min(n - 1, i + 1)]) / 3.0
+            for i in range(n)]
+
+
+def race_line(pts: list[dict], decimate: int = 6, eps: float = 0.04) -> dict:
+    """参考圈赛车线：按**油门 / 刹车开度**上色（渐变）。
+
+    刹车越重越红（粉→红），油门越深越绿（青→绿），都不踩 = 滑行。
+    颜色来自记录的踏板百分比本身，而不是纵向 G。
+
+    返回 {"segments": [{"color": "brake|throttle|coast",
+                        "pts": [[x, z], ...],
+                        "b": [刹车开度 0~1, ...],   # 与 pts 一一对齐
+                        "t": [油门开度 0~1, ...]}]}
 
     🔴 两个容易踩的坑（都实测踩过）：
-    1. **抽稀必须在分色之前对整条序列做**。之前是先分色、再在
+    1. **抽稀必须在分段之前对整条序列做**。之前是先分色、再在
        dashboard 里对每段各自 `pts[::6]`——每段末尾到下一个边界的
        点被丢掉，一圈上千个分色段就留下上千个肉眼可见的断隔，
        「明明跑完一整圈，线却是斑驳的」。
     2. **相邻两段必须共享边界点**（新段从上一段的末点接起），
        否则换色处那一帧的弦谁都不画（canvas 分多次 stroke 时
        段与段的衔接靠端点重合，不重合就是缺口）。
-    另外对 glong 做三点平滑：阈值附近的抖动会把一条线打成上千个小段。
+    另外对踏板值做三点平滑：逐点抖动会把一条线打成上千个小段。
     """
     sub = pts[::decimate] if decimate and decimate > 1 else pts
-    gs = [p["glong"] for p in sub]
-    n = len(gs)
-    sm = gs if n < 3 else [(gs[max(0, i - 1)] + gs[i] + gs[min(n - 1, i + 1)]) / 3.0
-                           for i in range(n)]
-    color_of = lambda g: ("brake" if g < brake_g
-                          else "throttle" if g > throttle_g else "coast")
+    bs = _smooth3([_clamp01(p.get("brake")) for p in sub])
+    ts = _smooth3([_clamp01(p.get("throttle")) for p in sub])
+
+    def channel(b: float, t: float) -> str:
+        # 两踏板同时踩时以刹车为准（trail braking 视觉上按刹车画）
+        if b >= t and b > eps:
+            return "brake"
+        if t > eps:
+            return "throttle"
+        return "coast"
+
     segments: list[dict] = []
-    cur_color, cur_pts = None, []
-    for p, g in zip(sub, sm):
-        c = color_of(g)
-        if c != cur_color:
+    cur_ch, cur_pts, cur_b, cur_t = None, [], [], []
+    for i, p in enumerate(sub):
+        c = channel(bs[i], ts[i])
+        if c != cur_ch:
             if cur_pts:
-                segments.append({"color": cur_color, "pts": cur_pts})
-                # 从上一段末点接起，保证换色处首尾相接
-                cur_pts = [cur_pts[-1]]
+                segments.append({"color": cur_ch, "pts": cur_pts,
+                                 "b": cur_b, "t": cur_t})
+                # 从上一段末点接起，保证换色处首尾相接（含踏板值）
+                cur_pts, cur_b, cur_t = [cur_pts[-1]], [cur_b[-1]], [cur_t[-1]]
             else:
-                cur_pts = []
-            cur_color = c
+                cur_pts, cur_b, cur_t = [], [], []
+            cur_ch = c
         cur_pts.append([p.get("x"), p.get("z")])
+        cur_b.append(round(bs[i], 3))
+        cur_t.append(round(ts[i], 3))
     if cur_pts:
-        segments.append({"color": cur_color, "pts": cur_pts})
+        segments.append({"color": cur_ch, "pts": cur_pts,
+                         "b": cur_b, "t": cur_t})
     return {"segments": segments}
 
 
