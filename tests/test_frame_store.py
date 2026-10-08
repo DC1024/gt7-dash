@@ -275,3 +275,121 @@ class TestSentinel:
         assert d["car"]["race"]["num_cars"] == 20
         assert d["car"]["race"]["grid_position"] == 7
         assert d["car"]["race"]["grid_start"] == 12
+
+
+class TestPresence:
+    """`"k" in f` 走的是一张预先算好的存在位图，不是真的取一次值。
+
+    这是一条为性能开的路，所以必须证明它和「取值看是否缺席」的老口径
+    逐帧等价 —— 否则一次误判就会让某场次的圈数据整段消失。
+    """
+
+    def test_位图与取值口径逐帧一致(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        cases = ["lap", "car_z", "car_code", "speed_kph", "g_force",
+                 "layout", "tyre_temp", "根本没这个字段"]
+        for k in cases:
+            for i in (0, 5, 7, 1199, 1200, 1205, len(store) - 1):
+                f = store[i]
+                want = store._value(k, i) is not dash._ABSENT
+                assert (k in f) == want, f"字段 {k} 第 {i} 帧判键不一致"
+
+    def test_某帧缺键时判为不在(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        assert "car_z" in store[0]
+        assert "car_z" not in store[1200 + 5]        # 该帧被删掉了 car_z
+
+    def test_场次里出现过但未存储的字段判为存在(self, dash, sess):
+        # tyre_temp 文件里有、但不在存储清单里：读出来是 None，键算「在」
+        _, store = dash._load_frames(sess)
+        assert "tyre_temp" in store[0]
+
+    def test_整场都没出现过的字段判为不在(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        assert "根本没这个字段" not in store[0]
+
+    def test_整场都缺席的字段判为不在(self, dash, tmp_path):
+        # 全部帧都缺 layout → 缺席标记退化成一个哨兵，
+        # 位图这条支路（_ALL）也要判对，不能一律 True。
+        def mutate(f, lap, i):
+            del f["layout"]
+
+        p = _write_session(tmp_path / "absent.jsonl", laps=2, fps=50,
+                           mutate=mutate)
+        dash._FRAMES_CACHE.clear()
+        _, store = dash._load_frames(p)
+        assert not any("layout" in f for f in store)
+        assert store.lap_frames(), "其它字段仍应正常"
+
+
+class TestMemo:
+    """每场只算一次的归算：结果必须与「每次重算」完全一致，且真的只算一次。"""
+
+    def test_lap_frames_与逐帧筛选结果一致(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        want = [f for f in store if "lap" in f]
+        got = store.lap_frames()
+        assert [f._i for f in got] == [f._i for f in want]
+
+    def test_lap_frames_复用同一个列表(self, dash, sess):
+        _, store = dash._load_frames(sess)
+        assert store.lap_frames() is store.lap_frames()
+
+    def test_valid_laps_记忆化且与重算一致(self, dash, sess):
+        a = dash._valid_laps(sess)
+        b = dash._valid_laps(sess)
+        assert a is b, "应当直接复用上次的结果"
+        laps, grouped, t0 = a
+        assert laps and t0
+
+        # 再和「照旧口径把全部帧喂 clean_laps」现算一遍比 —— 这是记忆化
+        # 能成立的全部依据（clean_laps(lap_frames) == clean_laps(all)）。
+        import gt7analysis
+        _, store = dash._load_frames(sess)
+        ref = gt7analysis.clean_laps(list(store))
+        assert sorted(grouped) == sorted(ref)
+        for k in ref:
+            assert [f._i for f in grouped[k]] == [f._i for f in ref[k]]
+
+
+class TestCleanLapsEquivalence:
+    """把 clean_laps 的输入从「全部帧」换成「含 lap 的帧」必须毫无差别。
+
+    这一条是 _valid_laps 记忆化的前提。构造的样本把 split_laps / clean_laps
+    里所有会分流的边界都塞进去：缺 lap 字段、lap=0、菜单态 0xFFFF、
+    以及一个距离过短要被剔掉的末圈。
+    """
+
+    def _pairs(self, dash, tmp_path):
+        def mutate(f, lap, i):
+            if lap == 1 and i < 3:
+                del f["lap"]                 # 整帧没有 lap 字段
+            if lap == 1 and i == 10:
+                f["lap"] = 0                 # 开赛前
+            if lap == 3 and i == 20:
+                f["lap"] = 65535             # 菜单态哨兵
+            if lap == 3:
+                # 整圈都在滑行（不是只改前几帧 —— 圈距离得真的短到
+                # < 45% 中位圈长，否则 clean_laps 不会剔除它）
+                f["speed_kph"] = 2.0
+
+        p = _write_session(tmp_path / "eq.jsonl", laps=3, fps=200, mutate=mutate)
+        dash._FRAMES_CACHE.clear()
+        _, store = dash._load_frames(p)
+        return store
+
+    def test_两种输入分组完全相同(self, dash, tmp_path):
+        import gt7analysis
+        store = self._pairs(dash, tmp_path)
+        allf = gt7analysis.clean_laps(list(store))
+        only = gt7analysis.clean_laps(store.lap_frames())
+        assert sorted(allf) == sorted(only)
+        for k in allf:
+            assert [f._i for f in allf[k]] == [f._i for f in only[k]]
+
+    def test_末圈假圈仍被剔除(self, dash, tmp_path):
+        import gt7analysis
+        store = self._pairs(dash, tmp_path)
+        got = gt7analysis.clean_laps(store.lap_frames())
+        assert 3 not in got, "滑行离场的末圈应仍被剔除"
+        assert 1 in got and 2 in got

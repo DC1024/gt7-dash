@@ -315,11 +315,10 @@ _ABSENT = object()
 _ALL = object()
 
 
-def _marked(marks, i: int) -> bool:
-    """第 i 帧是否命中 marks（None = 没标记过；_ALL = 全部命中；set = 查表）。"""
-    if marks is None:
-        return False
-    return marks is _ALL or i in marks
+# 字段取值的列种类。预先摊平成一维（见 FrameStore._build_index）——
+# 旧写法每取一个字段要依次试 _absent/_null/_num/_arr/_bool/_txi 六张表，
+# 217k 帧的 clean_laps 一趟就多花几十毫秒（实测单次取值 273ns → 摊平后 1xx ns）。
+_K_NUM, _K_AXIS, _K_BOOL, _K_STR, _K_MISS = 1, 2, 3, 4, 0
 
 
 class Frame:
@@ -350,7 +349,19 @@ class Frame:
         return default if v is _ABSENT else v
 
     def __contains__(self, k: str) -> bool:
-        return self._s._value(k, self._i) is not _ABSENT
+        """键在不在这帧里。
+
+        🔴 不复用 _value：判键的调用频次和取值一样高（`[f for f in frames
+           if "lap" in f]` 是每个接口的必经之路），但只需要「在不在」这一个
+           比特。存储时已按字段算好一张存在位图，这里直接查表，217k 帧一趟
+           比真的取 217k 次值快一倍。
+        """
+        p = self._s._pres.get(k)
+        if p is True:
+            return True
+        if p is None or p is False:
+            return False
+        return p[self._i] != 0
 
     def __repr__(self) -> str:
         return f"<Frame #{self._i}>"
@@ -370,7 +381,7 @@ class FrameStore(Sequence):
     """
 
     __slots__ = ("header", "n", "fields", "_num", "_arr", "_bool", "_tbl",
-                 "_txi", "_null", "_absent")
+                 "_txi", "_null", "_absent", "_col", "_pres", "_memo")
 
     def __init__(self, header: dict, n: int, num: dict, arr: dict, bl: dict,
                  tbl: dict, txi: dict, null: dict, absent: dict,
@@ -385,10 +396,49 @@ class FrameStore(Sequence):
         self._txi = txi
         self._null = null
         self._absent = absent
+        self._memo: dict = {}
+        self._col, self._pres = self._build_index()
 
     @classmethod
     def empty(cls, header: dict | None = None) -> "FrameStore":
         return cls(header or {}, 0, {}, {}, {}, {}, {}, {}, {}, set())
+
+    def _build_index(self) -> tuple[dict, dict]:
+        """把「字段名 → 取值路径」预摊平成一张表；另算一张「键在不在」的位图。
+
+        _col[k] = (种类, 数据, 缺席标记, null 标记)
+        这样取一个字段只查一次 dict，而不再是依次试六张表。
+        _pres[k] = True（恒定在）/ False（恒定不在）/ bytearray（逐帧看位）。
+        """
+        col: dict[str, tuple] = {}
+        for k in self.fields:
+            a = self._absent.get(k)
+            nl = self._null.get(k)
+            if k in self._num:
+                col[k] = (_K_NUM, self._num[k], a, nl)
+            elif k in self._arr:
+                col[k] = (_K_AXIS, tuple(self._arr[k]), a, nl)
+            elif k in self._bool:
+                col[k] = (_K_BOOL, self._bool[k], a, nl)
+            elif k in self._txi:
+                col[k] = (_K_STR, (self._tbl[k], self._txi[k]), a, nl)
+            else:
+                # 本场次出现过、但没进存储清单：读出来是 None 并计入 MISSED_FIELDS
+                col[k] = (_K_MISS, None, a, nl)
+
+        pres: dict[str, object] = {}
+        for k, d in col.items():
+            a = d[2]
+            if a is None:
+                pres[k] = True
+            elif a is _ALL:
+                pres[k] = False
+            else:
+                m = bytearray(b"\x01" * self.n)     # 1 = 这帧有这个键
+                for j in a:
+                    m[j] = 0
+                pres[k] = m
+        return col, pres
 
     def __len__(self) -> int:
         return self.n
@@ -410,6 +460,35 @@ class FrameStore(Sequence):
     def __bool__(self) -> bool:
         return self.n > 0
 
+    def lap_frames(self) -> list["Frame"]:
+        """含 lap 字段的帧（保持原顺序）。
+
+        🔴 每个详情页接口的第一件事都是这个列表，而它只取决于场次内容、
+           场次不变它就不变。以前每次请求都对 217k 帧重建一遍（还要新建
+           217k 个 Frame 对象）；现在整场只算一次，后续请求 O(1) 取用。
+           clean_laps 也喂它，两者共享同一批 Frame 对象，不额外占内存。
+        """
+        m = self._memo
+        v = m.get("lap_frames")
+        if v is None:
+            v = [f for f in self if "lap" in f]
+            m["lap_frames"] = v
+        return v
+
+    def _missing(self, k: str):
+        """本场次该字段确实存在，但列式存储里没留它的列 —— 是存储清单漏了。
+
+        空转返回 None（与旧 dict 实现「键在、值为 null」表现一致），
+        同时记一笔，由测试守住（tests/test_frame_store.py）。
+        """
+        MISSED_FIELDS.add(k)
+        if k not in _warned_fields:
+            _warned_fields.add(k)
+            print(f"[frames] ⚠️ 读了未存储的字段 {k!r}：请把它加进 "
+                  f"_FRAME_COL_KIND，否则本处静默拿到 None",
+                  file=sys.stderr, flush=True)
+        return None
+
     def _value(self, k: str, i: int):
         """取一帧某字段的值。
 
@@ -417,32 +496,27 @@ class FrameStore(Sequence):
            `[]` 抛 KeyError；后者 `.get()` 返回 None、`[]` 返回 None。
            混为一谈会让 `f.get("x") or 0` 之类的写法结果不同。
         """
-        if _marked(self._absent.get(k), i):
+        d = self._col.get(k)
+        if d is None:
             return _ABSENT
-        if _marked(self._null.get(k), i):
+        kind = d[0]
+        if kind == _K_MISS:
+            return self._missing(k)
+        a = d[2]
+        if a is not None and (a is _ALL or i in a):
+            return _ABSENT
+        nl = d[3]
+        if nl is not None and (nl is _ALL or i in nl):
             return None
-        col = self._num.get(k)
-        if col is not None:
-            return col[i]
-        cols = self._arr.get(k)
-        if cols is not None:
-            return [c[i] for c in cols]
-        bl = self._bool.get(k)
-        if bl is not None:
-            return bool(bl[i])
-        txi = self._txi.get(k)
-        if txi is not None:
-            return self._tbl[k][txi[i]]
-        # 走到这里：这个字段没被存储。若它确实存在于本场次，说明存储清单漏了。
-        if k in self.fields:
-            MISSED_FIELDS.add(k)
-            if k not in _warned_fields:
-                _warned_fields.add(k)
-                print(f"[frames] ⚠️ 读了未存储的字段 {k!r}：请把它加进 "
-                      f"_FRAME_COL_KIND，否则本处静默拿到 None",
-                      file=sys.stderr, flush=True)
-            return None
-        return _ABSENT
+        data = d[1]
+        if kind == _K_NUM:
+            return data[i]
+        if kind == _K_AXIS:
+            return [c[i] for c in data]
+        if kind == _K_BOOL:
+            return data[i] != 0
+        tb, xi = data
+        return tb[xi[i]]
 
 
 def _parse_frames(path: Path) -> tuple[dict, FrameStore]:
@@ -592,8 +666,8 @@ def compare_session(path: Path, ref_lap_no: int | None = None,
     不能因为它挂掉影响详情页主体。
     """
     try:
-        _, all_frames = _load_frames(path)
-        frames = [f for f in all_frames if "lap" in f]
+        _, store = _load_frames(path)
+        frames = store.lap_frames()
         import gt7analysis
         # 赛车线抽稀在 gt7analysis.race_line 内部做（decimate=6）。
         # 🔴 不能在这里对每段各自 [::6]：分段后各自抽稀会把每段末尾
@@ -615,8 +689,8 @@ def race_line_session(path: Path, lap_no: int, decimate: int = 6) -> dict[str, A
     🔴 与 compare_session 共用 _load_frames 的解析缓存，不额外读盘。
     """
     try:
-        _, all_frames = _load_frames(path)
-        frames = [f for f in all_frames if "lap" in f]
+        _, store = _load_frames(path)
+        frames = store.lap_frames()
         import gt7analysis
         return gt7analysis.race_line_of_lap(frames, int(lap_no),
                                             decimate=decimate)
@@ -1002,13 +1076,26 @@ def _valid_laps(path: Path) -> tuple[list[dict], dict, float]:
 
     圈口径复用 gt7analysis.clean_laps（与圈速表 / 赛车线 / 参考圈同一套），
     避免这里算一套、那边算一套导致圈号对不上。
+
+    🔴 结果按场次记忆化。clean_laps 内部是「按 lap 分组 + 每圈算距离 +
+       每圈算速度峰值」三遍 O(n) 逐帧取值；而它只取决于文件内容。
+       详情页每个接口（/frames、/series、/csv、/raceline）都调这一支，
+       一场 217k 帧的次次重算实测要多花 0.2s/次。
+
+    传给 clean_laps 的是 lap_frames 而不是全部帧：split_laps 本来就按
+    `lap <= 0` 丢弃，而缺 lap 字段的帧读出来正是 0，同样被丢——两份输入
+    得到的分组逐圈完全相同，但省掉一次全量遍历，还让两者共用那批 Frame 对象。
     """
-    _, frames = _load_frames(path)
-    if not frames:
+    _, store = _load_frames(path)
+    if not store:
         return [], {}, 0.0
-    t0 = frames[0].get("t") or 0.0
+    memo = store._memo
+    hit = memo.get("valid_laps")
+    if hit is not None:
+        return hit
+    t0 = store[0].get("t") or 0.0
     import gt7analysis
-    grouped = gt7analysis.clean_laps(frames)
+    grouped = gt7analysis.clean_laps(store.lap_frames())
     laps = []
     for no, fs in sorted(grouped.items()):
         if len(fs) < 2:
@@ -1019,7 +1106,9 @@ def _valid_laps(path: Path) -> tuple[list[dict], dict, float]:
             "dur": round((fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0), 3),
             "frames": len(fs),
         })
-    return laps, grouped, t0
+    out = (laps, grouped, t0)
+    memo["valid_laps"] = out
+    return out
 
 
 def _scope_t0(scope: list[dict], session_t0: float, lap_no: int | None) -> float:
@@ -1045,8 +1134,8 @@ def session_series(path: Path, lap_no: int | None = None,
         laps, grouped, sess_t0 = _valid_laps(path)
     except Exception as e:
         return {"error": str(e)}
-    _, frames = _load_frames(path)
-    fr = [f for f in frames if "lap" in f]
+    _, store = _load_frames(path)
+    fr = store.lap_frames()
     if not fr:
         return {"error": "没有可用的帧（缺少 lap 字段）"}
 
@@ -1083,8 +1172,8 @@ def session_frames(path: Path, offset: int = 0, limit: int = 200,
         _, grouped, sess_t0 = _valid_laps(path)
     except Exception as e:
         return {"error": str(e)}
-    _, frames = _load_frames(path)
-    fr = (grouped.get(lap_no) or []) if lap_no else [f for f in frames if "lap" in f]
+    _, store = _load_frames(path)
+    fr = (grouped.get(lap_no) or []) if lap_no else store.lap_frames()
     t0 = _scope_t0(fr, sess_t0, lap_no)
     total = len(fr)
     offset = max(0, int(offset or 0))
@@ -1101,8 +1190,8 @@ def session_frames(path: Path, offset: int = 0, limit: int = 200,
 def session_csv(path: Path, lap_no: int | None = None) -> str:
     """逐帧数据导成 CSV（Excel / pandas 可直接打开）。"""
     _, grouped, sess_t0 = _valid_laps(path)
-    _, frames = _load_frames(path)
-    fr = (grouped.get(lap_no) or []) if lap_no else [f for f in frames if "lap" in f]
+    _, store = _load_frames(path)
+    fr = (grouped.get(lap_no) or []) if lap_no else store.lap_frames()
     t0 = _scope_t0(fr, sess_t0, lap_no)
     head = ("时间(s),速度(km/h),转速(rpm),油门(%),刹车(%),档位,"
             "横向G,纵向G,油量(%),圈号")
