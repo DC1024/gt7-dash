@@ -733,6 +733,291 @@ def wheel_slip(laps: dict[int, list[dict]], nmax_events: int = 5,
     }
 
 
+# —— 走线偏差（本圈相对参考圈的横向偏移） ————————————
+
+_DEV_STEP = 5.0        # 输出网格步长（米）
+_DEV_WIN = 24          # 最近点单调搜索窗口（以参考线采样点数为单位，见下）
+_DEV_COVER = 0.6       # 本圈至少要覆盖参考线这么多比例才算可信
+_DEV_START_GAP = 60.0  # 本圈起点与参考圈起点的物理间距超过这个值 ⇒ 不同一位置起步
+_DEV_RMS_TOL = 60.0    # RMS 偏移超过这个值 ⇒ 对齐明确失败，绝不当结论输出
+
+
+def _ref_self_cross(R: list, ref_len: float, min_sep: float = 250.0) -> float:
+    """参考线上「沿赛道相隔 > min_sep 米、空间上最近」的那对点的间距。
+
+    单圈赛道这个值通常是几十米往上（平行直道之间、回头弯的内侧）。
+    撞车/出赛道导致**折返**的圈会出现很小的值（轨迹自己压到自己），
+    此时最近点匹配有歧义、单调搜索会锁死在错的分支上。
+
+    🔴 **探针实测发现这个指标单独使用不可靠**：
+      · 有些赛道两段本来就只差十几米（平行直道、内嵌的回头弯），
+        用 8~25 m 阈值会误杀干净圈；
+      · 有些「不那么脏」的圈（出赛道但没折返）自交指标仍是 ∞。
+      所以这里**只做诊断输出**（`ref_self_cross_m`），不作为硬护栏——
+      实际失败会被 RMS 护栏挡住。这种「诊断够用、护栏难定」的指标
+      老实标出来就行，别硬上阈值。网格分桶实现，O(n)。
+    """
+    cell = 8.0
+    buckets: dict[tuple[int, int], list[int]] = {}
+    best = float("inf")
+    for i, (s, x, z) in enumerate(R):
+        cx, cz = int(x // cell), int(z // cell)
+        for gx in (cx - 1, cx, cx + 1):
+            for gz in (cz - 1, cz, cz + 1):
+                for j in buckets.get((gx, gz), ()):
+                    ds = abs(s - R[j][0])
+                    ds = min(ds, ref_len - ds)      # 闭环：首尾是同一个点
+                    if ds < min_sep:
+                        continue
+                    d = math.hypot(R[j][1] - x, R[j][2] - z)
+                    if d < best:
+                        best = d
+        buckets.setdefault((cx, cz), []).append(i)
+    return best
+
+
+def _seg_closest(ax: float, az: float, bx: float, bz: float,
+                 px: float, pz: float):
+    """点 P 到线段 AB 的最近点。
+
+    返回 (t, d2, dx, dz)：t 为投影比例（夹到 [0,1]），d2 为平方距离，
+    (dx, dz) 为线段方向向量（未归一化，供算法向用）。
+    """
+    dx, dz = bx - ax, bz - az
+    L2 = dx * dx + dz * dz
+    if L2 <= 0.0:
+        return 0.0, (px - ax) ** 2 + (pz - az) ** 2, 0.0, 0.0
+    t = ((px - ax) * dx + (pz - az) * dz) / L2
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    fx, fz = ax + dx * t, az + dz * t
+    return t, (px - fx) ** 2 + (pz - fz) ** 2, dx, dz
+
+
+def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
+                    step: float = _DEV_STEP) -> dict:
+    """本圈相对参考圈的**横向偏移**（米，带符号）——「走线偏差」。
+
+    做法（几何对齐，不是按距离对齐）：
+      1. 把参考圈的点列当成折线。
+      2. 本圈每个点投影到折线上找**最近点**，得到三个量：
+         沿参考线的弧长 s、横向偏移 dlat、以及参考线在该处的切向。
+      3. dlat = (本圈点 − 垂足) 点乘参考线法向，所以**带符号**。
+      4. 把 (s, dlat) 重采样到固定距离网格输出。
+
+    🔴 **为什么不能用「按距离对齐」**——本项目已有的其它分析（时间差、峰谷配对）
+       是按各圈自己积分出的累计距离对齐的，而 `match_pv_pairs` 里实测记录了
+       「同场两圈同一弯道的积分漂移可达 60~300 m」（丢包时 `lap_samples` 会跳过
+       整段距离，见那个 dt<=1.0 的守卫）。
+       横向偏移对沿赛道错位**极其**敏感：100 m 的错位在半径 200 m 的弯里就是
+       约 6 m 的假偏移，而真实走线差才 1~5 m —— 等于把噪声当信号。
+       几何对齐天然免疫：垂足在参考线上，沿赛道误差恒为 0，剩下的
+       dlat 才是真的横向差。
+
+    🔴 符号约定：法向取参考线切向的 **+90° 旋转**，即 N = (−Tz, Tx)。
+       所以「正」= 参考线行进方向的左侧。但**别依赖它去说左右**——
+       世界坐标的左右手性容易搞反。要判内侧/外侧请用 `inside`
+       （由参考线自身的曲率方向算出，不依赖坐标系手性）。
+
+    🔴 只有**跑满整圈**的本圈才可信：残圈只覆盖参考线的一小段，
+       覆盖率（coverage）会远低于 1，此时可信度直接标 False。
+       判据与 sector_times 的残缺圈过滤同源。
+
+    返回：
+      {step_m, ref_len_m, cur_len_m, coverage, ref_lap_cover, reliable,
+       rms_dlat, p95_abs_dlat, max_abs_dlat, mean_dlat, inside_pct,
+       worst_win: {from_m, to_m, mean_dlat}, segments: [...],
+       line: [[x, z, dlat, inside], ...],   # 本圈走线，沿参考线弧长等距
+       grid_m: [s, ...],                    # 与 line 一一对应的弧长
+       drift_m}                             # 距离积分漂移诊断
+    """
+    empty = {"step_m": step, "line": [], "grid_m": [], "segments": [],
+             "reliable": False, "reason": "",
+             "ref_len_m": 0.0, "cur_len_m": 0.0, "coverage": 0.0,
+             "rms_dlat": 0.0, "p95_abs_dlat": 0.0, "max_abs_dlat": 0.0,
+             "mean_dlat": 0.0, "inside_pct": None, "drift_m": 0.0,
+             "start_arc_m": 0.0, "start_gap_m": 0.0, "end_gap_m": 0.0,
+             "ref_self_cross_m": None, "worst_win": None}
+    if not ref_pts or not cur_pts or len(ref_pts) < 10 or len(cur_pts) < 10:
+        empty["reason"] = "点太少"
+        return empty
+
+    # 参考折线：直接用原始采样点（50 Hz 下高速约 1.4 m 一个点，
+    # 已经比任何重采样都准），并只保留坐标有效的点。
+    R = [(p["dist"], p["x"], p["z"]) for p in ref_pts
+         if p.get("x") is not None and p.get("z") is not None]
+    if len(R) < 10:
+        empty["reason"] = "参考圈没有有效坐标"
+        return empty
+    ref_len = R[-1][0]
+    if ref_len <= 10.0:
+        empty["reason"] = "参考圈长度异常"
+        return empty
+
+    # 单调搜索：本圈与参考圈同向推进，所以每个点只需在上一次匹配附近找。
+    # 窗口 ±_DEV_WIN 个参考点（约 ±34 m 弧长）。这样既 O(n)，
+    # 又不会在「赛道两段相距很近」的地方跳到另一支（沿赛道长度上它们
+    # 差得远，窗口够不到）。
+    rows = []            # (s, dlat, inside, x, z, cur_dist)
+    j = 0
+    for p in cur_pts:
+        x, z = p.get("x"), p.get("z")
+        if x is None or z is None:
+            continue
+        lo = j - _DEV_WIN
+        if lo < 0:
+            lo = 0
+        hi = j + _DEV_WIN
+        if hi > len(R) - 2:
+            hi = len(R) - 2
+        best = None
+        for k in range(lo, hi + 1):
+            t, d2, dx, dz = _seg_closest(R[k][1], R[k][2],
+                                         R[k + 1][1], R[k + 1][2], x, z)
+            if best is None or d2 < best[0]:
+                best = (d2, k, t, dx, dz)
+        if best is None:
+            continue
+        d2, k, t, dx, dz = best
+        j = k
+        s = R[k][0] + (R[k + 1][0] - R[k][0]) * t
+        L = math.hypot(dx, dz)
+        if L <= 0.0:
+            continue
+        # 法向 = 切向 +90° 旋转：(−dz, dx)/L
+        nx, nz = -dz / L, dx / L
+        fx, fz = R[k][1] + dx * t, R[k][2] + dz * t
+        dlat = (x - fx) * nx + (z - fz) * nz
+        # 曲率方向：dT/ds 在 +N 上的分量 c = −cross(T, T')，
+        # 曲率中心就在 +N 一侧当且仅当 c > 0。所以点在**弯心侧**
+        # （=内侧）等价于 dlat 与 c 同号。用前后两点估 cross 就够。
+        k0 = max(0, k - 2)
+        k1 = min(len(R) - 1, k + 2)
+        t0x, t0z = R[k][1] - R[k0][1], R[k][2] - R[k0][2]
+        t1x, t1z = R[k1][1] - R[k][1], R[k1][2] - R[k][2]
+        cross = t0x * t1z - t0z * t1x
+        c = -cross
+        # 贴着参考线（|dlat| 极小）时点就在线上，既不算内侧也不算外侧，
+        # 否则「自己跟自己比」会算出 inside_pct = 0% 这种假结论。
+        inside = None if abs(dlat) < 0.05 else ((dlat * c) > 0.0 if c != 0.0 else None)
+        rows.append((s, dlat, inside, x, z, p.get("dist") or 0.0))
+
+    if len(rows) < 10:
+        empty["reason"] = "本圈可用点太少"
+        return empty
+
+    # 距离积分漂移诊断：同一物理位置处「本圈自己的累计距离」与
+    # 「参考线弧长」的最大偏差。数值大说明该圈有丢包或空转/锁死，
+    # 属于「结论之外但要如实交代」的量 —— 见 match_pv_pairs 的实测记录。
+    drift = max(abs(r[5] - r[0]) for r in rows)
+    start_arc = rows[0][0]
+    end_arc = rows[-1][0]
+    cover = end_arc / ref_len
+    # 物理起终点间距：同赛道上车从同一位置过线，所以两者的起点应当几乎重合。
+    # 出场圈（发车格起步，位置在起跑线之前）会让对应关系**跨圈回绕**，
+    # 而参考折线是线性的、单调搜索接不住 —— 实测第 1 圈因此算出 524 m 的假
+    # RMS。这个检查就是为它准备的（与赛道指纹依赖的是同一条前提）。
+    start_gap = math.hypot(R[0][1] - rows[0][3], R[0][2] - rows[0][4])
+    end_gap = math.hypot(R[-1][1] - rows[-1][3], R[-1][2] - rows[-1][4])
+
+    vals = [abs(r[1]) for r in rows]
+    svals = sorted(vals)
+    n = len(svals)
+    rms = math.sqrt(sum(v * v for v in vals) / n)
+    self_cross = _ref_self_cross(R, ref_len)
+
+    # 三道独立护栏，全都要过才给结论。宁可明确说「不可比」，
+    # 也不能吐一个 500 m 的假横向偏移出去 —— 那比没有更糟。
+    # （自交检测只做诊断，详见 _ref_self_cross 的注释。）
+    reasons = []
+    if start_gap > _DEV_START_GAP:
+        reasons.append(
+            f"本圈起点与参考圈起点相距 {start_gap:.0f} m，不是同一位置起步"
+            "（出场圈 / 维修区起步），对应关系会跨圈回绕")
+    if cover < _DEV_COVER:
+        reasons.append(f"本圈只覆盖参考线的 {cover * 100:.0f}%")
+    if rms > _DEV_RMS_TOL:
+        reasons.append(f"偏移量级 {rms:.0f} m 明显不合理，对齐失败")
+    reliable = not reasons
+
+    # 重采样到等弧长网格
+    line: list[list[float]] = []
+    grid: list[float] = []
+    s_end = end_arc
+    d = 0.0
+    idx = 0
+    while d <= s_end:
+        while idx + 1 < len(rows) and rows[idx + 1][0] < d:
+            idx += 1
+        r = rows[idx]
+        line.append([round(r[3] if r[3] is not None else 0.0, 2),
+                     round(r[4] if r[4] is not None else 0.0, 2),
+                     round(r[1], 3),
+                     1 if r[2] else (0 if r[2] is not None else -1)])
+        grid.append(round(d, 1))
+        d += step
+
+    ins_known = [r[2] for r in rows if r[2] is not None]
+    out = {
+        "step_m": step,
+        "ref_len_m": round(ref_len, 1),
+        "cur_len_m": round(rows[-1][5], 1),
+        "coverage": round(cover, 3),
+        "reliable": reliable,
+        "reason": "；".join(reasons),
+        "rms_dlat": round(rms, 3),
+        "p95_abs_dlat": round(svals[min(n - 1, int(n * 0.95))], 3),
+        "max_abs_dlat": round(svals[-1], 3),
+        "mean_dlat": round(sum(r[1] for r in rows) / n, 3),
+        "inside_pct": (round(100.0 * sum(1 for v in ins_known if v)
+                             / len(ins_known), 1) if ins_known else None),
+        "drift_m": round(drift, 1),
+        "start_arc_m": round(start_arc, 1),
+        "start_gap_m": round(start_gap, 1),
+        "end_gap_m": round(end_gap, 1),
+        "ref_self_cross_m": (round(self_cross, 1)
+                             if self_cross != float("inf") else None),
+        "line": line,
+        "grid_m": grid,
+        "segments": [],
+        "worst_win": None,
+    }
+    # 不可信就不给分段与最差段：一组标了「不可比」的数字本身就没意义
+    if not reliable:
+        return out
+
+    # 参考线等弧长采样（步长取 ref_len/step 个点，约 1400 个），
+    # 给前端画「灰线底图 + 彩色偏差」用。strided 采样即可，
+    # 原始 R 是 ~50 Hz，已经很密。
+    ref_step = max(1, round(len(R) * step / ref_len))
+    ref_line = [[round(R[k][1], 2), round(R[k][2], 2)]
+                for k in range(0, len(R), ref_step)]
+    out["ref_line"] = ref_line
+
+    # 分 10 段给均值——用户要的是「在哪个区段偏得最多」，不是全圈一个数
+    segs = []
+    seg_len = ref_len / 10.0
+    for k in range(10):
+        a, b = k * seg_len, (k + 1) * seg_len
+        win = [r for r in rows if a <= r[0] < b]
+        if not win:
+            continue
+        wv = [abs(r[1]) for r in win]
+        segs.append({
+            "from_m": round(a),
+            "to_m": round(b),
+            "mean_dlat": round(sum(r[1] for r in win) / len(win), 3),
+            "max_abs_dlat": round(max(wv), 3),
+            "rms_dlat": round(math.sqrt(sum(v * v for v in wv) / len(wv)), 3),
+        })
+    out["segments"] = segs
+    if segs:
+        w = max(segs, key=lambda x: x["rms_dlat"])
+        out["worst_win"] = {"from_m": w["from_m"], "to_m": w["to_m"],
+                            "rms_dlat": w["rms_dlat"],
+                            "mean_dlat": w["mean_dlat"]}
+    return out
+
+
 # —— 门面 ——————————————————————————————
 
 def match_pv_pairs(peaks_ref: list[dict], peaks_cur: list[dict],

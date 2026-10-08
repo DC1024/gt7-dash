@@ -136,6 +136,7 @@
 | `GET /api/v1/sessions/<文件名>/raceline?lap=N` | 第 N 圈的**行车轨迹**（踏板 + G 力两套着色通道）；`lap` 缺省 = 最快圈 |
 | `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
+| `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -226,6 +227,48 @@
 - ⚠️ 曲线是抽稀的，**1~2 帧的尖峰会漏掉**（抱死常常就这么短）——
   峰值一律从 `worst[]` 读，别从曲线读。
 
+## 走线偏差
+
+`GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5`
+—— 把「赛车线」「行进线」从「按 G + 踏板着色」升级成「按横向偏移量着色」。
+本圈每一点投影到参考圈的折线上求垂足，dlat = 垂足到本圈点 在参考线法向上的投影；
+前端按 dlat 标蓝 / 白 / 红，p95 截断色阶。回答的是「我在哪段路、开哪条线、偏了多远」。
+
+| 字段 | 说明 |
+|---|---|
+| `ref_lap` / `cmp_lap` | 参考圈 / 对比圈；缺省 `ref_lap` = 最快圈、`cmp_lap` = 最后一圈 |
+| `step` | 输出网格步长（米），1~50，缺省 5 |
+| `ref_len_m` / `cur_len_m` | 参考圈 / 本圈的长度（米） |
+| `coverage` | 本圈覆盖参考线的比例；< 0.6 ⇒ 残圈 ⇒ `reliable=false` |
+| `reliable` / `reason` | 对齐是否可信；出场圈 / 残圈 / 距离对齐失败时不可比 |
+| `rms_dlat` / `p95_abs_dlat` / `max_abs_dlat` | 偏移统计（米，p95 用于色阶截断） |
+| `mean_dlat` | 整体偏离方向（带符号；坐标系手性决定正负，不要靠它判内侧外侧） |
+| `inside_pct` | 弯心侧占比（按参考线自身曲率方向算）；直道 / 极贴线处为 `null` |
+| `drift_m` | **诊断量**：本圈距离积分漂移（同一物理位置处本圈与参考线累计距离的差） |
+| `start_arc_m` / `start_gap_m` / `end_gap_m` | 起点弧距、两圈起点物理间距、两圈终点物理间距；`start_gap_m > 60` ⇒ 出场圈 ⇒ 拒绝 |
+| `ref_self_cross_m` | **诊断量**：参考线自交距离（沿赛道相隔 250m 的两点空间最近值）；仅展示，不作护栏 |
+| `worst_win` | 10 段等弧长切分里 RMS 最大的那一段 `{from_m, to_m, rms_dlat, mean_dlat}` |
+| `line[]` | 本圈走线重采样：`[x, z, dlat, inside]`；`inside ∈ {-1, 0, 1}` = {无效, 不在弯心侧, 在弯心侧} |
+| `grid_m[]` | 与 `line[]` 一一对应的参考线弧长（米） |
+| `ref_line[]` | 参考线等弧长采样 `[[x, z], ...]`（前端灰底图） |
+| `segments[]` | 10 段等弧长切分：`{from_m, to_m, mean_dlat, max_abs_dlat, rms_dlat}` |
+| `laps_list[]` | 本场所有有效圈号，给前端下拉用 |
+
+- **几何对齐而不是距离对齐**：本圈每点投影到参考线折线上的最近线段。
+  按距离对齐会被 `match_pv_pairs` 实测的 60~300 m 距离积分漂移污染
+  （丢包时 `lap_samples` 跳过整段距离）；几何对齐天然免疫，
+  沿赛道方向误差恒为 0，剩下的 dlat 才是真的横向差。
+- **三道独立护栏，全过才给结论**：
+  - `start_gap_m > 60` ⇒ 出场圈，跨圈回绕会让单调搜索锁错；
+  - `coverage < 0.6` ⇒ 残圈（半圈起步 / 进站退出），不覆盖参考线；
+  - `rms_dlat > 60` ⇒ 距离对齐明确失败，绝不吐出假横向偏移。
+  三道都不过时返回 `reliable=false` + `reason`，但 `line` / `ref_line` 仍输出，
+  前端照画灰底供肉眼参考，**RMS / 内侧占比这些数都别看**。
+- **符号约定**：法向取参考线切向的 **+90° 旋转**（`N = (−Tz, Tx)`），
+  所以「正 = 参考线行进方向的左侧」。但**别靠它判内侧外侧**——
+  世界坐标的左右手性容易看反。要判内侧 / 外侧请用 `inside`
+  （按参考线自身曲率方向算，不依赖坐标系手性）。
+
 ## 单圈行车轨迹
 
 `GET /api/v1/sessions/<文件名>/raceline?lap=N` 只算**某一圈**的轨迹（缺省 `lap` = 最快圈，
@@ -275,6 +318,10 @@ curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&
 
 # 单圈行车轨迹（踏板 + G 力两套着色通道）
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/raceline?lap=3"
+
+# 走线偏差（参考圈 vs 对比圈，逐米横向偏移）
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation?ref_lap=6&cmp_lap=7&step=5"
 
 # 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"

@@ -66,6 +66,9 @@ def test_new_analysis_rows_in_both_tables(embedded, doc_file):
          "`n` = 段数（2~10，缺省 4） |"),
         ("| `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**："
          "空转 / 抱死检测；每圈曲线最多 `max_points` 点 |"),
+        ("| `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | "
+         "**走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，"
+         "`cmp_lap` 缺省 = 最后一圈 |"),
     ]
     for row in rows:
         assert row in embedded, f"内嵌文档缺表格行：{row}"

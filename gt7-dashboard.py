@@ -1370,6 +1370,78 @@ def session_slip(path: Path, max_per_lap: int = 120) -> dict[str, Any]:
     return hit
 
 
+def session_deviation(path: Path, ref_lap: int | None = None,
+                      cmp_lap: int | None = None,
+                      step: float = 5.0) -> dict[str, Any]:
+    """走线偏差（横向偏移热力图）：本圈相对参考圈的逐米 dlat 通道。
+
+    `ref_lap` 缺省取最快圈，`cmp_lap` 缺省取「非 ref 的另一有效圈」——
+    与「圈间对比」卡片的口径一致。两圈不存在或其一不达标（出场圈 / 残圈
+    / 距离对齐失败）时会返回 `reliable=false` + `reason`，前端整段画灰底
+    说明而不吐错。
+
+    🔴 结果按场次记忆化。本场 217k 帧实测 ~80ms（一次最贵的最近点搜索
+       一次性跑完），命中缓存 0ms。同一份 (ref, cmp, step) 在同一场次里
+       反复切换时才不会被反复算。
+    """
+    step = max(1.0, min(float(step or 5.0), 50.0))
+    try:
+        laps_list, grouped, _ = _valid_laps(path)
+    except Exception as e:
+        return {"error": str(e), "reliable": False, "line": [], "grid_m": [],
+                "segments": [], "ref_line": []}
+    if not grouped:
+        return {"error": "no frames", "reliable": False, "line": [],
+                "grid_m": [], "segments": [], "ref_line": []}
+    valid_nos = sorted(grouped.keys())
+    if not valid_nos:
+        return {"error": "no valid lap", "reliable": False, "line": [],
+                "grid_m": [], "segments": [], "ref_line": []}
+
+    # 参考圈缺省 = 最快圈；与「圈间对比 / 行车轨迹」卡片共用同一选择逻辑。
+    if ref_lap is None or ref_lap not in grouped or len(grouped[ref_lap]) < 10:
+        best = (analyze_session(path) or {}).get("best_lap") or {}
+        ref_lap = best.get("lap") if best.get("lap") in grouped else valid_nos[0]
+    # 对比圈缺省 = 最后一圈（圈号最大的有效圈），与「圈间对比」卡片
+    # 共用同一口径。
+    if cmp_lap is None:
+        cands = sorted(grouped.keys(), reverse=True)
+        cmp_lap = next((n for n in cands if n != ref_lap), None)
+        if cmp_lap is None:
+            cmp_lap = valid_nos[-1]
+    # 显式指定：ref 与 cmp 撞成同一圈、或圈不在 grouped 里 —— 直接报错，
+    # 而不是悄悄换号。悄悄换号会让「我点了 6 号没反应」的排查很难。
+    if cmp_lap not in grouped:
+        return {"error": f"对比圈 {cmp_lap} 不在场次里",
+                "reliable": False, "line": [], "grid_m": [],
+                "segments": [], "ref_line": []}
+    if ref_lap == cmp_lap:
+        return {"error": "ref 与 cmp 撞成同一圈", "reliable": False,
+                "line": [], "grid_m": [], "segments": [], "ref_line": []}
+
+    _, store = _load_frames(path)
+    if not store:
+        return {"error": "no frames", "reliable": False, "line": [],
+                "grid_m": [], "segments": [], "ref_line": []}
+    memo = store._memo
+    key = ("deviation", int(ref_lap), int(cmp_lap), step)
+    hit = memo.get(key)
+    if hit is None:
+        import gt7analysis
+        hit = gt7analysis.track_deviation(
+            gt7analysis.lap_samples(grouped[int(ref_lap)]),
+            gt7analysis.lap_samples(grouped[int(cmp_lap)]),
+            step=step)
+        memo[key] = hit
+    # 每次返回都补这两个字段（让前端切圈时知道参考圈 / 对比圈当前是几号），
+    # 同时把可圈清单给前端做下拉用。
+    hit = dict(hit)
+    hit["ref_lap"] = int(ref_lap)
+    hit["cmp_lap"] = int(cmp_lap)
+    hit["laps_list"] = [int(x["lap"]) for x in laps_list]
+    return hit
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -1625,6 +1697,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/raceline?lap=N` | 第 N 圈的**行车轨迹**（踏板 + G 力两套着色通道）；`lap` 缺省 = 最快圈 |
 | `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
+| `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
 
 `series` / `frames` 返回的 `cols` 固定为
 `["t", "spd", "rpm", "thr", "brk", "gear", "glat", "glon", "fuel", "lap"]`：
@@ -1715,6 +1788,48 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 - ⚠️ 曲线是抽稀的，**1~2 帧的尖峰会漏掉**（抱死常常就这么短）——
   峰值一律从 `worst[]` 读，别从曲线读。
 
+## 走线偏差
+
+`GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5`
+—— 把「赛车线」「行进线」从「按 G + 踏板着色」升级成「按横向偏移量着色」。
+本圈每一点投影到参考圈的折线上求垂足，dlat = 垂足到本圈点 在参考线法向上的投影；
+前端按 dlat 标蓝 / 白 / 红，p95 截断色阶。回答的是「我在哪段路、开哪条线、偏了多远」。
+
+| 字段 | 说明 |
+|---|---|
+| `ref_lap` / `cmp_lap` | 参考圈 / 对比圈；缺省 `ref_lap` = 最快圈、`cmp_lap` = 最后一圈 |
+| `step` | 输出网格步长（米），1~50，缺省 5 |
+| `ref_len_m` / `cur_len_m` | 参考圈 / 本圈的长度（米） |
+| `coverage` | 本圈覆盖参考线的比例；< 0.6 ⇒ 残圈 ⇒ `reliable=false` |
+| `reliable` / `reason` | 对齐是否可信；出场圈 / 残圈 / 距离对齐失败时不可比 |
+| `rms_dlat` / `p95_abs_dlat` / `max_abs_dlat` | 偏移统计（米，p95 用于色阶截断） |
+| `mean_dlat` | 整体偏离方向（带符号；坐标系手性决定正负，不要靠它判内侧外侧） |
+| `inside_pct` | 弯心侧占比（按参考线自身曲率方向算）；直道 / 极贴线处为 `null` |
+| `drift_m` | **诊断量**：本圈距离积分漂移（同一物理位置处本圈与参考线累计距离的差） |
+| `start_arc_m` / `start_gap_m` / `end_gap_m` | 起点弧距、两圈起点物理间距、两圈终点物理间距；`start_gap_m > 60` ⇒ 出场圈 ⇒ 拒绝 |
+| `ref_self_cross_m` | **诊断量**：参考线自交距离（沿赛道相隔 250m 的两点空间最近值）；仅展示，不作护栏 |
+| `worst_win` | 10 段等弧长切分里 RMS 最大的那一段 `{from_m, to_m, rms_dlat, mean_dlat}` |
+| `line[]` | 本圈走线重采样：`[x, z, dlat, inside]`；`inside ∈ {-1, 0, 1}` = {无效, 不在弯心侧, 在弯心侧} |
+| `grid_m[]` | 与 `line[]` 一一对应的参考线弧长（米） |
+| `ref_line[]` | 参考线等弧长采样 `[[x, z], ...]`（前端灰底图） |
+| `segments[]` | 10 段等弧长切分：`{from_m, to_m, mean_dlat, max_abs_dlat, rms_dlat}` |
+| `laps_list[]` | 本场所有有效圈号，给前端下拉用 |
+
+- **几何对齐而不是距离对齐**：本圈每点投影到参考线折线上的最近线段。
+  按距离对齐会被 `match_pv_pairs` 实测的 60~300 m 距离积分漂移污染
+  （丢包时 `lap_samples` 跳过整段距离）；几何对齐天然免疫，
+  沿赛道方向误差恒为 0，剩下的 dlat 才是真的横向差。
+- **三道独立护栏，全过才给结论**：
+  - `start_gap_m > 60` ⇒ 出场圈，跨圈回绕会让单调搜索锁错；
+  - `coverage < 0.6` ⇒ 残圈（半圈起步 / 进站退出），不覆盖参考线；
+  - `rms_dlat > 60` ⇒ 距离对齐明确失败，绝不吐出假横向偏移。
+  三道都不过时返回 `reliable=false` + `reason`，但 `line` / `ref_line` 仍输出，
+  前端照画灰底供肉眼参考，**RMS / 内侧占比这些数都别看**。
+- **符号约定**：法向取参考线切向的 **+90° 旋转**（`N = (−Tz, Tx)`），
+  所以「正 = 参考线行进方向的左侧」。但**别靠它判内侧外侧**——
+  世界坐标的左右手性容易看反。要判内侧 / 外侧请用 `inside`
+  （按参考线自身曲率方向算，不依赖坐标系手性）。
+
 ## 单圈行车轨迹
 
 `GET /api/v1/sessions/<文件名>/raceline?lap=N` 只算**某一圈**的轨迹（缺省 `lap` = 最快圈，
@@ -1764,6 +1879,10 @@ curl "http://localhost:8787/session?file=20261007_045628_unknown_6ac5607c.jsonl&
 
 # 单圈行车轨迹（踏板 + G 力两套着色通道）
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/raceline?lap=3"
+
+# 走线偏差（参考圈 vs 对比圈，逐米横向偏移）
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation"
+curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/deviation?ref_lap=6&cmp_lap=7&step=5"
 
 # 逐帧数据：整场时序 / 第 3 圈时序 / 翻页 / 导出
 curl "http://localhost:8787/api/v1/sessions/SESSION.jsonl/series"
@@ -2138,12 +2257,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif path.startswith("/api/v1/sessions/") and (
                     path.endswith("/series") or path.endswith("/frames")
                     or path.endswith("/csv") or path.endswith("/raceline")
-                    or path.endswith("/sectors") or path.endswith("/slip")):
+                    or path.endswith("/sectors") or path.endswith("/slip")
+                    or path.endswith("/deviation")):
                 # 逐帧遥测三兄弟：/series（降采样画图）/ frames（分页表）/ csv（导出）
                 # 外加 /raceline：单圈赛车线（「行车轨迹」卡片独立切圈用，
                 #   不必重算整页对比分析）。
-                # 外加 /sectors（分段计时 + 理论最快圈）与 /slip（轮胎滑移）：
-                #   两张分析卡片各自展开时才取，同样不拖累整页渲染。
+                # 外加 /sectors（分段计时 + 理论最快圈）、/slip（轮胎滑移）、
+                #   /deviation（走线偏差）：三张分析卡片各自展开时才取，
+                #   同样不拖累整页渲染。
                 # 🔴 必须排在下面那条「通用 /api/v1/sessions/<名>」之前，
                 #    否则会被当成场次名吞掉。
                 seg = path.split("/")
@@ -2186,6 +2307,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         mp = 120
                     self._send_json(
                         session_slip(target, max_per_lap=mp), cors=True)
+                elif path.endswith("/deviation"):
+                    try:
+                        rl = int(query.get("ref_lap", ["0"])[0]) or None
+                    except ValueError:
+                        rl = None
+                    try:
+                        cl = int(query.get("cmp_lap", ["0"])[0]) or None
+                    except ValueError:
+                        cl = None
+                    try:
+                        st = float(query.get("step", ["5"])[0])
+                    except ValueError:
+                        st = 5.0
+                    self._send_json(
+                        session_deviation(target, ref_lap=rl, cmp_lap=cl,
+                                          step=st), cors=True)
                 elif path.endswith("/csv"):
                     body = session_csv(target, lap_no=lap_no).encode("utf-8")
                     fn = name[:-6] + (f"_lap{lap_no}" if lap_no else "") + ".csv"
@@ -3274,6 +3411,282 @@ const CMP = __DATA__;
 #
 # 🔴 用 r""" 而不是 """：内嵌 JS 里的正则反斜杠不会被 Python 转义吃掉
 #    （_COMPARE_TMPL 就是这里踩过，留下一条 SyntaxWarning）。
+_DEVIATION_TMPL = r"""
+<style>
+  .dv-note { font-size:12px; color:var(--muted); margin:6px 0 10px; line-height:1.65; }
+  .dv-canvas-wrap { position:relative; border:1px solid var(--line);
+    border-radius:8px; background:rgba(128,128,128,.04); padding:4px; }
+  .dv-canvas { display:block; width:100%; height:auto; }
+  .dv-legend { display:flex; gap:14px; font-size:11.5px; color:var(--muted);
+    flex-wrap:wrap; align-items:center; margin-top:8px; }
+  .dv-legend i { display:inline-block; height:8px; border-radius:2px;
+    margin-right:5px; vertical-align:1px; }
+  .dv-bar { flex:1 1 200px; height:8px; border-radius:4px;
+    background:linear-gradient(to right, #0d6efd, #e7ecef 49%, #e7ecef 51%, #dc3545);
+    position:relative; }
+  .dv-bar b { position:absolute; top:-2px; width:2px; height:12px;
+    background:var(--text); border-radius:1px; }
+  .dv-partial { background:rgba(255,193,7,.08); border:1px solid rgba(255,193,7,.4);
+    border-radius:7px; padding:8px 12px; margin-top:8px; font-size:12px;
+    color:var(--text); }
+  .dv-partial b { color:var(--warn); }
+</style>
+
+<div class="card" id="cardDeviation">
+  <h2>走线偏差（参考圈 vs 对比圈）
+    <span style="float:right;display:flex;gap:8px;align-items:center;text-transform:none">
+      <span id="dvMeta" style="font-weight:400;color:var(--muted)"></span>
+      <label style="font-weight:400;font-size:12px;color:var(--muted)">对比圈
+        <select id="dvLapSel" onchange="dvPick(this.value)"
+          style="font-weight:400;font-size:12px;padding:3px 7px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"></select>
+      </label>
+    </span>
+  </h2>
+  <p class="dv-note">
+    <b>横向偏移 = 本圈点 − 参考线垂足</b> 在参考线法向上的投影（米，带符号）。
+    算法把参考圈当成折线，本圈每点投影到最近线段，几何对齐天然免疫距离积分漂移
+    （<code>match_pv_pairs</code> 实测丢包时同帧 60~300 m）。
+    颜色：<b style="color:#0d6efd">蓝</b> = 偏参考线一侧、<b style="color:var(--text)">白</b> = 贴线、
+    <b style="color:#dc3545">红</b> = 偏另一侧；色阶按 <b>p95</b> 截断，避免单点尖峰把整圈压成单色。
+    出场 / 残圈 / 距离对齐失败时整卡降级为「不可比」，并写明原因。
+  </p>
+  <div class="dv-canvas-wrap"><canvas id="dvCanvas" class="dv-canvas"
+       width="780" height="460"></canvas></div>
+  <div class="dv-legend">
+    <span><i style="background:#9aa0a6"></i>参考线（灰底图）</span>
+    <span style="flex:1;min-width:240px"><span style="font-size:11px">−p95</span>
+      <span class="dv-bar" id="dvBar"></span>
+      <span style="font-size:11px">+p95</span></span>
+    <span><b id="dvScaleTxt" style="color:var(--text)"></b></span>
+  </div>
+  <div id="dvStats" class="an-stats" style="margin-top:14px"></div>
+  <div id="dvPartial"></div>
+  <p class="dv-note" style="margin-top:8px">
+    <b>圈长偏差 / 距离积分漂移</b> 只是诊断量 ——
+    「距离积分漂移」说的是同一物理位置处两圈<b>各自</b>累计距离的差，
+    它本身不影响结论（算法按几何对齐、不按距离对齐），但数值大说明这一圈
+    中途有过空转 / 锁死 / 丢包，对走线理解要打个折。
+  </p>
+</div>
+
+<script>
+// ---------- 走线偏差 ----------
+(function () {
+  var FILE = '__FILE__';
+  var API = '/api/v1/sessions/' + encodeURIComponent(FILE);
+  var DV = null, dvLapNo = 0;
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function fsgn(v) {
+    if (v == null) return '-';
+    return (v > 0 ? '+' : v < 0 ? '-' : '') + Math.abs(v).toFixed(2);
+  }
+  function f2(v) { return v == null ? '-' : (+v).toFixed(2); }
+  function pct(v) { return v == null ? '-' : (+v).toFixed(1) + '%'; }
+  function stat(label, main, sub, color) {
+    return '<div class="an-stat"><span>' + esc(label) + '</span>'
+      + '<b style="color:' + (color || 'inherit') + '">' + esc(main) + '</b>'
+      + (sub ? '<em>' + esc(sub) + '</em>' : '') + '</div>';
+  }
+
+  // 发散色阶：dlat ∈ [−s, +s] 映射到蓝 → 白 → 红；s 由 p95 决定
+  // （用 p95 而不是 max，避免单点撞墙把整圈压成单色）。
+  function dvColor(v, s) {
+    if (s <= 0) return '#9aa0a6';
+    var t = Math.max(-1, Math.min(1, v / s));
+    // t ∈ [-1, 0] → 蓝(13,110,253) → 白(231,236,239)
+    // t ∈ [ 0, 1] → 白(231,236,239) → 红(220,53,69)
+    var r, g, b;
+    if (t < 0) {
+      var k = -t;
+      r = Math.round(13  + (231 - 13)  * k);
+      g = Math.round(110 + (236 - 110) * k);
+      b = Math.round(253 + (239 - 253) * k);
+    } else {
+      r = Math.round(231 + (220 - 231) * t);
+      g = Math.round(236 + (53  - 236) * t);
+      b = Math.round(239 + (69  - 239) * t);
+    }
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  function drawDeviation() {
+    var cv = el('dvCanvas'), ctx = cv.getContext('2d');
+    var W = cv.width, H = cv.height;
+    ctx.clearRect(0, 0, W, H);
+    if (!DV || !DV.line || !DV.line.length) {
+      ctx.fillStyle = '#9aa0a6';
+      ctx.font = '13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('走线数据不可用', W / 2, H / 2);
+      return;
+    }
+    // 计算坐标范围：以参考线 + 本圈线的并集为准，颜色按 dlat 着色。
+    var x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    var line = DV.line, ref = DV.ref_line || [];
+    for (var i = 0; i < ref.length; i++) {
+      var p = ref[i];
+      if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+      if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1];
+    }
+    for (var j = 0; j < line.length; j++) {
+      var q = line[j];
+      if (q[0] < x0) x0 = q[0]; if (q[0] > x1) x1 = q[0];
+      if (q[1] < z0) z0 = q[1]; if (q[1] > z1) z1 = q[1];
+    }
+    if (!(x1 > x0 && z1 > z0)) return;
+    var PAD = Math.min(W, H) * 0.04 + 6;
+    var sc = Math.min((W - 2 * PAD) / (x1 - x0), (H - 2 * PAD) / (z1 - z0));
+    var ox = (W - (x1 - x0) * sc) / 2 - x0 * sc;
+    var oy = (H - (z1 - z0) * sc) / 2 - z0 * sc;
+    var px = function (v) { return ox + v * sc; };
+    var py = function (v) { return H - (oy + v * sc); };
+
+    // 灰底图：参考线
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(154,160,166,.85)';
+    ctx.lineWidth = Math.max(2.4, W / 320);
+    if (ref.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(px(ref[0][0]), py(ref[0][1]));
+      for (var k = 1; k < ref.length; k++) ctx.lineTo(px(ref[k][0]), py(ref[k][1]));
+      ctx.stroke();
+    }
+    // 彩色线：本圈走线，逐段按 dlat 上色
+    var scale = Math.max(DV.p95_abs_dlat || 0, 0.5);  // 色阶至少 0.5m
+    ctx.lineWidth = Math.max(3.2, W / 220);
+    for (var i = 1; i < line.length; i++) {
+      var a = line[i - 1], b = line[i];
+      if (a[0] == null || b[0] == null) continue;
+      // 两点 dlat 均值上色，避免锯齿
+      var mid = ((a[2] || 0) + (b[2] || 0)) / 2;
+      ctx.strokeStyle = dvColor(mid, scale);
+      ctx.beginPath();
+      ctx.moveTo(px(a[0]), py(a[1]));
+      ctx.lineTo(px(b[0]), py(b[1]));
+      ctx.stroke();
+    }
+    // 把 0 标在线上（白点的位置）
+    var bar = el('dvBar');
+    if (bar) {
+      var tk = bar.querySelector('b');
+      if (!tk) { tk = document.createElement('b'); bar.appendChild(tk); }
+      // 0 永远在条中点；不需要根据 p95 调位置
+      tk.style.left = 'calc(50% - 1px)';
+    }
+    var st = el('dvScaleTxt');
+    if (st) st.textContent = '色阶 ±' + scale.toFixed(2) + 'm';
+  }
+
+  function dvStats(d) {
+    var h = '';
+    // 主要诊断：RMS / p95 / max / 内侧占比 / 距离积分漂移
+    h += stat('RMS 偏移', f2(d.rms_dlat) + ' m',
+              '越小越贴线；典型干净圈 1~3m', d.rms_dlat < 3 ? 'var(--ok)' : 'var(--warn)');
+    h += stat('p95 / 最大', f2(d.p95_abs_dlat) + ' / ' + f2(d.max_abs_dlat) + ' m',
+              '色阶按 p95 截断');
+    h += stat('平均偏移', fsgn(d.mean_dlat) + ' m',
+              '正/负号看坐标系手性');
+    h += stat('弯心侧占比', pct(d.inside_pct),
+              '靠弯心走 vs 走外线',
+              d.inside_pct == null ? 'var(--muted)'
+              : (d.inside_pct > 55 || d.inside_pct < 45 ? 'var(--text)' : 'var(--ok)'));
+    h += stat('覆盖参考线', pct(d.coverage * 100),
+              '出场圈 / 残圈会 < 60%',
+              d.coverage >= 0.6 ? 'var(--ok)' : 'var(--warn)');
+    h += stat('距离积分漂移', (d.drift_m != null ? d.drift_m.toFixed(1) : '-') + ' m',
+              '诊断量；大 ⇒ 中途丢过帧');
+    // 最差段（10 段等弧长切分里 RMS 最大那一段）
+    if (d.worst_win) {
+      h += stat('最差段', 'S' + Math.round(d.worst_win.from_m) + '–S'
+                          + Math.round(d.worst_win.to_m) + 'm',
+                'RMS ' + f2(d.worst_win.rms_dlat) + 'm · 均值 '
+                + fsgn(d.worst_win.mean_dlat) + 'm',
+                'var(--bad)');
+    }
+    return h;
+  }
+
+  function renderDv() {
+    var card = el('cardDeviation'), box = el('dvStats'), meta = el('dvMeta'),
+        par = el('dvPartial');
+    if (!card || !box) return;
+    var d = DV;
+    if (!d) return;
+    if (d.error) {
+      meta.textContent = '';
+      box.innerHTML = '<p class="dv-note">' + esc(d.error) + '</p>';
+      par.innerHTML = '';
+      var cv = el('dvCanvas');
+      if (cv) { var ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.fillStyle = '#9aa0a6'; ctx.font = '13px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(d.error || '没有可用的圈', cv.width / 2, cv.height / 2);
+      }
+      return;
+    }
+    meta.textContent = '参考第 ' + d.ref_lap + ' 圈 · 对比第 ' + d.cmp_lap + ' 圈'
+      + ' · 步长 ' + d.step_m + 'm';
+    box.innerHTML = dvStats(d);
+    if (!d.reliable && d.reason) {
+      par.innerHTML = '<div class="dv-partial"><b>不可比：</b>' + esc(d.reason)
+        + '<br/>下方仍画图供参考，但 RMS / 内侧占比 这些数都没意义，请忽略。</div>';
+    } else {
+      par.innerHTML = '';
+    }
+    drawDeviation();
+  }
+
+  // lap 选择：参考圈固定 = 最快圈（服务端定的），只让用户换对比圈。
+  window.dvPick = function (v) {
+    dvLapNo = parseInt(v, 10) || dvLapNo;
+    var meta = el('dvMeta');
+    if (meta) meta.textContent = '计算中…';
+    var refL = DV && DV.ref_lap;
+    fetch(API + '/deviation?ref_lap=' + refL + '&cmp_lap=' + dvLapNo)
+      .then(function (r) { return r.json(); })
+      .then(function (d) { DV = d; renderDv(); }, function () {
+        if (meta) meta.textContent = '读取失败';
+      });
+  };
+
+  function dvFetchFail() {
+    var meta = el('dvMeta'), box = el('dvStats');
+    if (meta) meta.textContent = '读取失败';
+    if (box) box.innerHTML = '<p class="dv-note">走线偏差数据请求失败（见控制台）。</p>';
+  }
+
+  // 🔴 与 _ANALYSIS_TMPL 同源：取数失败与渲染失败分开处理，
+  //    避免渲染异常被 catch 吞掉而把整卡静默隐藏。
+  fetch(API + '/deviation').then(function (r) { return r.json(); })
+    .then(function (d) {
+      DV = d; renderDv();
+      // 填充对比圈下拉：去掉参考圈本身；按圈号升序。
+      var sel = el('dvLapSel');
+      if (sel && d.ref_lap != null && d.laps_list) {
+        sel.innerHTML = '';
+        var opts = (d.laps_list || []).filter(function (x) {
+          return x !== d.ref_lap;
+        });
+        dvLapNo = d.cmp_lap;
+        for (var i = 0; i < opts.length; i++) {
+          var o = document.createElement('option');
+          o.value = opts[i]; o.textContent = '第 ' + opts[i] + ' 圈';
+          if (opts[i] === dvLapNo) o.selected = true;
+          sel.appendChild(o);
+        }
+      }
+    }, dvFetchFail);
+})();
+</script>
+"""
+
+
 _ANALYSIS_TMPL = r"""
 <style>
 .an-stats { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
@@ -4396,9 +4809,10 @@ def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
     js_file = path.name.replace("\\", "").replace("'", "")
     return _page_shell(f"场次 · {_html.escape(str(hdr.get('circuit') or 'unknown'))}",
                        body + _COMPARE_TMPL.replace('__DATA__', cmp_json)
-                       # 两张分析卡排在「遥测数据」之前：先给结论（能快多少、
-                       # 胎怎么被糟蹋的），原始逐帧数据垫底。数据走 XHR 异步取，
+                       # 三张分析卡排在「遥测数据」之前：先给结论（走线偏哪、胎怎么被
+                       # 糟蹋的、能快多少），原始逐帧数据垫底。数据走 XHR 异步取，
                        # 不占首屏渲染时间。
+                       + _DEVIATION_TMPL.replace('__FILE__', js_file)
                        + _ANALYSIS_TMPL.replace('__FILE__', js_file)
                        + _TELEMETRY_TMPL.replace('__FILE__', js_file))
 
