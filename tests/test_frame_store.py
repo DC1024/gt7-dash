@@ -322,6 +322,44 @@ class TestPresence:
         assert store.lap_frames(), "其它字段仍应正常"
 
 
+    def test_get_与_getitem_跟参考实现等价(self, dash, sess):
+        """Frame.get / Frame[k] 走的是「干净数字列」快路，必须与 _value 等价。
+
+        快路为了速度绕开了 _value 的一整套判断，所以要逐帧逐字段把两边
+        对一遍 —— 尤其是 get 的默认值语义和 getitem 的 KeyError 语义。
+        """
+        _, store = dash._load_frames(sess)
+        sentinel = object()
+        for k in ("lap", "car_z", "car_code", "speed_kph", "g_force",
+                  "layout", "tyre_temp", "根本没这个字段"):
+            for i in (0, 5, 7, 1200 + 5, len(store) - 1):
+                f = store[i]
+                ref = store._value(k, i)
+                if ref is dash._ABSENT:
+                    assert f.get(k, sentinel) is sentinel, f"{k}#{i} 该给默认值"
+                    with pytest.raises(KeyError):
+                        f[k]
+                else:
+                    got = f.get(k, sentinel)
+                    assert type(got) is type(ref) and got == ref, f"{k}#{i} get"
+                    got2 = f[k]
+                    assert type(got2) is type(ref) and got2 == ref, f"{k}#{i} [k]"
+
+    def test_快路标记只对干净数字列开(self, dash, sess):
+        """快路一旦被误开，有缺席/null 的列会当作 0.0 返回 —— 这是静默错值。
+
+        所以这里把「不该开」的几类都钉住：键缺席过、值为过 null、数组列、
+        字符串列、以及本场次没存储的字段。
+        """
+        _, store = dash._load_frames(sess)
+        assert store._col["speed_kph"][4] is True      # 干净数字列 → 开
+        assert store._col["car_z"][4] is False         # 有一帧缺键
+        assert store._col["car_code"][4] is False      # 有一帧是 null
+        assert store._col["g_force"][4] is False       # 数组列
+        assert store._col["layout"][4] is False        # 字符串列
+        assert store._col["tyre_temp"][4] is False     # 未存储
+
+
 class TestMemo:
     """每场只算一次的归算：结果必须与「每次重算」完全一致，且真的只算一次。"""
 

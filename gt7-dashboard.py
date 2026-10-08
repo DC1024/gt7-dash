@@ -339,13 +339,22 @@ class Frame:
         self._i = i
 
     def __getitem__(self, k: str):
-        v = self._s._value(k, self._i)
+        d = self._s._col.get(k)
+        # 🔴 快路：干净的数字列（无缺席、无 null）就地取值，不下沉到 _value。
+        #    详情页一次渲染要取 500 万次字段值，省下的这一层函数调用
+        #    在慢一点的机器上是实打实的几百毫秒。
+        if d is not None and d[4]:
+            return d[1][self._i]
+        v = self._s._value_d(k, self._i, d)
         if v is _ABSENT:
             raise KeyError(k)
         return v
 
     def get(self, k: str, default=None):
-        v = self._s._value(k, self._i)
+        d = self._s._col.get(k)
+        if d is not None and d[4]:
+            return d[1][self._i]
+        v = self._s._value_d(k, self._i, d)
         return default if v is _ABSENT else v
 
     def __contains__(self, k: str) -> bool:
@@ -406,25 +415,30 @@ class FrameStore(Sequence):
     def _build_index(self) -> tuple[dict, dict]:
         """把「字段名 → 取值路径」预摊平成一张表；另算一张「键在不在」的位图。
 
-        _col[k] = (种类, 数据, 缺席标记, null 标记)
+        _col[k] = (种类, 数据, 缺席标记, null 标记, 是否快路)
         这样取一个字段只查一次 dict，而不再是依次试六张表。
+        第 5 位（快路）预先算好，让最热的「干净数字列」在 Frame 里
+        一个下标 + 一次真值判断就能取值，不必再进 _value 绕一圈。
         _pres[k] = True（恒定在）/ False（恒定不在）/ bytearray（逐帧看位）。
         """
         col: dict[str, tuple] = {}
         for k in self.fields:
             a = self._absent.get(k)
             nl = self._null.get(k)
+            data = None
             if k in self._num:
-                col[k] = (_K_NUM, self._num[k], a, nl)
+                kind, data = _K_NUM, self._num[k]
             elif k in self._arr:
-                col[k] = (_K_AXIS, tuple(self._arr[k]), a, nl)
+                kind, data = _K_AXIS, tuple(self._arr[k])
             elif k in self._bool:
-                col[k] = (_K_BOOL, self._bool[k], a, nl)
+                kind, data = _K_BOOL, self._bool[k]
             elif k in self._txi:
-                col[k] = (_K_STR, (self._tbl[k], self._txi[k]), a, nl)
+                kind, data = _K_STR, (self._tbl[k], self._txi[k])
             else:
                 # 本场次出现过、但没进存储清单：读出来是 None 并计入 MISSED_FIELDS
-                col[k] = (_K_MISS, None, a, nl)
+                kind = _K_MISS
+            fast = kind == _K_NUM and a is None and nl is None
+            col[k] = (kind, data, a, nl, fast)
 
         pres: dict[str, object] = {}
         for k, d in col.items():
@@ -490,13 +504,20 @@ class FrameStore(Sequence):
         return None
 
     def _value(self, k: str, i: int):
-        """取一帧某字段的值。
+        """取一帧某字段的值（语义参考实现）。
 
         🔴 「键缺席」与「值是 null」必须分开：前者 `.get()` 返回默认值、
            `[]` 抛 KeyError；后者 `.get()` 返回 None、`[]` 返回 None。
            混为一谈会让 `f.get("x") or 0` 之类的写法结果不同。
+
+        Frame 的几个取值方法会自己走「干净数字列」的快路，走到这里的是
+        慢路；两边口径由 tests/test_frame_store.py 的 TestPresence /
+        TestFidelity 逐帧锁死。
         """
-        d = self._col.get(k)
+        return self._value_d(k, i, self._col.get(k))
+
+    def _value_d(self, k: str, i: int, d):
+        """同上，但调用方已经查过 _col —— 省掉一次 dict 查找。"""
         if d is None:
             return _ABSENT
         kind = d[0]
