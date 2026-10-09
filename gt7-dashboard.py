@@ -3284,8 +3284,17 @@ _GZIP_LEVEL = 6
 _GZIP_ENABLED = True        # --no-gzip 关掉（排障 / 抓包时看明文）
 
 
+# 版本号唯一定义处。发版时只改这一行。
+# 命名习惯跟随 git tag：这里是 `1.0.1`，对应发行标识 `v1.0.1`。
+# 之所以单独设一个常量：此前 HTTP `Server:` 头里写死过 "GT7Dashboard/1.0"，
+# 发版时容易漏改（coach 那边已经踩过一次同样的坑）。
+APP_VERSION = "1.0.1"
+
+DEFAULT_PORT = 8787
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version = "GT7Dashboard/1.0"
+    server_version = "GT7Dashboard/" + APP_VERSION
 
     # 历史场次目录。由 main() 挂在「服务器实例」上，
     # ⚠️ 不是挂在类上——handler 里读的是 self.server.history_dir，
