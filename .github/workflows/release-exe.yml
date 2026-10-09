@@ -61,28 +61,37 @@ jobs:
           if-no-files-found: error
 
       - name: 清掉同名旧 Release（若有）
-        # 这一步失败不该拖垮整条发行链路：删不掉最多是说明旧一点，
-        # 而让 `set -e` 在这里中断会导致整个 Release 都发不出来（更糟）。
-        continue-on-error: true
         if: startsWith(github.ref, 'refs/tags/')
         # 🔴 必须显式指定 bash：本 job 跑在 windows-latest 上，默认 shell 是
         #    PowerShell，下面这套 `if [ -n ... ]` / `$(...)` 会直接语法报错，
         #    整个 job 在这一步挂掉（实测：0 秒失败，后续发布步骤被 skip）。
+        #
+        # 🔴 这里**故意不写 continue-on-error**：删不掉就必须让 job 红，
+        #    否则 action-gh-release 会"就地更新"已存在的 Release 并保留旧
+        #    body —— 表面上步骤全绿、实际发行说明是旧的，极难发现（踩过）。
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # `softprops/action-gh-release` 在 Release **已存在**时只更新附件、
-          # 不覆盖 body —— 所以重推 tag 会重建 zip 但说明还是旧的（踩过）。
-          # 先删掉，让它以全新 Release 的姿态创建，body 才会生效。
-          ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-                 --jq .id 2>/dev/null || true)
-          if [ -n "$ID" ]; then
+          # `softprops/action-gh-release` 在 Release 已存在时**保留原 body**，
+          # 只更新附件。所以重推 tag 会重建 zip 但说明还是旧的。
+          # 先确认删干净，再让它以全新 Release 创建。
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+               --jq .id >/dev/null 2>&1; then
+            ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .id)
             echo "发现旧 Release id=$ID，删除"
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$ID" || true
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$ID"
           else
             echo "无同名 Release，直接创建"
           fi
+          # 复核：删完必须查不到，否则后面的 body 不会生效。
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+               --jq .id >/dev/null 2>&1; then
+            echo "::error::旧 Release 仍存在，删除没生效"
+            exit 1
+          fi
+          echo "旧 Release 已清干净 ✓"
 
       - name: 发布 Release
         if: startsWith(github.ref, 'refs/tags/')
