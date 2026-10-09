@@ -249,6 +249,9 @@ class TelemetryHub:
                 "path": self._path,
                 "gg": self._gg,
                 "lap_times": self._lap_times,
+                # 🔴 当前圈起点的墙上时刻：接收器每次冲线更新。
+                #    仪表盘用它反推上一圈用时，作为 GT7 不报 last_lap 时的兜底圈速来源。
+                "lap_started_at": self._lap_started_at,
                 "lap_fuel": self._lap_fuel,
                 "powertrain": self._powertrain,
                 "max_energy_recovery": self._max_energy_recovery,
@@ -2744,6 +2747,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `max_speed_kph` | float | 本场极速（km/h） |
 | `completed_laps` | int | 已完成圈数 |
 | `lap_times` | array | `[[第几圈, 圈速毫秒], ...]` |
+| `lap_started_at` | float | 当前圈起点的墙上时刻（秒，time.time()）。接收器每次冲线更新；仪表盘用它反推上一圈用时，作为 GT7 不报 last_lap 时的兜底圈速来源 |
 | `car_code` | int | 车型码（全场非 0 众数；读不到为 0） |
 | `car_name` | string | 车型短名，`cars.csv` 查 ShortName，查不到空串 |
 | `laps` | array | 逐圈详情，见下表 |
@@ -8376,6 +8380,8 @@ function fmtLap(sec) {
   return m + ':' + s.toFixed(3).padStart(6, '0');
 }
 
+// 圈速兜底：GT7 不报 last_lap 时，用「本圈起点时刻」跳变反推上一圈用时。
+let lapFbPrevStart = 0, lapFbList = [], lapFbSession = 0;
 function render(s) {
   const L = s.latest;
   if (!L) return;
@@ -8665,7 +8671,18 @@ function render(s) {
   }
 
   // —— 每圈圈速列表（新圈在上，最快圈标绿★）——
-  const lt = s.lap_times || [];
+  // 🔴 优先用接收器攒的 lap_times；本场没收到（GT7 不报 last_lap 的场景），
+  //    改用量产「本圈起点时刻」的跳变反推上一圈用时，列表不空白。
+  let lt = s.lap_times || [];
+  if (!lt.length && s.lap_started_at && s.lap_time_source === 'lap' && L.lap > 1) {
+    if (lapFbSession !== s.session_start) { lapFbPrevStart = 0; lapFbList = []; lapFbSession = s.session_start; }
+    if (lapFbPrevStart && s.lap_started_at !== lapFbPrevStart) {
+      const durMs = Math.round((s.lap_started_at - lapFbPrevStart) * 1000);
+      if (durMs > 20000 && durMs < 600000) lapFbList.push([L.lap - 1, durMs]);
+    }
+    lapFbPrevStart = s.lap_started_at;
+    lt = lapFbList;
+  }
   const el = $('lapList');
   if (!lt.length) {
     el.innerHTML = '<div class="laprow empty">跑完第一圈后这里会逐圈记录</div>';
@@ -9199,10 +9216,23 @@ document.addEventListener('keydown', e => {
 
 // 拉多少帧跟着面板的曲线窗口走：窗口拉到 10 秒，这里就得要 600 帧，
 // 否则曲线会因为数据不够而画不满。
+let _noRespStreak = 0;
 function poll() {
-  fetch('/api/state?frames=' + prefs.chartWindow).then(r => r.json()).then(render)
-    .catch(() => { $('dot').className = 'dot off';
-      $('status').textContent = '服务无响应'; });
+  fetch('/api/state?frames=' + prefs.chartWindow)
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    // 🔴 渲染异常 ≠ 服务断流：单独 try 吞掉，绝不因此误报「服务无响应」——
+    //    否则主数据明明在动、状态栏却红着「服务无响应」，车手会以为坏了。
+    .then(d => { _noRespStreak = 0;
+      try { render(d); } catch (e) { console.error('render 异常（非服务断流）:', e); } })
+    // 🔴 偶发抖动（一次 fetch 失败 / JSON 解析卡顿）不该立刻判死。
+    //    连续 ~300ms（3 次 100Hz 轮询）拉不到才红「服务无响应」。
+    .catch(() => {
+      _noRespStreak++;
+      if (_noRespStreak >= 3) {
+        $('dot').className = 'dot off';
+        $('status').textContent = '服务无响应';
+      }
+    });
 }
 poll();
 setInterval(poll, 100);   // 10Hz 轮询；G 力球靠 rAF 在两次轮询之间平滑插值
