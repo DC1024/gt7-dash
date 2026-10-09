@@ -60,6 +60,22 @@ jobs:
           path: gt7-dash-windows-x64.zip
           if-no-files-found: error
 
+      - name: 清掉同名旧 Release（若有）
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # `softprops/action-gh-release` 在 Release **已存在**时只更新附件、
+          # 不覆盖 body —— 所以重推 tag 会重建 zip 但说明还是旧的（踩过）。
+          # 先删掉，让它以全新 Release 的姿态创建，body 才会生效。
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .id)
+            echo "发现旧 Release id=$ID，删除"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$ID"
+          else
+            echo "无同名 Release，直接创建"
+          fi
+
       - name: 发布 Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
