@@ -8678,7 +8678,8 @@ function render(s) {
     if (lapFbSession !== s.session_start) { lapFbPrevStart = 0; lapFbList = []; lapFbSession = s.session_start; }
     if (lapFbPrevStart && s.lap_started_at !== lapFbPrevStart) {
       const durMs = Math.round((s.lap_started_at - lapFbPrevStart) * 1000);
-      if (durMs > 20000 && durMs < 600000) lapFbList.push([L.lap - 1, durMs]);
+      // 用兜底列表长度顺次编号（1,2,3…），不依赖 L.lap 时序，避免差一帧错号
+      if (durMs > 20000 && durMs < 600000) lapFbList.push([lapFbList.length + 1, durMs]);
     }
     lapFbPrevStart = s.lap_started_at;
     lt = lapFbList;
