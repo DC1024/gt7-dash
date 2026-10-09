@@ -1755,11 +1755,18 @@ def session_profile(path: Path, lap_no: int | None = None,
     #    **跑完了的**合法圈 —— 拿它去排除等于白白丢掉一份好参考
     #    （实测：一圈完整的第 2 圈被误排除，参考圈退回到第 1 圈）。
     recording = _recording_active(path.parent)
+    # 🔴 「正在跑的那一圈」的圈号要先算出来，而且要让**调用方也看得见**（见下面
+    #    meta.in_progress）。原因：本场只有一圈时，上面的兜底 `trimmed or usable`
+    #    会退回把**半圈**当参考发出去 —— 那一刻 available_laps / recording 与
+    #    "已经跑完一圈"时**长得一模一样**，消费方（赛道工程师）光看
+    #    "有没有拿到 profile"根本分不出来，只能拿半圈的折线去做最近点定位。
+    #    所以这里明说一句，把判断权交回去。
+    raw_max = store.memo_compute(
+        "raw_max_lap",
+        lambda: max((f.get("lap") or 0) for f in store.lap_frames()))
+    in_progress_lap = raw_max if recording else None
     usable = sorted(grouped.keys())
     if recording:
-        raw_max = store.memo_compute(
-            "raw_max_lap",
-            lambda: max((f.get("lap") or 0) for f in store.lap_frames()))
         trimmed = [n for n in usable if n != raw_max]
         # 不能把唯一的一圈也排掉，否则永远没有参考圈可用
         usable = trimmed or usable
@@ -1768,22 +1775,30 @@ def session_profile(path: Path, lap_no: int | None = None,
         want = int(lap_no)
         # 两种拒绝理由要分清：正在跑 vs 根本没有这一圈。
         # 混成一句话会让消费方无从下手（"重试"还是"别重试"）。
-        in_progress = recording and (
-            want not in grouped or want >= max(grouped, default=0))
+        in_progress = in_progress_lap is not None and want >= in_progress_lap
         why = "lap_in_progress" if in_progress else "no_data"
         return {"error": f"第 {lap_no} 圈不可作为参考（{why}）",
                 "why": why, "recording": recording,
+                "in_progress_lap": in_progress_lap,
                 "available_laps": usable}
 
     if lap_no is None:
         if not usable:
             return {"error": "还没有跑完一整圈，暂无参考圈", "why": "no_lap",
-                    "recording": recording, "available_laps": []}
+                    "recording": recording, "available_laps": [],
+                    "in_progress_lap": in_progress_lap}
         best = (analyze_session(path).get("best_lap") or {}).get("lap")
         lap_no = best if best in usable else usable[-1]
 
     key = ("profile", int(lap_no), round(float(step_m), 2),
-           round(float(prominence_kph), 2))
+           round(float(prominence_kph), 2),
+           # 🔴 「录制中吗 / 正在跑第几圈」也必须进 key。
+           #    `meta`（含 `in_progress`）是在 `_compute` **里面**拼的，而
+           #    `_compute` 的结果整体进记忆化 —— 不把这两个状态量算进 key，
+           #    就会出现「文件没变、录制刚结束」时把上一次的 meta 原样发回去：
+           #    `in_progress` 永远停在 true，消费方（赛道工程师）于是一直
+           #    不敢用这份参考圈，而文件内容明明早就跑完了。
+           recording, in_progress_lap)
 
     def _compute() -> dict:
         import gt7analysis
@@ -1797,6 +1812,13 @@ def session_profile(path: Path, lap_no: int | None = None,
             "meta": {"api_version": 1, "file": path.name,
                      "available_laps": usable,
                      "recording": recording,
+                     # 🔴 返回给你的这一圈**还在跑**吗？只有"本场唯一一圈"
+                     #    （`trimmed or usable` 的兜底分支）才可能为真。
+                     #    消费方必须据此拒绝它：半圈的折线只覆盖半条赛道，
+                     #    圈长还随车前进一直变（实测 5491 m → 7493 m）。
+                     "in_progress": bool(in_progress_lap is not None
+                                         and lap_no == in_progress_lap),
+                     "in_progress_lap": in_progress_lap,
                      "laps": laps},
         }
         out.update(prof)
@@ -3167,6 +3189,21 @@ t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这�
 最大圈号，不是 `clean_laps` 过滤后的 —— 半圈常已被当假圈剔掉，那时取过滤后的
 最大值会误伤一个跑完了的合法圈）。`meta.recording` 会说明当前是否录制中，
 `why` 为 `lap_in_progress` 时表示请求的正是那一圈，`no_lap` 表示一圈都还没跑完。
+
+**⚠️ 有一个例外必须由调用方自己兜住：本场只有一圈时。** 那时上面那条排除
+规则会把唯一的一圈也排掉（等于永远没有参考圈可用），所以接口会**退回把这一圈
+（半圈）发出去**。而这一刻 `recording` / `available_laps` 与"已经跑完一圈"时
+**长得一模一样** —— 光看"有没有拿到 profile"分不出来。所以响应里明说了：
+
+| 字段 | 含义 |
+| --- | --- |
+| `meta.in_progress` | **返回给你的这一圈还在跑**（只有上面那个例外才为 `true`）。消费方必须据此拒绝它 |
+| `meta.in_progress_lap` | 原始帧里圈号最大的那一圈（= 正在跑的那一圈；没在录制时为 `null`） |
+
+`s_m` 那套最近点定位对这个字段特别敏感：半圈的折线只覆盖半条赛道、圈长还随车
+前进一直变（实测一场里 5491 m 一路涨到 7493 m），拿它定位会得到几十米的横向
+误差（表现为"出界了"和指错位置的刹车预告），**而且只在开局那几十秒出现**，
+极难复现。
 
 ## 使用示例
 

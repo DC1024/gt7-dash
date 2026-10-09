@@ -233,3 +233,34 @@ class TestInProgressLapExcluded:
         d = dash.session_profile(sess, lap_no=None)
         assert "error" not in d, d
         assert d["meta"]["available_laps"] == [1]
+
+    def test_meta_admits_the_in_progress_lap(self, dash, tmp_path):
+        """🔴 上面那条兜底必须**明说**"发给你的是半圈"。
+
+        消费方（赛道工程师）自己判不出来：这一刻 `recording` / `available_laps`
+        与"已经跑完一圈"时**长得一模一样**，而半圈的坐标折线只覆盖半条赛道、
+        圈长还随车前进一直变（实测 5491 m → 7493 m）。拿它做实时最近点定位
+        会得到几十米的横向误差 —— 表现是"偶尔报一句出界了"，只在开局那几十秒
+        出现，极难复现。所以判断权要交回去。
+        """
+        # 本场只有一圈，而且是半圈 → 发出去的那份必须被标记
+        sess = self._write(tmp_path / "s.jsonl", laps=0, partial_last=0.4)
+        self._mark_recording(tmp_path, True)
+        d = dash.session_profile(sess, lap_no=None)
+        assert d["lap"] == 1
+        assert d["length_m"] < 2 * 3.14159 * 600 * 0.6, "这确实是半圈"
+        assert d["meta"]["in_progress"] is True
+        assert d["meta"]["in_progress_lap"] == 1
+
+        # 已经跑完一圈 → 发出去的那份是跑完的，标记必须为假
+        done = self._write(tmp_path / "t.jsonl", laps=2, partial_last=0.2)
+        d2 = dash.session_profile(done, lap_no=None)
+        assert "error" not in d2, d2
+        assert d2["lap"] in (1, 2) and d2["meta"]["in_progress"] is False
+        assert d2["meta"]["in_progress_lap"] == 3      # 正在跑的是第 3 圈
+
+        # 录制结束 → 最后一圈也是跑完的
+        self._mark_recording(tmp_path, False)
+        d3 = dash.session_profile(sess, lap_no=None)
+        assert d3["meta"]["in_progress"] is False
+        assert d3["meta"]["in_progress_lap"] is None
