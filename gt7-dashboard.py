@@ -7449,6 +7449,26 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   font-family:inherit; font-size:11px; letter-spacing:.3px;
   text-transform:none; font-weight:400; }
 #coachMute.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
+/* 播报内容面板：与 #coachMute（全局"要不要出声"）分工不同 —— 它管
+   "**哪些内容**出声"。两者是「与」关系：语音关着时，勾选多少都不会出声。 */
+#coachPanelBtn { border:1px solid var(--line); background:transparent;
+  color:var(--muted); border-radius:6px; padding:2px 8px; cursor:pointer;
+  font-family:inherit; font-size:11px; letter-spacing:.3px;
+  text-transform:none; font-weight:400; }
+#coachPanelBtn:hover { color:var(--text); }
+#coachPanelBtn.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
+#coPanel { margin-top:9px; border-top:1px solid var(--line); padding-top:6px; }
+#coPanel .cp-row { display:flex; align-items:center; gap:8px; font-size:12.5px;
+  padding:4px 0; }
+#coPanel .cp-row input { width:14px; height:14px; flex-shrink:0; cursor:pointer;
+  accent-color:var(--accent); margin:0; }
+#coPanel .cp-row label { flex:1; cursor:pointer; }
+#coPanel .cp-row.off label { color:var(--muted); }
+#coPanel .cp-desc { color:var(--muted); font-size:11px; }
+#coPanel .cp-n { font-family:var(--mono); font-size:11px; color:var(--muted);
+  min-width:18px; text-align:right; }
+#coPanel .cp-hint { color:var(--muted); font-size:11px; margin-top:6px;
+  line-height:1.5; }
 .coach-row { display:flex; justify-content:space-between; font-size:13px;
   padding:5px 0; border-bottom:1px solid var(--line); }
 .coach-row:last-of-type { border-bottom:none; }
@@ -7907,6 +7927,7 @@ th { color:var(--muted); font-weight:500; }
       <h2>赛道工程师
         <span id="coachDot" title="连接状态"></span>
         <span class="cspacer"></span>
+        <button id="coachPanelBtn" title="选择哪些内容播报、哪些不播报">播报内容</button>
         <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">语音：关</button>
       </h2>
       <div class="coach-row"><span>参考圈</span><b id="coRef">--</b></div>
@@ -7914,6 +7935,7 @@ th { color:var(--muted); font-weight:500; }
       <div class="coach-row"><span>对比参考圈</span><b id="coDelta">--</b></div>
       <div class="coach-row"><span>下一个刹车点</span><b id="coBrake">--</b></div>
       <div id="coSay" class="idle">赛道工程师未启动</div>
+      <div id="coPanel" hidden></div>
       <div id="coHist"></div>
     </div>
 
@@ -9150,6 +9172,106 @@ function coachSay(text, priority){
   } catch (e) { /* 播报失败绝不影响取数 */ }
 }
 
+// ---------- 播报内容面板（分内容开关）----------
+// 与 #coachMute 的分工：那个是**全局**「要不要出声」，这个是**分内容**的
+// 「哪些内容出声」。两者是「与」关系 —— 语音关着时，勾选多少都不会出声。
+//
+// 🔴 真值在教练服务端的 `GateConfig.muted`（`/api/v1/coach/panel`）。
+//    这里只做两件事：读回来画、改动后 POST 回去。**本地不存一份** ——
+//    存一份就会出现"两个客户端各记各的、谁也说服不了谁"。
+let coachPanelOpen = false;
+let coachPanelGroups = [];   // 服务端返回的最后一版分组（渲染 + 算下一版 muted）
+
+function coachPanelToggle(){
+  coachPanelOpen = !coachPanelOpen;
+  $('coPanel').hidden = !coachPanelOpen;
+  $('coachPanelBtn').className = coachPanelOpen ? 'on' : '';
+  if (coachPanelOpen) loadCoachPanel(false);
+}
+
+// silent=true 用于面板开着时的周期刷新：失败就静静等下一次，
+// 别因为一次抖动把面板收起来。
+function loadCoachPanel(silent){
+  fetch(coachUrl + '/api/v1/coach/panel')
+    .then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(renderCoachPanel, function(){
+      if (silent) return;
+      // 老版教练没有这个接口 / 没启动 → 不报错，把面板收起来并说明原因
+      coachPanelOpen = false;
+      $('coPanel').hidden = true;
+      $('coachPanelBtn').className = '';
+      $('coachPanelBtn').title = '当前教练不支持播报设置（需要新版教练服务端）';
+    });
+}
+
+function coachPanelRowHtml(g){
+  const on = !g.muted;
+  return '<div class="cp-row' + (on ? '' : ' off') + '" data-id="' + g.id + '">'
+    + '<input type="checkbox" id="cp-' + g.id + '"' + (on ? ' checked' : '')
+    + '><label for="cp-' + g.id + '">' + g.label
+    + '<span class="cp-desc"> · ' + (g.desc || '') + '</span></label>'
+    + '<span class="cp-n" title="最近播报条数">' + (g.recent || 0) + '</span></div>';
+}
+
+// 🔴 已经渲染过就**只就地改**，不重写 innerHTML —— 重写会把用户正按着的
+//    复选框整个换成新的，点击看起来像"没反应"。
+function renderCoachPanel(d){
+  coachPanelGroups = d.groups || [];
+  const box = $('coPanel');
+  if (!box.querySelector('.cp-row')) {
+    box.innerHTML = coachPanelGroups.map(coachPanelRowHtml).join('')
+      + '<div class="cp-hint">勾选 = 播报，取消 = 不说。'
+      + '「安全告警」不建议关闭。改动立即生效。</div>';
+    return;
+  }
+  coachPanelGroups.forEach(function(g){
+    const row = box.querySelector('.cp-row[data-id="' + g.id + '"]');
+    if (!row) return;
+    row.className = 'cp-row' + (g.muted ? ' off' : '');
+    const cb = row.querySelector('input');
+    if (cb && cb.checked === g.muted) cb.checked = !g.muted;
+    const n = row.querySelector('.cp-n');
+    if (n) n.textContent = String(g.recent || 0);
+  });
+}
+
+// 面板开着时搭主轮询的顺风车，每 ~3 s 刷一次（只为更新"最近播报条数"）。
+// 主轮询 200ms 一次 → 15 次 ≈ 3 s。
+const COACH_PANEL_REFRESH_EVERY = 15;
+let coachPanelRefreshN = 0;
+
+function coachPanelMaybeRefresh(){
+  if (!coachPanelOpen) return;
+  coachPanelRefreshN = (coachPanelRefreshN + 1) % COACH_PANEL_REFRESH_EVERY;
+  if (coachPanelRefreshN === 0) loadCoachPanel(true);
+}
+
+function setCoachMuted(id, muted){
+  const next = [];
+  coachPanelGroups.forEach(function(g){
+    const m = (g.id === id) ? muted : !!g.muted;
+    if (m) next.push(g.id);
+    g.muted = m;                    // 乐观更新：勾选立刻跟手
+  });
+  renderCoachPanel({groups: coachPanelGroups});
+  fetch(coachUrl + '/api/v1/coach/panel', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({muted: next}),
+  })
+    .then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }, function(){ throw new Error('net'); })
+    // ⚠️ 双参数 then：单参数 .catch 会把 renderCoachPanel 里的异常也当成
+    //    "发送失败"，于是回读服务端把用户的点击撤销掉，而真正的原因
+    //    （渲染 bug）永远看不见 —— 与 pollCoach 同一个坑。
+    .then(renderCoachPanel, function(){ loadCoachPanel(true); });
+}
+
 function renderCoach(d){
   coachRetry = COACH_POLL_MS;
   $('coachDot').className = 'on';
@@ -9175,8 +9297,12 @@ function renderCoach(d){
     box.className = ''; box.textContent = say.text;
     // 播报只念**本次新产生**的那一条：/state 是电平接口，它会一直返回
     // 同一条，不去重就会每 200ms 念一遍。
-    const sig = say.key + '|' + say.text + '|' + d.lap;
-    if (sig !== coachSig) { coachSig = sig; coachSay(say.text, say.priority); }
+    // 🔴 语音走 say.speech（数字逐位中文，更贴近真实无线电），屏幕仍显示
+    //    say.text（保留 54 / 1:32.412 等原样数字便于扫读）；旧版教练没给
+    //    speech 时退回 say.text，向后兼容。
+    const spoken = say.speech || say.text;
+    const sig = say.key + '|' + spoken + '|' + d.lap;
+    if (sig !== coachSig) { coachSig = sig; coachSay(spoken, say.priority); }
   } else if (!d.ref_ready) {
     box.className = 'idle';
     box.textContent = d.connected
@@ -9193,6 +9319,8 @@ function renderCoach(d){
   $('coHist').innerHTML = (d.spoken || []).slice(0, 8).map(function(h){
     return '<div><i>' + (h.key || '').split('@')[0] + '</i>' + h.text + '</div>';
   }).join('');
+  // 面板开着时顺路刷新"最近播报条数"（关着时这行什么都不做）
+  coachPanelMaybeRefresh();
 }
 
 function renderCoachOff(){
@@ -9207,6 +9335,9 @@ function renderCoachOff(){
   box.style.cursor = 'pointer';
   box.title = '点击填写赛道工程师的地址，例如 http://localhost:8788';
   $('coHist').innerHTML = '';
+  // 教练没了 → 播报面板也没得改（真值在服务端），顺手收起来
+  if (coachPanelOpen) { coachPanelOpen = false; $('coPanel').hidden = true; }
+  $('coachPanelBtn').className = '';
   // 指数退避：没装/没起的时候别每 200ms 打一个空端口
   coachRetry = Math.min(coachRetry * 2, 15000);
 }
@@ -9256,6 +9387,15 @@ function pollCoach(){
     };
   }
   $('coSay').onclick = askCoachUrl;
+  // 播报内容面板：按钮开合 + 勾选改动（事件委托 —— 行是用 innerHTML
+  // 生成的，逐行挂监听会在每次刷新后全部失效）
+  $('coachPanelBtn').onclick = coachPanelToggle;
+  $('coPanel').addEventListener('change', function(ev){
+    const cb = ev.target;
+    if (!cb || cb.tagName !== 'INPUT') return;
+    const row = cb.closest ? cb.closest('.cp-row') : null;
+    if (row) setCoachMuted(row.getAttribute('data-id'), !cb.checked);
+  });
   pollCoach();
 })();
 
@@ -9270,6 +9410,7 @@ const CARD_TITLES = {
   'c-engine':'引擎健康', 'c-race':'比赛信息', 'c-coach':'赛道工程师',
 };
 const DEFAULT_CARDS = [
+  {id:'c-coach',span:2, show:true},
   {id:'c-rpm',  span:1, show:true},
   {id:'c-pedal',span:1, show:true},
   {id:'c-lap',  span:1, show:true},
@@ -9299,11 +9440,19 @@ let layoutState = {
   // 版本升级对齐：旧存档缺少后来新增的卡片时，按默认顺序补进去。
   // 不做这一步，升级后新卡会「存在但排在错位/不可见」，用户会当成 bug。
   // 已有卡片的位置与显隐保持不变，只做「缺啥补啥」。
+  //
+  // 🔴 必须是**按默认布局的位置插入**，不能 push 到末尾：
+  //    新卡追加到末尾 = 升级后它从第 1 张跳到最后一第，用户眼里就是 bug。
+  //    （实测：c-coach 原先既不在 DEFAULT_CARDS 也不在 CARD_TITLES 的
+  //      显隐列表里 —— 它靠"不在列表里就不被 applyLayout 碰"偶然可见，
+  //      代价是用户**永远没法隐藏或拖动它**。）
   layoutState.layouts.forEach(function (l) {
-    DEFAULT_CARDS.forEach(function (d) {
-      if (!l.cards.some(function (c) { return c.id === d.id; })) {
-        l.cards.push(JSON.parse(JSON.stringify(d)));
-      }
+    const present = new Set(l.cards.map(c => c.id));
+    DEFAULT_CARDS.forEach(function (d, i) {
+      if (present.has(d.id)) return;
+      l.cards.splice(Math.min(i, l.cards.length), 0,
+                     JSON.parse(JSON.stringify(d)));
+      present.add(d.id);
     });
   });
 })();

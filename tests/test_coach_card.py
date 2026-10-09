@@ -43,9 +43,28 @@ class TestCardMarkup:
             assert label in page, label
 
     def test_card_is_in_layout_system(self, src):
-        """不在 CARD_TITLES 里 → 布局系统的显隐/拖拽列表里没有它，
-        用户第一次打开会看到一张凭空出现的卡，而且没法隐藏。"""
-        assert "'c-coach':'赛道工程师'" in src
+        """🔴 这张卡必须同时出现在 **CARD_TITLES 和 DEFAULT_CARDS** 里。
+
+        只查 CARD_TITLES 是不够的 —— 这条断言原先就只查它，于是
+        「标题表里有、默认布局列表里没有」这个状态被放过了：
+        `applyLayout()` 只遍历 `DEFAULT_CARDS`，不在里面的卡它压根不碰，
+        结果卡片靠"没人管"偶然可见，但用户在「卡片显隐」面板里
+        **找不到它、也永远没法隐藏或拖动它**（浏览器实测
+        `setCardShow('c-coach', false)` 是空操作、display 仍是 block）。
+        """
+        assert "'c-coach':'赛道工程师'" in src        # 标题表
+        assert "{id:'c-coach'" in src                 # 默认布局列表
+        # 顺序也要对：教练卡在 HTML 里是第一张，默认布局里也得是第一个，
+        # 否则 applyLayout 一重排它就跑位了。
+        assert src.index("{id:'c-coach'") < src.index("{id:'c-rpm'")
+
+    def test_new_cards_are_spliced_not_appended(self, src):
+        """🔴 旧存档「缺啥补啥」必须按默认位置**插入**，不能 push 到末尾 ——
+        push 会让新卡在升级后从第 1 张跳到最后一第，用户眼里就是 bug。"""
+        i = src.index("版本升级对齐")
+        seg = src[i:i + 1200]
+        assert "l.cards.splice(" in seg
+        assert "l.cards.push(" not in seg
 
     def test_css_defined(self, page):
         for sel in ("#c-coach h2", "#coachDot", "#coachMute", ".coach-row",
@@ -136,10 +155,76 @@ class TestVoicePreemption:
 
     def test_priority_is_passed_through(self, page):
         """不把 priority 传进去，抢占逻辑等于没写。"""
-        assert "coachSay(say.text, say.priority)" in page
         assert "function coachSay(text, priority)" in page
+        # 语音走 say.speech（数字逐位中文），屏幕仍显示 say.text ——
+        # 这条断言原先写的是 `coachSay(say.text, ...)`，加 speech 之后没跟着改，
+        # 于是长期红着（红着的守卫等于没有守卫）。
+        assert "const spoken = say.speech || say.text;" in page
+        assert "coachSay(spoken, say.priority)" in page
 
     def test_no_priority_for_local_feedback(self, page):
         """本地反馈（"语音已开启"）不该触发抢占 —— 它没有优先级，
         拿 undefined 去比 `<= 0` 会是 false，正好。"""
         assert "coachSay('语音已开启')" in page
+
+
+class TestBroadcastPanelWiring:
+    """播报内容面板（`#coachPanelBtn` / `#coPanel`）在实时页里的接线。
+
+    🔴 与 `#coachMute` 是两件事：那个是**全局**「要不要出声」，这个是
+       **分内容**的「哪些内容出声」，两者是「与」关系（语音关着时，
+       勾选多少都不会出声）。
+    面板的真值在教练服务端（`/api/v1/coach/panel`）—— 这里守的是：
+    按钮/容器在、读回来画、改动 POST 回去、失败时**不撤销**用户的点击。
+    """
+
+    def test_button_and_container_present(self, page):
+        assert 'id="coachPanelBtn"' in page
+        assert 'id="coPanel"' in page
+        assert 'id="coPanel" hidden' in page, "默认收起 —— 常驻会把卡片撑长"
+
+    def test_css_defined(self, page):
+        for sel in ("#coachPanelBtn", "#coachPanelBtn.on", "#coPanel .cp-row",
+                    "#coPanel .cp-row input", "#coPanel .cp-hint"):
+            assert sel in page, f"缺样式 {sel}"
+
+    def test_talks_to_the_panel_endpoint_both_ways(self, page):
+        assert "/api/v1/coach/panel" in page
+        assert "method: 'POST'" in page, "只读不改 = 面板是个摆设"
+
+    def test_toggle_by_button(self, page):
+        assert "function coachPanelToggle()" in page
+        assert "$('coachPanelBtn').onclick = coachPanelToggle;" in page
+
+    def test_change_uses_event_delegation(self, page):
+        """行是 innerHTML 生成的 —— 逐行挂监听会在每次刷新后全部失效。"""
+        assert "$('coPanel').addEventListener('change'" in page
+        assert "cb.closest('.cp-row')" in page
+
+    def test_does_not_rewrite_innerhtml_when_rows_exist(self, page):
+        """🔴 重写 innerHTML 会把用户正按着的复选框整个换掉，点击像"没反应"。"""
+        blk = page[page.index("function renderCoachPanel("):][:800]
+        assert "box.querySelector('.cp-row')" in blk, "已有行时不能整块重画"
+
+    def test_post_failure_uses_two_arg_then(self, page):
+        """单参数 .catch 会把渲染异常也当成"发送失败"，于是回读服务端把
+        用户刚点的那个勾**悄悄撤销**，而真正的原因（渲染 bug）永远看不见
+        —— 与 pollCoach 同一个坑。"""
+        blk = page[page.index("function setCoachMuted("):][:1000]
+        assert ".then(renderCoachPanel, function(){" in blk
+
+    def test_mute_state_is_not_kept_locally(self, page):
+        """真值只在服务端：本地再存一份就会出现"两个客户端各记各的、
+        谁也说服不了谁"。"""
+        blk = page[page.index("function setCoachMuted("):][:1000]
+        assert "localStorage" not in blk
+
+    def test_panel_hidden_when_coach_offline(self, page):
+        blk = page[page.index("function renderCoachOff("):][:800]
+        assert "$('coPanel').hidden = true" in blk
+
+    def test_refresh_piggybacks_on_the_main_poll(self, page):
+        """面板的周期刷新搭主轮询的顺风车（不另起定时器）——
+        教练没起来时不该多一个空转的定时器。"""
+        assert "coachPanelMaybeRefresh();" in page
+        assert "COACH_PANEL_REFRESH_EVERY" in page
