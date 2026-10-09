@@ -7,6 +7,11 @@
 ![GHCR](https://img.shields.io/badge/镜像-ghcr.io-blue)
 ![License](https://img.shields.io/badge/许可-MIT-green)
 
+> **当前版本：v1.0.1** —— 本版把给[赛道工程师](https://github.com/DC1024/gt7-coach)
+> 取数的那几个接口补齐了（`/profile` 剖面、场次 `car_code`、`meta.in_progress`），
+> 仪表盘实时页多了「赛道工程师」卡片（状态 + 播报内容 + 语音开关 + 云措辞模型填写），
+> 并修掉「本圈已用时」的口径问题。
+
 ## ⬇️ 下载（Windows 免安装）
 
 不想用 Docker 的话，可直接从 [Releases](https://github.com/DC1024/gt7-dash/releases)
@@ -62,7 +67,13 @@ docker compose up -d
 curl "http://<本机IP>:8787/api/v1/live?frames=120"   # 实时遥测
 curl "http://192.168.x.x:8787/api/v1/laps"           # 每圈圈速
 curl "http://192.168.x.x:8787/api/v1/sessions"       # 历史场次
+curl "http://192.168.x.x:8787/api/v1/profile?session=<id>"  # 赛道圈剖面（按绝对距离等分）
 ```
+
+`/api/v1/profile` 返回按**绝对距离**（不是按时间）等分的赛道剖面，
+并带 `meta.in_progress` 说明这一圈是否还在跑 —— 赛道工程师用它判断
+参考圈是否已完整跑完。场次列表里的每个场次带 `car_code`（数字车型码），
+供跨车型时判断「是不是同一台车」。
 
 完整字段与单位说明见 [`API文档.md`](API文档.md)，或直接访问 `/api/v1/docs`。
 
