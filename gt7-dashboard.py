@@ -9137,9 +9137,13 @@ let coachSpeakOn = false;
 let coachRetry = COACH_POLL_MS;
 let coachSig = '';        // 已播报过的内容指纹（去重）
 
-function coachSay(text){
+function coachSay(text, priority){
   if (!coachSpeakOn || !text || !window.speechSynthesis) return;
   try {
+    // 🔴 P0（出界/打滑/刹车晚了）要能**打断**正在念的闲话。
+    //    浏览器 TTS 默认排队：一句 delta 会把随后的"出界"堵在后面，
+    //    等念完就晚了。真赛车无线电是抢麦，不是排队。
+    if (priority <= 0 && speechSynthesis.speaking) speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
     u.lang = 'zh-CN'; u.rate = 1.15;
     speechSynthesis.speak(u);
@@ -9172,7 +9176,7 @@ function renderCoach(d){
     // 播报只念**本次新产生**的那一条：/state 是电平接口，它会一直返回
     // 同一条，不去重就会每 200ms 念一遍。
     const sig = say.key + '|' + say.text + '|' + d.lap;
-    if (sig !== coachSig) { coachSig = sig; coachSay(say.text); }
+    if (sig !== coachSig) { coachSig = sig; coachSay(say.text, say.priority); }
   } else if (!d.ref_ready) {
     box.className = 'idle';
     box.textContent = d.connected

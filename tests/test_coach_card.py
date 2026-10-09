@@ -121,3 +121,25 @@ class TestCoachUrlResolution:
         为了"省一次往返"把 coach 挪进同源，会发现改不动。"""
         i = src.index("赛道工程师（gt7-coach）：状态卡片")
         assert "CORS" in src[i:i + 300]
+
+
+class TestVoicePreemption:
+    """P0 要能**打断**正在念的闲话。
+
+    浏览器 TTS 默认是排队制：一句 delta（P3）会把随后的"出界"（P0）
+    堵在它后面，等念完就晚了。真赛车无线电是抢麦，不是排队。
+    """
+
+    def test_cancels_on_p0(self, page):
+        assert "speechSynthesis.cancel()" in page
+        assert "priority <= 0" in page, "只有 P0 才抢占"
+
+    def test_priority_is_passed_through(self, page):
+        """不把 priority 传进去，抢占逻辑等于没写。"""
+        assert "coachSay(say.text, say.priority)" in page
+        assert "function coachSay(text, priority)" in page
+
+    def test_no_priority_for_local_feedback(self, page):
+        """本地反馈（"语音已开启"）不该触发抢占 —— 它没有优先级，
+        拿 undefined 去比 `<= 0` 会是 false，正好。"""
+        assert "coachSay('语音已开启')" in page
