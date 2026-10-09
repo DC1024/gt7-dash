@@ -9334,7 +9334,20 @@ function coachPanelShellHtml(rows){
     + 'placeholder="留空 = 用厂商预设">'
     + '<button id="coModelSave" title="写入 cloud.json，立即生效">保存</button>'
     + '</div>'
-    + '<div class="cp-hint" id="coModelMsg">加载中…</div>';
+    + '<div class="cp-hint" id="coModelMsg">加载中…</div>'
+    + '<div class="cp-sec">打滑灵敏度（#J）</div>'
+    + '<div class="cm-row">'
+    + '<select id="coSlipPreset" title="三档预设：街道要严、赛道日适中、漂移/拉力/泥地故意滑">'
+    + '<option value="strict">严格（街道）</option>'
+    + '<option value="standard">标准（赛道日）</option>'
+    + '<option value="lenient">宽容（漂移/拉力/泥地）</option>'
+    + '</select></div>'
+    + '<div class="cm-row" style="align-items:center;gap:10px">'
+    + '<input type="range" id="coSlipSlider" min="0.02" max="0.50" step="0.01"'
+    + '  style="flex:1;accent-color:var(--accent)">'
+    + '<b id="coSlipVal" style="min-width:48px;text-align:right;'
+    + 'font-family:var(--mono)">--</b></div>'
+    + '<div class="cp-hint" id="coSlipMsg">加载中…</div>';
 }
 
 // 🔴 已经渲染过就**只就地改**，不重写 innerHTML —— 重写会把用户正按着的
@@ -9345,6 +9358,7 @@ function renderCoachPanel(d){
   if (!box.querySelector('.cp-row')) {
     box.innerHTML = coachPanelShellHtml(coachPanelGroups.map(coachPanelRowHtml).join(''));
     loadCoachCloud(false);
+    loadCoachSlip(false);
     return;
   }
   coachPanelGroups.forEach(function(g){
@@ -9436,6 +9450,103 @@ function saveCoachModel(){
     });
 }
 
+// ---------- 打滑灵敏度三档（#J）----------
+// 🔴 预设只是标签，真正判据用的是 slip_threshold。选预设时服务端把阈值设回
+//    该档基线，之后滑块微调改的就是 slip_threshold 本身。这里既不存预设学名、
+//    也不存基线值——全以 /api/v1/coach/config 返回为准（单一事实源）。
+function loadCoachSlip(silent){
+  fetch(coachUrl + '/api/v1/coach/config')
+    .then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(renderCoachSlip, function(){
+      if (silent) return;
+      const m = $('coSlipMsg');
+      if (m) m.textContent = '当前教练不支持打滑三档设置（需要新版教练服务端）';
+      const s = $('coSlipSlider'); if (s) s.disabled = true;
+      const p = $('coSlipPreset'); if (p) p.disabled = true;
+    });
+}
+
+function renderCoachSlip(d){
+  const sel = $('coSlipPreset'), sl = $('coSlipSlider'),
+        val = $('coSlipVal'), msg = $('coSlipMsg');
+  if (!sel || !sl) return;
+  const r = (d.rules || {});
+  // 🔴 不覆盖用户正在操作的控件：面板开着每 ~3s 刷一次，无条件回填会把
+  //    正拖着的滑块、正选的下拉冲掉（与云模型输入框同样的坑）。
+  if (document.activeElement !== sel) sel.value = r.slip_preset || 'standard';
+  const thr = (typeof r.slip_threshold === 'number') ? r.slip_threshold
+                                                     : parseFloat(sl.value);
+  if (document.activeElement !== sl) {
+    sl.value = thr;
+    if (val) val.textContent = thr.toFixed(2);
+  }
+  if (msg && document.activeElement !== sl) {
+    msg.textContent = '滑移率超过阈值才报"打滑"。严格=任何打滑都报，'
+      + '宽容=故意滑也少报。滑块可在档内微调。';
+  }
+}
+
+function saveCoachSlipPreset(){
+  const sel = $('coSlipPreset'), msg = $('coSlipMsg');
+  if (!sel || !msg) return;
+  const preset = sel.value;
+  msg.className = 'cp-hint';
+  msg.textContent = '保存中…';
+  fetch(coachUrl + '/api/v1/coach/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rules: {slip_preset: preset}}),
+  })
+    .then(function(r){
+      if (r.ok) return r.json();
+      return r.json().then(function(e){
+        throw new Error(e && e.error ? e.error : ('HTTP ' + r.status));
+      }, function(){ throw new Error('HTTP ' + r.status); });
+    })
+    .then(function(d){
+      renderCoachSlip(d.config);
+      msg.textContent = '已切换为「' + presetLabel(preset)
+        + '」档，阈值已回到该档基线。';
+    }, function(e){
+      msg.className = 'cp-hint warn';
+      msg.textContent = '保存失败：' + e.message;
+    });
+}
+
+function saveCoachSlipThreshold(){
+  const sl = $('coSlipSlider'), val = $('coSlipVal'), msg = $('coSlipMsg');
+  if (!sl || !msg) return;
+  const thr = parseFloat(sl.value);
+  if (val) val.textContent = thr.toFixed(2);
+  msg.className = 'cp-hint';
+  msg.textContent = '保存中…';
+  fetch(coachUrl + '/api/v1/coach/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rules: {slip_threshold: thr}}),
+  })
+    .then(function(r){
+      if (r.ok) return r.json();
+      return r.json().then(function(e){
+        throw new Error(e && e.error ? e.error : ('HTTP ' + r.status));
+      }, function(){ throw new Error('HTTP ' + r.status); });
+    })
+    .then(function(d){
+      renderCoachSlip(d.config);
+      msg.textContent = '阈值已微调为 ' + thr.toFixed(2) + '。';
+    }, function(e){
+      msg.className = 'cp-hint warn';
+      msg.textContent = '保存失败：' + e.message;
+    });
+}
+
+function presetLabel(v){
+  return v === 'strict' ? '严格（街道）'
+       : v === 'lenient' ? '宽容（漂移/拉力/泥地）'
+       : '标准（赛道日）';
+}
+
 // 面板开着时搭主轮询的顺风车，每 ~3 s 刷一次（只为更新"最近播报条数"）。
 // 主轮询 200ms 一次 → 15 次 ≈ 3 s。
 const COACH_PANEL_REFRESH_EVERY = 15;
@@ -9444,7 +9555,7 @@ let coachPanelRefreshN = 0;
 function coachPanelMaybeRefresh(){
   if (!coachPanelOpen) return;
   coachPanelRefreshN = (coachPanelRefreshN + 1) % COACH_PANEL_REFRESH_EVERY;
-  if (coachPanelRefreshN === 0) { loadCoachPanel(true); loadCoachCloud(true); }
+  if (coachPanelRefreshN === 0) { loadCoachPanel(true); loadCoachCloud(true); loadCoachSlip(true); }
 }
 
 function setCoachMuted(id, muted){
@@ -9590,9 +9701,21 @@ function pollCoach(){
   $('coachPanelBtn').onclick = coachPanelToggle;
   $('coPanel').addEventListener('change', function(ev){
     const cb = ev.target;
-    if (!cb || cb.tagName !== 'INPUT') return;
+    if (!cb || cb.tagName !== 'INPUT') {
+      // 下拉框（SELECT）的 change 也走这里：选了打滑预设就保存
+      if (cb && cb.id === 'coSlipPreset') saveCoachSlipPreset();
+      return;
+    }
+    if (cb.id === 'coSlipSlider') { saveCoachSlipThreshold(); return; }
     const row = cb.closest ? cb.closest('.cp-row') : null;
     if (row) setCoachMuted(row.getAttribute('data-id'), !cb.checked);
+  });
+  // 滑块拖动时实时更新数字（不保存）；松手时 change 才保存
+  $('coPanel').addEventListener('input', function(ev){
+    if (ev.target && ev.target.id === 'coSlipSlider') {
+      const v = $('coSlipVal');
+      if (v) v.textContent = parseFloat(ev.target.value).toFixed(2);
+    }
   });
   // 云模型输入框：按钮点一下、或在框里回车都能存。
   // 同样走事件委托 —— 抽屉内容是 innerHTML 生成的，逐项挂监听会失效。
