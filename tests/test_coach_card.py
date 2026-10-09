@@ -228,3 +228,101 @@ class TestBroadcastPanelWiring:
         教练没起来时不该多一个空转的定时器。"""
         assert "coachPanelMaybeRefresh();" in page
         assert "COACH_PANEL_REFRESH_EVERY" in page
+
+
+class TestCloudModelWiring:
+    """云措辞模型的填写入口（用户自己填模型名）在实时页里的接线。
+
+    需求背景（2026-10-09）：用户给了百炼控制台的免费额度导出表，要求
+    「不要用到付费模型避免用户被收费」，并让**模型名由用户自己填**。
+    真值在教练服务端的 cloud.json（`/api/v1/coach/cloud`）——
+    这里守的是：入口在、只发 model（绝不发 key）、本地不存副本、
+    非免费模型的警告能显示出来、以及**用户正在打字时不被周期刷新冲掉**。
+    """
+
+    def test_input_and_button_present(self, page):
+        for eid in ("coModelInput", "coModelSave", "coModelMsg"):
+            assert f'id="{eid}"' in page, f"缺元素 {eid}"
+
+    def test_drawer_has_two_sections(self, page):
+        """上面管「说哪些」、下面管「用哪个模型说」—— 分节是为了不让人
+        以为模型名也是个播报开关。"""
+        assert ">播报内容<" in page
+        assert ">云措辞模型<" in page
+        assert 'id="coGroups"' in page, "分组行要能单独就地更新"
+
+    def test_shell_is_built_once(self, page):
+        """骨架只在首次建一次；之后只就地改（重写会把用户正按的复选框换掉）。"""
+        assert "function coachPanelShellHtml(" in page
+        blk = page[page.index("function renderCoachPanel("):][:600]
+        assert "coachPanelShellHtml(" in blk
+        assert "box.querySelector('.cp-row')" in blk
+
+    def test_talks_to_the_cloud_endpoint_both_ways(self, page):
+        assert "/api/v1/coach/cloud" in page
+        blk = page[page.index("function saveCoachModel("):][:900]
+        assert "method: 'POST'" in blk, "只读不改 = 填了没用"
+
+    def test_save_sends_only_the_model(self, page):
+        """🔴 只发 model。明文 key 绝不进配置文件，也不该从这个框流出去。"""
+        blk = page[page.index("function saveCoachModel("):][:900]
+        assert "body: JSON.stringify({model: model})" in blk
+        assert "api_key" not in blk
+
+    def test_save_uses_two_arg_then(self, page):
+        """单参数 .catch 会把渲染异常当成"保存失败"，报一个和真实原因无关的错。"""
+        blk = page[page.index("function saveCoachModel("):][:1400]
+        assert ".then(function(d){" in blk and "}, function(e){" in blk
+
+    def test_input_is_not_overwritten_while_typing(self, page):
+        """🔴 抽屉开着时每 ~3s 刷一次，无条件回填会把用户正打的字冲掉。"""
+        blk = page[page.index("function renderCoachCloud("):][:900]
+        assert "document.activeElement !== inp" in blk
+
+    def test_input_is_an_override_not_a_mirror(self, page):
+        """输入框是**覆盖**语义：用厂商预设时必须回空串 ——
+        把预设名填进去会让它在下次保存时变成一次显式覆盖。"""
+        blk = page[page.index("function renderCoachCloud("):][:900]
+        assert "coachCloud.model_from_user ? (coachCloud.model || '') : ''" in blk
+
+    def test_free_status_is_shown(self, page):
+        blk = page[page.index("function renderCoachCloud("):][:1200]
+        assert "免费额度内" in blk
+        assert "model_warning" in blk
+
+    def test_warning_uses_the_warn_colour(self, page):
+        blk = page[page.index("function renderCoachCloud("):][:1200]
+        assert "'cp-hint' + (coachCloud.model_warning ? ' warn' : '')" in blk
+        assert "#coPanel .cp-hint.warn" in page
+
+    def test_enter_key_saves(self, page):
+        blk = page[page.index("(function initCoachCard(){"):]
+        assert "ev.target.id === 'coModelInput'" in blk
+        assert "saveCoachModel()" in blk
+
+    def test_save_is_delegated(self, page):
+        """抽屉内容是 innerHTML 生成的 —— 逐项挂监听会失效。"""
+        blk = page[page.index("(function initCoachCard(){"):]
+        assert "$('coPanel').addEventListener('click'" in blk
+        assert "ev.target.id === 'coModelSave'" in blk
+
+    def test_no_local_copy_of_the_model(self, page):
+        """真值只在服务端 —— 本地再存一份就会出现"两边各记各的"。"""
+        for fn in ("function saveCoachModel(", "function renderCoachCloud("):
+            blk = page[page.index(fn):][:1200]
+            assert "localStorage" not in blk
+
+    def test_refresh_updates_the_model_too(self, page):
+        blk = page[page.index("function coachPanelMaybeRefresh("):][:400]
+        assert "loadCoachCloud(true)" in blk
+
+    def test_css_defined(self, page):
+        for sel in ("#coPanel .cp-sec", "#coPanel .cm-row",
+                    "#coPanel .cm-row input", "#coPanel .cm-row button"):
+            assert sel in page, f"缺样式 {sel}"
+
+    def test_missing_endpoint_is_explained(self, page):
+        """老版教练没有 /cloud → 明说并把输入框禁用，别给一个填了没反应的框。"""
+        blk = page[page.index("function loadCoachCloud("):][:900]
+        assert "不支持查看云模型" in blk
+        assert "inp.disabled = true" in blk

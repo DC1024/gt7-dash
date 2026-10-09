@@ -7469,6 +7469,24 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   min-width:18px; text-align:right; }
 #coPanel .cp-hint { color:var(--muted); font-size:11px; margin-top:6px;
   line-height:1.5; }
+/* 云措辞模型：与上面那组开关同一个抽屉，但节标题分开 —— 上面管「说哪些」，
+   这里管「用哪个模型说」。分节是为了不让人以为它也是播报开关。 */
+#coPanel .cp-sec { font-size:10.5px; letter-spacing:.6px; color:var(--accent);
+  margin:12px 0 5px; padding-top:10px; border-top:1px dashed var(--line); }
+#coPanel .cm-row { display:flex; gap:6px; margin-top:6px; }
+#coPanel .cm-row input { flex:1; min-width:0; background:var(--bg);
+  border:1px solid var(--line); border-radius:6px; color:var(--text);
+  font-family:var(--mono); font-size:11.5px; padding:4px 7px; }
+#coPanel .cm-row input::placeholder { color:var(--muted); }
+#coPanel .cm-row input:focus { outline:none;
+  border-color:rgba(var(--accent-rgb),.5); }
+#coPanel .cm-row button { flex-shrink:0; border:1px solid var(--line);
+  background:transparent; color:var(--text); border-radius:6px;
+  padding:4px 10px; cursor:pointer; font-family:inherit; font-size:11.5px; }
+#coPanel .cm-row button:hover { border-color:rgba(var(--accent-rgb),.5);
+  color:var(--accent); }
+/* 非免费模型的提示：必须显眼 —— 这条是防「静默扣费」的唯一提示 */
+#coPanel .cp-hint.warn { color:var(--warn); }
 .coach-row { display:flex; justify-content:space-between; font-size:13px;
   padding:5px 0; border-bottom:1px solid var(--line); }
 .coach-row:last-of-type { border-bottom:none; }
@@ -7927,7 +7945,7 @@ th { color:var(--muted); font-weight:500; }
       <h2>赛道工程师
         <span id="coachDot" title="连接状态"></span>
         <span class="cspacer"></span>
-        <button id="coachPanelBtn" title="选择哪些内容播报、哪些不播报">播报内容</button>
+        <button id="coachPanelBtn" title="播报内容开关 + 云措辞模型（用哪个模型润色）">播报设置</button>
         <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">语音：关</button>
       </h2>
       <div class="coach-row"><span>参考圈</span><b id="coRef">--</b></div>
@@ -9216,15 +9234,31 @@ function coachPanelRowHtml(g){
     + '<span class="cp-n" title="最近播报条数">' + (g.recent || 0) + '</span></div>';
 }
 
+// 抽屉骨架。分两节：① 播报内容（说哪些）② 云措辞模型（用哪个模型说）。
+// 输入框是**覆盖**语义：留空 = 用厂商预设。所以回填时必须回
+// `model_from_user ? model : ''` —— 把预设名填进去会把它变成一次显式覆盖。
+function coachPanelShellHtml(rows){
+  return '<div class="cp-sec">播报内容</div>'
+    + '<div id="coGroups">' + rows + '</div>'
+    + '<div class="cp-hint">勾选 = 播报，取消 = 不说。'
+    + '「安全告警」不建议关闭。改动立即生效。</div>'
+    + '<div class="cp-sec">云措辞模型</div>'
+    + '<div class="cm-row">'
+    + '<input id="coModelInput" type="text" spellcheck="false" '
+    + 'placeholder="留空 = 用厂商预设">'
+    + '<button id="coModelSave" title="写入 cloud.json，立即生效">保存</button>'
+    + '</div>'
+    + '<div class="cp-hint" id="coModelMsg">加载中…</div>';
+}
+
 // 🔴 已经渲染过就**只就地改**，不重写 innerHTML —— 重写会把用户正按着的
-//    复选框整个换成新的，点击看起来像"没反应"。
+//    复选框整个换成新的，点击看起来像"没反应"。骨架只在首次建一次。
 function renderCoachPanel(d){
   coachPanelGroups = d.groups || [];
   const box = $('coPanel');
   if (!box.querySelector('.cp-row')) {
-    box.innerHTML = coachPanelGroups.map(coachPanelRowHtml).join('')
-      + '<div class="cp-hint">勾选 = 播报，取消 = 不说。'
-      + '「安全告警」不建议关闭。改动立即生效。</div>';
+    box.innerHTML = coachPanelShellHtml(coachPanelGroups.map(coachPanelRowHtml).join(''));
+    loadCoachCloud(false);
     return;
   }
   coachPanelGroups.forEach(function(g){
@@ -9238,6 +9272,84 @@ function renderCoachPanel(d){
   });
 }
 
+// ---------- 云措辞模型（用户自己填模型名）----------
+// 🔴 真值在教练服务端的 cloud.json（`/api/v1/coach/cloud`）。这里只负责
+//    「显示现在用的是哪个」+「把用户填的名字 POST 回去」，**本地不存**。
+//
+// 为什么卡片里要有这个入口：教练默认挑的是**免费额度内**的模型，但免费
+// 名单会随活动和到期日变化；用户想换一个（或额度用完了）时，不该被迫去
+// vim 一个藏在容器/服务器里的 json。改完立即生效，不用重启。
+let coachCloud = null;      // 服务端返回的最后一版云状态
+
+function loadCoachCloud(silent){
+  fetch(coachUrl + '/api/v1/coach/cloud')
+    .then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(renderCoachCloud, function(){
+      if (silent) return;
+      const msg = $('coModelMsg');
+      // 老版教练没有这个接口 → 明说，别给用户一个填了没反应的框
+      if (msg) { msg.textContent = '当前教练不支持查看云模型（需要新版教练服务端）'; }
+      const inp = $('coModelInput');
+      if (inp) inp.disabled = true;
+    });
+}
+
+function renderCoachCloud(d){
+  coachCloud = d || {};
+  const msg = $('coModelMsg'), inp = $('coModelInput');
+  if (!msg || !inp) return;
+  inp.disabled = false;
+  // 🔴 只在输入框**没被编辑**时才回填 —— 面板开着时每 ~3s 刷一次，
+  //    无条件回填会把用户正打的字冲掉。
+  if (document.activeElement !== inp) {
+    inp.value = coachCloud.model_from_user ? (coachCloud.model || '') : '';
+  }
+  const who = coachCloud.model_from_user ? '你填的' : '厂商预设';
+  let txt = coachCloud.enabled
+    ? ('当前：' + (coachCloud.model || '（无）') + '（' + who + '）'
+       + (coachCloud.model_is_free ? ' · 免费额度内' : ''))
+    : '云措辞未启用（只用本地模板，零外呼）';
+  if (coachCloud.model_warning) { txt += ' ⚠ ' + coachCloud.model_warning; }
+  msg.textContent = txt;
+  msg.className = 'cp-hint' + (coachCloud.model_warning ? ' warn' : '');
+}
+
+function saveCoachModel(){
+  const inp = $('coModelInput'), msg = $('coModelMsg');
+  if (!inp || !msg) return;
+  const model = (inp.value || '').trim();
+  msg.className = 'cp-hint';
+  msg.textContent = '保存中…';
+  fetch(coachUrl + '/api/v1/coach/cloud', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({model: model}),
+  })
+    .then(function(r){
+      if (r.ok) return r.json();
+      // 把服务端的错误原因（如"未配置 cloud.json"）带给用户，别只说"失败"
+      return r.json().then(function(e){
+        throw new Error(e && e.error ? e.error : ('HTTP ' + r.status));
+      }, function(){ throw new Error('HTTP ' + r.status); });
+    })
+    // ⚠️ 双参数 then：单参数 .catch 会把 renderCoachCloud 里的异常也算成
+    //    "保存失败"，于是报一个和真实原因无关的错 —— 与 pollCoach 同一个坑。
+    .then(function(d){
+      renderCoachCloud(d.cloud);
+      // 有警告就让警告留着（它比"已保存"重要），没警告才回一句确认
+      if (!coachCloud.model_warning) {
+        msg.textContent = '已保存：' + (coachCloud.model || '（厂商预设）')
+          + '。下一句播报就按这个模型走。';
+      }
+    }, function(e){
+      msg.className = 'cp-hint warn';
+      msg.textContent = '保存失败：' + e.message;
+    });
+}
+
 // 面板开着时搭主轮询的顺风车，每 ~3 s 刷一次（只为更新"最近播报条数"）。
 // 主轮询 200ms 一次 → 15 次 ≈ 3 s。
 const COACH_PANEL_REFRESH_EVERY = 15;
@@ -9246,7 +9358,7 @@ let coachPanelRefreshN = 0;
 function coachPanelMaybeRefresh(){
   if (!coachPanelOpen) return;
   coachPanelRefreshN = (coachPanelRefreshN + 1) % COACH_PANEL_REFRESH_EVERY;
-  if (coachPanelRefreshN === 0) loadCoachPanel(true);
+  if (coachPanelRefreshN === 0) { loadCoachPanel(true); loadCoachCloud(true); }
 }
 
 function setCoachMuted(id, muted){
@@ -9395,6 +9507,17 @@ function pollCoach(){
     if (!cb || cb.tagName !== 'INPUT') return;
     const row = cb.closest ? cb.closest('.cp-row') : null;
     if (row) setCoachMuted(row.getAttribute('data-id'), !cb.checked);
+  });
+  // 云模型输入框：按钮点一下、或在框里回车都能存。
+  // 同样走事件委托 —— 抽屉内容是 innerHTML 生成的，逐项挂监听会失效。
+  $('coPanel').addEventListener('click', function(ev){
+    if (ev.target && ev.target.id === 'coModelSave') saveCoachModel();
+  });
+  $('coPanel').addEventListener('keydown', function(ev){
+    if (ev.key === 'Enter' && ev.target && ev.target.id === 'coModelInput') {
+      ev.preventDefault();
+      saveCoachModel();
+    }
   });
   pollCoach();
 })();
