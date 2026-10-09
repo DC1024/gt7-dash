@@ -90,9 +90,10 @@ jobs:
         with:
           files: gt7-dash-windows-x64.zip
           name: GT7 Dash ${{ github.ref_name }}
-          # 发行说明 = 手写的 body（下表）+ GitHub 自动生成的 What's Changed。
-          # 只靠自动生成的话，Release 页上只有一个 compare 链接，
-          # 看不出这个版本到底改了什么 —— 对下载 zip 的人是无效信息。
+          # 🔴 不能同时用 `generate_release_notes: true`：实测两者并存时
+          #    **自动生成的 notes 会把 body 整个盖掉**，Release 页上只剩
+          #    一行 compare 链接（踩过两次）。想要自动 changelog 就自己
+          #    在 body 末尾拼一个 compare 链接 —— 见下面「完整变更」那行。
           body: |
             **PS5《Gran Turismo 7》官方 UDP 遥测 → 本地解密 → Web 实时仪表盘 + 公开数据 API。**
 
@@ -145,5 +146,6 @@ jobs:
             ---
 
             **许可**：MIT
-          generate_release_notes: true
+
+            **完整变更**：https://github.com/DC1024/gt7-dash/compare/v1.0.0...${{ github.ref_name }}
           fail_on_unmatched_files: true
