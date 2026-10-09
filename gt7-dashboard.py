@@ -7499,10 +7499,10 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   flex-shrink:0; margin:0; }
 #coachDot.on { background:var(--ok); box-shadow:0 0 0 3px rgba(63,185,80,.18); }
 #coachDot.off { background:var(--warn); }
-#coachMute { border:1px solid var(--line); background:transparent;
-  color:var(--muted); border-radius:6px; padding:2px 8px; cursor:pointer;
-  font-family:inherit; font-size:11px; letter-spacing:.3px;
-  text-transform:none; font-weight:400; }
+#coachMute { border:1px solid var(--warn); background:transparent;
+  color:var(--warn); border-radius:6px; padding:4px 10px; cursor:pointer;
+  font-family:inherit; font-size:12px; letter-spacing:.3px;
+  text-transform:none; font-weight:500; }
 #coachMute.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
 /* 播报内容面板：与 #coachMute（全局"要不要出声"）分工不同 —— 它管
    "**哪些内容**出声"。两者是「与」关系：语音关着时，勾选多少都不会出声。 */
@@ -8001,7 +8001,7 @@ th { color:var(--muted); font-weight:500; }
         <span id="coachDot" title="连接状态"></span>
         <span class="cspacer"></span>
         <button id="coachPanelBtn" title="播报内容开关 + 云措辞模型（用哪个模型润色）">播报设置</button>
-        <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">语音：关</button>
+        <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">🔇 语音：关</button>
       </h2>
       <div class="coach-row"><span>参考圈</span><b id="coRef">--</b></div>
       <div class="coach-row"><span>本圈位置</span><b id="coS">--</b></div>
@@ -9545,13 +9545,13 @@ function pollCoach(){
     btn.textContent = '语音不可用';
     btn.disabled = true;
   } else {
-    btn.onclick = function(){
-      coachSpeakOn = !coachSpeakOn;
-      btn.textContent = '语音：' + (coachSpeakOn ? '开' : '关');
-      btn.className = coachSpeakOn ? 'on' : '';
-      // 顺便给个即时反馈（也确认音色/音量是通的）
-      if (coachSpeakOn) coachSay('语音已开启');
-    };
+      btn.onclick = function(){
+        coachSpeakOn = !coachSpeakOn;
+        btn.textContent = coachSpeakOn ? '🔈 语音：开' : '🔇 语音：关';
+        btn.className = coachSpeakOn ? 'on' : '';
+        // 顺便给个即时反馈（也确认音色/音量是通的）
+        if (coachSpeakOn) coachSay('语音已开启');
+      };
   }
   $('coSay').onclick = askCoachUrl;
   // 播报内容面板：按钮开合 + 勾选改动（事件委托 —— 行是用 innerHTML
