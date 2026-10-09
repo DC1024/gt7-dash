@@ -1311,7 +1311,13 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
             canon = session_stem(f.name) + ".jsonl"
             m = meta.get(canon) or meta.get(f.name) or {}
             import gt7analysis
-            car_name = gt7analysis.car_name_of(_first_car_code(f), csv_path)
+            # 🔴 `car_code` 必须**也**出现在列表里：赛道工程师（Coach）用它做
+            #    "是不是同一辆车"的判据 —— 数字相等即可，不依赖 `cars.csv`
+            #    查表命中。只给 `car_name` 的话，车型表没命中时本场与候选场
+            #    都是空串 → 过滤被跳过 → 静默跨车采用历史参考圈（拿慢车的
+            #    最快圈去量快车，delta 会退化成一个恒定的 +8 秒）。
+            car_code = _first_car_code(f)
+            car_name = gt7analysis.car_name_of(car_code, csv_path)
             # 文件名里的时间戳 → 短格式「10-08 00:27」
             ts = (parts[0] or "") if parts else ""
             tod = (parts[1] if len(parts) > 1 else "")[:6]
@@ -1335,6 +1341,9 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                     "%Y-%m-%d %H:%M:%S"
                 ),
                 "car_name": car_name,
+                # 数字车型码：比车型名可靠（不经过 `cars.csv` 查表）。
+                # 0 = 未知（老场次 / 解析失败），消费方要做"未知"处理。
+                "car_code": car_code,
                 "best_lap_s": best,
                 "anomalous": anomalous,
                 "time_str": time_str,
