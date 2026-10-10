@@ -9365,7 +9365,7 @@ function coachPanelShellHtml(rows){
     + '</div>'
     + '<div class="cm-row">'
     + '<input id="coModelInput" type="text" spellcheck="false" '
-    + 'placeholder="模型名（留空 = 用厂商预设)">'
+    + 'placeholder="模型名（自行填写；留空 = 该家免费默认)">'
     + '<button id="coModelSave" title="写入 cloud.json，立即生效">保存</button>'
     + '</div>'
     + '<div class="cp-hint" id="coModelMsg">加载中…</div>'
@@ -9655,17 +9655,19 @@ function presetLabel(v){
 let coachCloudPresets = null;   // renderCoachSlip 从 /config 抓下来存一份给 applyCloudPreset 用
 function applyCloudPreset(key){
   const cp = $('coCloudPreset'), bu = $('coBaseUrlInput'),
-        ke = $('coKeyEnvInput'), inp = $('coModelInput'),
-        msg = $('coModelMsg');
+        ke = $('coKeyEnvInput'), msg = $('coModelMsg');
   if (!cp || !key) return;
   const p = (coachCloudPresets || {})[key];
   if (!p) return;
   if (bu) bu.value = p.base_url || '';
   if (ke) ke.value = p.api_key_env || '';
-  if (inp) inp.value = p.model || '';
+  // 🔴 模型名**不预设**（2026-10-10 用户要求）：预设只填端点与 key 变量名，
+  //    模型名让用户自己写 —— 预设里的 model 只作为「留空时的服务端默认」，
+  //    不该从 UI 流出去变成一次显式覆盖。留空保存 = 回到该家免费默认。
   if (msg) {
     msg.className = 'cp-hint';
-    let t = '已填入「' + (p.label || key) + '」预设，点保存生效。';
+    let t = '已填入「' + (p.label || key) + '」的端点与 key 变量名；'
+      + '模型名请自行填写（留空保存 = 用该家免费默认）。';
     if (key === 'ollama') {
       t += '本地 Ollama 不校验 key，但需设一个非空环境变量（如 GT7_COACH_LLM_KEY=local）作占位。';
     }

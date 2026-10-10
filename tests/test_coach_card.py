@@ -299,6 +299,16 @@ class TestCloudModelWiring:
         assert "'cp-hint' + (coachCloud.model_warning ? ' warn' : '')" in blk
         assert "#coPanel .cp-hint.warn" in page
 
+    def test_preset_does_not_prefill_the_model(self, page):
+        """🔴 模型名不做预设（2026-10-10 用户要求）：applyCloudPreset 只填
+        端点与 key 变量名，模型名让用户自己写 —— 预设里的 model 只作为
+        留空时的服务端免费默认，不能从 UI 流出去变成显式覆盖。"""
+        blk = page[page.index("function applyCloudPreset("):]
+        blk = blk[:blk.index("\nfunction ") if "\nfunction " in blk else 1200]
+        assert "inp.value" not in blk, "预设不得回填模型名输入框"
+        assert "p.model" not in blk, "预设的 model 值不得流进 UI"
+        assert "自行填写" in blk, "提示语要说清模型名要用户自己填"
+
     def test_enter_key_saves(self, page):
         blk = page[page.index("(function initCoachCard(){"):]
         assert "ev.target.id === 'coModelInput'" in blk
