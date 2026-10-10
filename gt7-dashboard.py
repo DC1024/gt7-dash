@@ -7503,11 +7503,16 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   flex-shrink:0; margin:0; }
 #coachDot.on { background:var(--ok); box-shadow:0 0 0 3px rgba(63,185,80,.18); }
 #coachDot.off { background:var(--warn); }
-#coachMute { border:1px solid var(--warn); background:transparent;
-  color:var(--warn); border-radius:6px; padding:4px 10px; cursor:pointer;
+/* #C 复审（用户反馈"不知道要手动点开"）：关闭态改成**实心橙红 + 呼吸闪烁**
+   ——一眼就知道"这个按钮在等我一脚"。点开后回落低调描边态，不再闪。 */
+#coachMute { border:1px solid var(--warn); background:var(--warn);
+  color:#fff; border-radius:6px; padding:4px 10px; cursor:pointer;
   font-family:inherit; font-size:12px; letter-spacing:.3px;
-  text-transform:none; font-weight:500; }
-#coachMute.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
+  text-transform:none; font-weight:700;
+  animation:coachMuteHint 1.6s ease-in-out infinite; }
+#coachMute.on { border-color:rgba(var(--accent-rgb),.5); background:transparent;
+  color:var(--accent); font-weight:500; animation:none; }
+@keyframes coachMuteHint { 50% { opacity:.55; } }
 /* 播报内容面板：与 #coachMute（全局"要不要出声"）分工不同 —— 它管
    "**哪些内容**出声"。两者是「与」关系：语音关着时，勾选多少都不会出声。 */
 #coachPanelBtn { border:1px solid var(--line); background:transparent;
@@ -8013,7 +8018,7 @@ th { color:var(--muted); font-weight:500; }
         <span id="coachDot" title="连接状态"></span>
         <span class="cspacer"></span>
         <button id="coachPanelBtn" title="播报内容开关 + 云措辞模型（用哪个模型润色）">播报设置</button>
-        <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">🔇 语音：关</button>
+        <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">🔇 点我开语音</button>
       </h2>
       <div class="coach-row"><span>参考圈</span><b id="coRef">--</b></div>
       <div class="coach-row"><span>本圈位置</span><b id="coS">--</b></div>
@@ -9233,11 +9238,13 @@ function poll() {
     //    否则主数据明明在动、状态栏却红着「服务无响应」，车手会以为坏了。
     .then(d => { _noRespStreak = 0;
       try { render(d); } catch (e) { console.error('render 异常（非服务断流）:', e); } })
-    // 🔴 偶发抖动（一次 fetch 失败 / JSON 解析卡顿）不该立刻判死。
-    //    连续 ~300ms（3 次 100Hz 轮询）拉不到才红「服务无响应」。
+    // 🔴 偶发抖动（一次 fetch 失败 / JSON 解析卡顿 / 服务在算重活短时无响应）
+    //    不该立刻判死。#5 复审：3 次（300ms）太敏感 —— 用户实测"数据明明在动，
+    //    状态栏却闪『服务无响应』"。提到 10 次（~1s）：真断了 1 秒内必红，
+    //    假抖动基本滤净。
     .catch(() => {
       _noRespStreak++;
-      if (_noRespStreak >= 3) {
+      if (_noRespStreak >= 10) {
         $('dot').className = 'dot off';
         $('status').textContent = '服务无响应';
       }
@@ -9809,7 +9816,7 @@ function pollCoach(){
   } else {
       btn.onclick = function(){
         coachSpeakOn = !coachSpeakOn;
-        btn.textContent = coachSpeakOn ? '🔈 语音：开' : '🔇 语音：关';
+        btn.textContent = coachSpeakOn ? '🔊 语音：开' : '🔇 点我开语音';
         btn.className = coachSpeakOn ? 'on' : '';
         // 顺便给个即时反馈（也确认音色/音量是通的）
         if (coachSpeakOn) coachSay('语音已开启');
