@@ -248,7 +248,7 @@ class TestCloudModelWiring:
         """上面管「说哪些」、下面管「用哪个模型说」—— 分节是为了不让人
         以为模型名也是个播报开关。"""
         assert ">播报内容<" in page
-        assert ">云措辞模型<" in page
+        assert ">云措辞模型（#H）<" in page
         assert 'id="coGroups"' in page, "分组行要能单独就地更新"
 
     def test_shell_is_built_once(self, page):
@@ -263,11 +263,15 @@ class TestCloudModelWiring:
         blk = page[page.index("function saveCoachModel("):][:900]
         assert "method: 'POST'" in blk, "只读不改 = 填了没用"
 
-    def test_save_sends_only_the_model(self, page):
-        """🔴 只发 model。明文 key 绝不进配置文件，也不该从这个框流出去。"""
-        blk = page[page.index("function saveCoachModel("):][:900]
-        assert "body: JSON.stringify({model: model})" in blk
-        assert "api_key" not in blk
+    def test_save_sends_the_three_compat_boxes(self, page):
+        """#H：三框（model / base_url / api_key_env）一次 POST。
+        红线不变：没有明文 key 字段 —— key 框收的是**环境变量名**，
+        明文 key 既不进配置文件，也不该从这个框流出去。"""
+        blk = page[page.index("function saveCoachModel("):][:1100]
+        assert "body: JSON.stringify(bodyData)" in blk
+        assert "base_url" in blk and "api_key_env" in blk
+        assert "api_key:" not in blk, "只允许 api_key_env（变量名），不允许明文 key"
+        assert "sk-" not in blk
 
     def test_save_uses_two_arg_then(self, page):
         """单参数 .catch 会把渲染异常当成"保存失败"，报一个和真实原因无关的错。"""
@@ -291,7 +295,7 @@ class TestCloudModelWiring:
         assert "model_warning" in blk
 
     def test_warning_uses_the_warn_colour(self, page):
-        blk = page[page.index("function renderCoachCloud("):][:1200]
+        blk = page[page.index("function renderCoachCloud("):][:1800]
         assert "'cp-hint' + (coachCloud.model_warning ? ' warn' : '')" in blk
         assert "#coPanel .cp-hint.warn" in page
 

@@ -9328,10 +9328,22 @@ function coachPanelShellHtml(rows){
     + '<div id="coGroups">' + rows + '</div>'
     + '<div class="cp-hint">勾选 = 播报，取消 = 不说。'
     + '「安全告警」不建议关闭。改动立即生效。</div>'
-    + '<div class="cp-sec">云措辞模型</div>'
+    + '<div class="cp-sec">云措辞模型（#H）</div>'
+    + '<div class="cm-row">'
+    + '<select id="coCloudPreset" title="选服务商一键填入三框，填完点保存；仍可手改任意一框">'
+    + '<option value="">— 服务商预设（一键填入）—</option>'
+    + '</select></div>'
+    + '<div class="cm-row">'
+    + '<input id="coBaseUrlInput" type="text" spellcheck="false" '
+    + 'placeholder="base_url（OpenAI 兼容端点）">'
+    + '</div>'
+    + '<div class="cm-row">'
+    + '<input id="coKeyEnvInput" type="text" spellcheck="false" '
+    + 'placeholder="API Key 环境变量名（不是 key 本体！）">'
+    + '</div>'
     + '<div class="cm-row">'
     + '<input id="coModelInput" type="text" spellcheck="false" '
-    + 'placeholder="留空 = 用厂商预设">'
+    + 'placeholder="模型名（留空 = 用厂商预设)">'
     + '<button id="coModelSave" title="写入 cloud.json，立即生效">保存</button>'
     + '</div>'
     + '<div class="cp-hint" id="coModelMsg">加载中…</div>'
@@ -9394,24 +9406,35 @@ function loadCoachCloud(silent){
       if (msg) { msg.textContent = '当前教练不支持查看云模型（需要新版教练服务端）'; }
       const inp = $('coModelInput');
       if (inp) inp.disabled = true;
+      const bu = $('coBaseUrlInput'), ke = $('coKeyEnvInput');
+      if (bu) bu.disabled = true;
+      if (ke) ke.disabled = true;
     });
 }
 
 function renderCoachCloud(d){
   coachCloud = d || {};
   const msg = $('coModelMsg'), inp = $('coModelInput');
+  const bu = $('coBaseUrlInput'), ke = $('coKeyEnvInput');
   if (!msg || !inp) return;
-  inp.disabled = false;
+  inp.disabled = false; if (bu) bu.disabled = false; if (ke) ke.disabled = false;
   // 🔴 只在输入框**没被编辑**时才回填 —— 面板开着时每 ~3s 刷一次，
   //    无条件回填会把用户正打的字冲掉。
   if (document.activeElement !== inp) {
     inp.value = coachCloud.model_from_user ? (coachCloud.model || '') : '';
   }
+  // #H：base_url / api_key_env 同样只在没被编辑时回填。
+  //     key 框回填的是**环境变量名**（明文 key 从不回传 —— 服务端根本没有）。
+  if (bu && document.activeElement !== bu) bu.value = coachCloud.base_url || '';
+  if (ke && document.activeElement !== ke) ke.value = coachCloud.api_key_env || '';
   const who = coachCloud.model_from_user ? '你填的' : '厂商预设';
   let txt = coachCloud.enabled
     ? ('当前：' + (coachCloud.model || '（无）') + '（' + who + '）'
        + (coachCloud.model_is_free ? ' · 免费额度内' : ''))
     : '云措辞未启用（只用本地模板，零外呼）';
+  if (coachCloud.has_key === false && coachCloud.enabled) {
+    txt += ' · 环境变量 ' + (coachCloud.api_key_env || '?') + ' 未设置，云调用会回落模板';
+  }
   if (coachCloud.model_warning) { txt += ' ⚠ ' + coachCloud.model_warning; }
   msg.textContent = txt;
   msg.className = 'cp-hint' + (coachCloud.model_warning ? ' warn' : '');
@@ -9419,14 +9442,20 @@ function renderCoachCloud(d){
 
 function saveCoachModel(){
   const inp = $('coModelInput'), msg = $('coModelMsg');
+  const bu = $('coBaseUrlInput'), ke = $('coKeyEnvInput');
   if (!inp || !msg) return;
   const model = (inp.value || '').trim();
+  const base = bu ? (bu.value || '').trim() : '';
+  const envName = ke ? (ke.value || '').trim() : '';
   msg.className = 'cp-hint';
   msg.textContent = '保存中…';
+  // 🔴 #H 三框一次 POST。key 框填的是**环境变量名**——真 key 待在环境变量里，
+  //    服务端对明文 key 会直接 400 拒收，这里不用重复校验。
+  const bodyData = {model: model, base_url: base, api_key_env: envName};
   fetch(coachUrl + '/api/v1/coach/cloud', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({model: model}),
+    body: JSON.stringify(bodyData),
   })
     .then(function(r){
       if (r.ok) return r.json();
@@ -9470,6 +9499,19 @@ function loadCoachSlip(silent){
 }
 
 function renderCoachSlip(d){
+  // #H 顺手搭车：/config 里带了 cloud_presets，首次在这里把服务商预设
+  //     下拉填上（只填一次，之后不重写 —— 避免冲掉用户正展开的选项）。
+  const cp = $('coCloudPreset');
+  if (d.cloud_presets) coachCloudPresets = d.cloud_presets;
+  if (cp && cp.options.length <= 1 && d.cloud_presets) {
+    Object.keys(d.cloud_presets).forEach(function(k){
+      const p = d.cloud_presets[k];
+      const opt = document.createElement('option');
+      opt.value = k;
+      opt.textContent = p.label || k;
+      cp.appendChild(opt);
+    });
+  }
   const sel = $('coSlipPreset'), sl = $('coSlipSlider'),
         val = $('coSlipVal'), msg = $('coSlipMsg');
   if (!sel || !sl) return;
@@ -9546,6 +9588,30 @@ function presetLabel(v){
        : v === 'lenient' ? '宽容（漂移/拉力/泥地）'
        : '标准（赛道日）';
 }
+
+// #H：选了服务商预设 → 一键填入三框（base_url / key 环境变量名 / 模型名）。
+// 只填框**不保存** —— 用户看清三框内容再点保存，避免"手滑选错立刻生效"。
+let coachCloudPresets = null;   // renderCoachSlip 从 /config 抓下来存一份给 applyCloudPreset 用
+function applyCloudPreset(key){
+  const cp = $('coCloudPreset'), bu = $('coBaseUrlInput'),
+        ke = $('coKeyEnvInput'), inp = $('coModelInput'),
+        msg = $('coModelMsg');
+  if (!cp || !key) return;
+  const p = (coachCloudPresets || {})[key];
+  if (!p) return;
+  if (bu) bu.value = p.base_url || '';
+  if (ke) ke.value = p.api_key_env || '';
+  if (inp) inp.value = p.model || '';
+  if (msg) {
+    msg.className = 'cp-hint';
+    let t = '已填入「' + (p.label || key) + '」预设，点保存生效。';
+    if (key === 'ollama') {
+      t += '本地 Ollama 不校验 key，但需设一个非空环境变量（如 GT7_COACH_LLM_KEY=local）作占位。';
+    }
+    msg.textContent = t;
+  }
+}
+
 
 // 面板开着时搭主轮询的顺风车，每 ~3 s 刷一次（只为更新"最近播报条数"）。
 // 主轮询 200ms 一次 → 15 次 ≈ 3 s。
@@ -9702,8 +9768,10 @@ function pollCoach(){
   $('coPanel').addEventListener('change', function(ev){
     const cb = ev.target;
     if (!cb || cb.tagName !== 'INPUT') {
-      // 下拉框（SELECT）的 change 也走这里：选了打滑预设就保存
+      // 下拉框（SELECT）的 change 也走这里：选了打滑预设就保存；
+      // 选了云服务商预设就一键填入三框（#H，只填不存）
       if (cb && cb.id === 'coSlipPreset') saveCoachSlipPreset();
+      if (cb && cb.id === 'coCloudPreset') applyCloudPreset(cb.value);
       return;
     }
     if (cb.id === 'coSlipSlider') { saveCoachSlipThreshold(); return; }
