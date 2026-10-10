@@ -231,13 +231,14 @@ class TestBroadcastPanelWiring:
 
 
 class TestCloudModelWiring:
-    """云措辞模型的填写入口（用户自己填模型名）在实时页里的接线。
+    """云措辞模型的填写入口（玩家自己填模型名）在实时页里的接线。
 
-    需求背景（2026-10-09）：用户给了百炼控制台的免费额度导出表，要求
-    「不要用到付费模型避免用户被收费」，并让**模型名由用户自己填**。
+    需求背景（2026-10-10 用户要求）：**没有任何预设模型，也不显示任何
+    「免费额度」标注** —— 免费承诺会被时间打脸（今天免费、明天可能收费
+    或下架）。模型名玩家自己填，留空 = 云措辞不可用。
     真值在教练服务端的 cloud.json（`/api/v1/coach/cloud`）——
     这里守的是：入口在、只发 model（绝不发 key）、本地不存副本、
-    非免费模型的警告能显示出来、以及**用户正在打字时不被周期刷新冲掉**。
+    以及**玩家正在打字时不被周期刷新冲掉**。
     """
 
     def test_input_and_button_present(self, page):
@@ -275,7 +276,7 @@ class TestCloudModelWiring:
 
     def test_save_uses_two_arg_then(self, page):
         """单参数 .catch 会把渲染异常当成"保存失败"，报一个和真实原因无关的错。"""
-        blk = page[page.index("function saveCoachModel("):][:1400]
+        blk = page[page.index("function saveCoachModel("):][:2000]
         assert ".then(function(d){" in blk and "}, function(e){" in blk
 
     def test_input_is_not_overwritten_while_typing(self, page):
@@ -283,31 +284,37 @@ class TestCloudModelWiring:
         blk = page[page.index("function renderCoachCloud("):][:900]
         assert "document.activeElement !== inp" in blk
 
-    def test_input_is_an_override_not_a_mirror(self, page):
-        """输入框是**覆盖**语义：用厂商预设时必须回空串 ——
-        把预设名填进去会让它在下次保存时变成一次显式覆盖。"""
+    def test_input_mirrors_the_user_model(self, page):
+        """回填的就是玩家填的那个模型名（没有预设模型可"覆盖"）。"""
         blk = page[page.index("function renderCoachCloud("):][:900]
-        assert "coachCloud.model_from_user ? (coachCloud.model || '') : ''" in blk
+        assert "inp.value = coachCloud.model || '';" in blk
 
-    def test_free_status_is_shown(self, page):
+    def test_no_free_labels_at_all(self, page):
+        """🔴 2026-10-10：状态里**不许有**任何「免费额度 / 厂商预设」标注
+        —— 不做会被时间打脸的承诺；没填模型名就明说云措辞不可用。"""
         blk = page[page.index("function renderCoachCloud("):][:1200]
-        assert "免费额度内" in blk
-        assert "model_warning" in blk
+        assert "免费额度内" not in blk
+        assert "厂商预设" not in blk
+        for gone in ("model_from_user", "model_is_free", "model_warning",
+                     "model_free"):
+            assert gone not in blk, gone
+        assert "未填写模型名，云措辞不可用" in blk
 
-    def test_warning_uses_the_warn_colour(self, page):
+    def test_warn_colour_marks_missing_model(self, page):
+        """云已启用但没填模型名 → 黄字提醒。"""
         blk = page[page.index("function renderCoachCloud("):][:1800]
-        assert "'cp-hint' + (coachCloud.model_warning ? ' warn' : '')" in blk
+        assert "'cp-hint' + (coachCloud.enabled && !coachCloud.model ? ' warn' : '')" in blk
         assert "#coPanel .cp-hint.warn" in page
 
     def test_preset_does_not_prefill_the_model(self, page):
         """🔴 模型名不做预设（2026-10-10 用户要求）：applyCloudPreset 只填
-        端点与 key 变量名，模型名让用户自己写 —— 预设里的 model 只作为
-        留空时的服务端免费默认，不能从 UI 流出去变成显式覆盖。"""
+        端点与 key 变量名，模型名必须玩家自己填 —— 服务端也没有任何
+        默认模型可兜底，留空 = 云措辞不可用。"""
         blk = page[page.index("function applyCloudPreset("):]
         blk = blk[:blk.index("\nfunction ") if "\nfunction " in blk else 1200]
         assert "inp.value" not in blk, "预设不得回填模型名输入框"
         assert "p.model" not in blk, "预设的 model 值不得流进 UI"
-        assert "自行填写" in blk, "提示语要说清模型名要用户自己填"
+        assert "自行填写" in blk, "提示语要说清模型名要玩家自己填"
 
     def test_enter_key_saves(self, page):
         blk = page[page.index("(function initCoachCard(){"):]

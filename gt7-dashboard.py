@@ -7557,7 +7557,7 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   padding:4px 10px; cursor:pointer; font-family:inherit; font-size:11.5px; }
 #coPanel .cm-row button:hover { border-color:rgba(var(--accent-rgb),.5);
   color:var(--accent); }
-/* 非免费模型的提示：必须显眼 —— 这条是防「静默扣费」的唯一提示 */
+/* 「未填模型名但云已启用」的提示必须显眼 */
 #coPanel .cp-hint.warn { color:var(--warn); }
 .coach-row { display:flex; justify-content:space-between; font-size:13px;
   padding:5px 0; border-bottom:1px solid var(--line); }
@@ -9343,8 +9343,8 @@ function coachPanelRowHtml(g){
 }
 
 // 抽屉骨架。分两节：① 播报内容（说哪些）② 云措辞模型（用哪个模型说）。
-// 输入框是**覆盖**语义：留空 = 用厂商预设。所以回填时必须回
-// `model_from_user ? model : ''` —— 把预设名填进去会把它变成一次显式覆盖。
+// 🔴 2026-10-10：没有任何预设模型 —— 模型名必须玩家自己填（必填），
+//    留空 = 云措辞不可用（服务端回落本地模板）。
 function coachPanelShellHtml(rows){
   return '<div class="cp-sec">播报内容</div>'
     + '<div id="coGroups">' + rows + '</div>'
@@ -9365,7 +9365,7 @@ function coachPanelShellHtml(rows){
     + '</div>'
     + '<div class="cm-row">'
     + '<input id="coModelInput" type="text" spellcheck="false" '
-    + 'placeholder="模型名（自行填写；留空 = 该家免费默认)">'
+    + 'placeholder="模型名（必填，自行填写；无任何预设）">'
     + '<button id="coModelSave" title="写入 cloud.json，立即生效">保存</button>'
     + '</div>'
     + '<div class="cp-hint" id="coModelMsg">加载中…</div>'
@@ -9445,13 +9445,13 @@ function saveCoachSub(id, on){
     }, function(){ loadCoachPanel(true); });
 }
 
-// ---------- 云措辞模型（用户自己填模型名）----------
+// ---------- 云措辞模型（玩家自己填模型名）----------
 // 🔴 真值在教练服务端的 cloud.json（`/api/v1/coach/cloud`）。这里只负责
-//    「显示现在用的是哪个」+「把用户填的名字 POST 回去」，**本地不存**。
+//    「显示现在用的是哪个」+「把玩家填的名字 POST 回去」，**本地不存**。
 //
-// 为什么卡片里要有这个入口：教练默认挑的是**免费额度内**的模型，但免费
-// 名单会随活动和到期日变化；用户想换一个（或额度用完了）时，不该被迫去
-// vim 一个藏在容器/服务器里的 json。改完立即生效，不用重启。
+// 2026-10-10：**没有任何预设模型，也不显示任何「免费额度」标注** ——
+// 免费承诺会被时间打脸（今天免费、明天可能收费或下架）。模型名玩家
+// 自己填，计费情况自己在厂商控制台确认。
 let coachCloud = null;      // 服务端返回的最后一版云状态
 
 function loadCoachCloud(silent){
@@ -9482,23 +9482,24 @@ function renderCoachCloud(d){
   // 🔴 只在输入框**没被编辑**时才回填 —— 面板开着时每 ~3s 刷一次，
   //    无条件回填会把用户正打的字冲掉。
   if (document.activeElement !== inp) {
-    inp.value = coachCloud.model_from_user ? (coachCloud.model || '') : '';
+    inp.value = coachCloud.model || '';
   }
   // #H：base_url / api_key_env 同样只在没被编辑时回填。
   //     key 框回填的是**环境变量名**（明文 key 从不回传 —— 服务端根本没有）。
   if (bu && document.activeElement !== bu) bu.value = coachCloud.base_url || '';
   if (ke && document.activeElement !== ke) ke.value = coachCloud.api_key_env || '';
-  const who = coachCloud.model_from_user ? '你填的' : '厂商预设';
+  // 🔴 2026-10-10：只显示玩家填的模型名本身；不做任何免费/预设置信度
+  //    标注。没填就明说云措辞不可用。
   let txt = coachCloud.enabled
-    ? ('当前：' + (coachCloud.model || '（无）') + '（' + who + '）'
-       + (coachCloud.model_is_free ? ' · 免费额度内' : ''))
+    ? (coachCloud.model
+        ? ('当前：' + coachCloud.model)
+        : '当前：未填写模型名，云措辞不可用（请自行填写）')
     : '云措辞未启用（只用本地模板，零外呼）';
   if (coachCloud.has_key === false && coachCloud.enabled) {
     txt += ' · 环境变量 ' + (coachCloud.api_key_env || '?') + ' 未设置，云调用会回落模板';
   }
-  if (coachCloud.model_warning) { txt += ' ⚠ ' + coachCloud.model_warning; }
   msg.textContent = txt;
-  msg.className = 'cp-hint' + (coachCloud.model_warning ? ' warn' : '');
+  msg.className = 'cp-hint' + (coachCloud.enabled && !coachCloud.model ? ' warn' : '');
 }
 
 function saveCoachModel(){
@@ -9529,10 +9530,14 @@ function saveCoachModel(){
     //    "保存失败"，于是报一个和真实原因无关的错 —— 与 pollCoach 同一个坑。
     .then(function(d){
       renderCoachCloud(d.cloud);
-      // 有警告就让警告留着（它比"已保存"重要），没警告才回一句确认
-      if (!coachCloud.model_warning) {
-        msg.textContent = '已保存：' + (coachCloud.model || '（厂商预设）')
+      // 没填模型名时给一句黄字提醒（云措辞实际不可用）
+      if (coachCloud.model) {
+        msg.textContent = '已保存：' + coachCloud.model
           + '。下一句播报就按这个模型走。';
+      } else {
+        msg.className = 'cp-hint warn';
+        msg.textContent = '已保存，但**未填写模型名** —— 云措辞不可用，'
+          + '请自行填写。';
       }
     }, function(e){
       msg.className = 'cp-hint warn';
@@ -9662,12 +9667,12 @@ function applyCloudPreset(key){
   if (bu) bu.value = p.base_url || '';
   if (ke) ke.value = p.api_key_env || '';
   // 🔴 模型名**不预设**（2026-10-10 用户要求）：预设只填端点与 key 变量名，
-  //    模型名让用户自己写 —— 预设里的 model 只作为「留空时的服务端默认」，
-  //    不该从 UI 流出去变成一次显式覆盖。留空保存 = 回到该家免费默认。
+  //    模型名必须玩家自己填 —— 服务端也没有任何默认模型可兜底，
+  //    留空保存 = 云措辞不可用（回落本地模板）。
   if (msg) {
     msg.className = 'cp-hint';
     let t = '已填入「' + (p.label || key) + '」的端点与 key 变量名；'
-      + '模型名请自行填写（留空保存 = 用该家免费默认）。';
+      + '模型名必填，请自行填写（无任何预设模型）。';
     if (key === 'ollama') {
       t += '本地 Ollama 不校验 key，但需设一个非空环境变量（如 GT7_COACH_LLM_KEY=local）作占位。';
     }
