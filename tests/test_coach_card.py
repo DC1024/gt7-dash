@@ -330,3 +330,30 @@ class TestCloudModelWiring:
         blk = page[page.index("function loadCoachCloud("):][:900]
         assert "不支持查看云模型" in blk
         assert "inp.disabled = true" in blk
+
+
+class TestRuleSubToggles:
+    """#G：分组下的细分开关（出界/打滑/刹车…各自独立开关）在抽屉里的接线。"""
+
+    def test_sub_rows_rendered(self, page):
+        assert "cp-sub" in page
+        assert 'data-sub="' in page
+        assert "function saveCoachSub(" in page
+
+    def test_sub_toggle_posts_rules_patch(self, page):
+        """子开关真值在教练端 RuleConfig —— POST 到 /config 的 rules 节。"""
+        blk = page[page.index("function saveCoachSub("):][:1300]
+        assert "/api/v1/coach/config" in blk
+        assert "JSON.stringify({rules: patch})" in blk
+        # 乐观更新 + 失败回读（与 setCoachMuted 同一套纪律）
+        assert "renderCoachPanel({groups: coachPanelGroups})" in blk
+        assert "loadCoachPanel(true)" in blk
+
+    def test_sub_checkbox_delegated(self, page):
+        blk = page[page.index("(function initCoachCard(){"):]
+        assert "closest('.cp-sub')" in blk
+
+    def test_sub_rows_updated_in_place(self, page):
+        """周期刷新就地改子开关，不重写骨架（否则冲掉用户正点的复选框）。"""
+        blk = page[page.index("function renderCoachPanel("):][:1600]
+        assert "cp-sub[data-sub=" in blk

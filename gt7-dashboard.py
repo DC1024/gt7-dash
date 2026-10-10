@@ -7524,6 +7524,14 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 #coPanel .cp-row label { flex:1; cursor:pointer; }
 #coPanel .cp-row.off label { color:var(--muted); }
 #coPanel .cp-desc { color:var(--muted); font-size:11px; }
+/* #G：分组下的细分开关行 —— 缩进+小一号，视觉上明确"从属于上一行分组" */
+#coPanel .cp-sub { display:flex; align-items:center; gap:7px; font-size:11.5px;
+  padding:2px 0 2px 21px; color:var(--muted); }
+#coPanel .cp-sub input { width:12px; height:12px; flex-shrink:0; cursor:pointer;
+  accent-color:var(--accent); margin:0; }
+#coPanel .cp-sub label { flex:1; cursor:pointer; }
+#coPanel .cp-sub.off label { color:var(--muted); opacity:.55;
+  text-decoration:line-through; }
 #coPanel .cp-n { font-family:var(--mono); font-size:11px; color:var(--muted);
   min-width:18px; text-align:right; }
 #coPanel .cp-hint { color:var(--muted); font-size:11px; margin-top:6px;
@@ -9317,7 +9325,14 @@ function coachPanelRowHtml(g){
     + '<input type="checkbox" id="cp-' + g.id + '"' + (on ? ' checked' : '')
     + '><label for="cp-' + g.id + '">' + g.label
     + '<span class="cp-desc"> · ' + (g.desc || '') + '</span></label>'
-    + '<span class="cp-n" title="最近播报条数">' + (g.recent || 0) + '</span></div>';
+    + '<span class="cp-n" title="最近播报条数">' + (g.recent || 0) + '</span></div>'
+    // #G：分组下的细分开关（id 直接用教练端 RuleConfig 字段名）
+    + (g.subs || []).map(function(s){
+        return '<div class="cp-sub' + (s.on ? '' : ' off')
+          + '" data-sub="' + s.id + '" data-group="' + g.id + '">'
+          + '<input type="checkbox" id="cs-' + s.id + '"' + (s.on ? ' checked' : '')
+          + '><label for="cs-' + s.id + '">' + (s.label || s.id) + '</label></div>';
+      }).join('');
 }
 
 // 抽屉骨架。分两节：① 播报内容（说哪些）② 云措辞模型（用哪个模型说）。
@@ -9381,7 +9396,46 @@ function renderCoachPanel(d){
     if (cb && cb.checked === g.muted) cb.checked = !g.muted;
     const n = row.querySelector('.cp-n');
     if (n) n.textContent = String(g.recent || 0);
+    // #G：细分开关就地更新（同样只在状态真变了才动，避免抢用户刚点的）
+    (g.subs || []).forEach(function(s){
+      const sub = box.querySelector('.cp-sub[data-sub="' + s.id + '"]');
+      if (!sub) return;
+      sub.className = 'cp-sub' + (s.on ? '' : ' off');
+      const scb = sub.querySelector('input');
+      if (scb && scb.checked !== s.on) scb.checked = s.on;
+    });
   });
+}
+
+// #G：切一个细分开关。乐观更新（勾选立刻跟手），POST 到 /config 的 rules
+// 节（布尔白名单）—— 子开关的真值在教练服务端 RuleConfig，不在本地。
+function saveCoachSub(id, on){
+  const patch = {};
+  patch[id] = on;
+  coachPanelGroups.forEach(function(g){
+    (g.subs || []).forEach(function(s){ if (s.id === id) s.on = on; });
+  });
+  renderCoachPanel({groups: coachPanelGroups});
+  fetch(coachUrl + '/api/v1/coach/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rules: patch}),
+  })
+    .then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }, function(){ throw new Error('net'); })
+    // ⚠️ 双参数 then（与 setCoachMuted 同一个坑）：失败时回读服务端，
+    //    把乐观更新撤回去；成功时服务端回的 config 本来就是真值。
+    .then(function(d){
+      const rules = (d.config && d.config.rules) || {};
+      coachPanelGroups.forEach(function(g){
+        (g.subs || []).forEach(function(s){
+          if (s.id in rules) s.on = !!rules[s.id];
+        });
+      });
+      renderCoachPanel({groups: coachPanelGroups});
+    }, function(){ loadCoachPanel(true); });
 }
 
 // ---------- 云措辞模型（用户自己填模型名）----------
@@ -9775,6 +9829,9 @@ function pollCoach(){
       return;
     }
     if (cb.id === 'coSlipSlider') { saveCoachSlipThreshold(); return; }
+    // #G：细分开关在 .cp-sub 里（与 .cp-row 平级，不会误入分组分支）
+    const sub = cb.closest ? cb.closest('.cp-sub') : null;
+    if (sub) { saveCoachSub(sub.getAttribute('data-sub'), cb.checked); return; }
     const row = cb.closest ? cb.closest('.cp-row') : null;
     if (row) setCoachMuted(row.getAttribute('data-id'), !cb.checked);
   });
