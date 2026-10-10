@@ -7514,13 +7514,15 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
   color:var(--accent); font-weight:500; animation:none; }
 @keyframes coachMuteHint { 50% { opacity:.55; } }
 /* 播报内容面板：与 #coachMute（全局"要不要出声"）分工不同 —— 它管
-   "**哪些内容**出声"。两者是「与」关系：语音关着时，勾选多少都不会出声。 */
-#coachPanelBtn { border:1px solid var(--line); background:transparent;
+   "**哪些内容**出声"。两者是「与」关系：语音关着时，勾选多少都不会出声。
+   #coachHistBtn（播报历史开关）与它同一档样式 —— 头部这几个小按钮必须长一样，
+   否则会出现一个"浏览器默认方框按钮"混在里面。 */
+#coachPanelBtn, #coachHistBtn { border:1px solid var(--line); background:transparent;
   color:var(--muted); border-radius:6px; padding:2px 8px; cursor:pointer;
   font-family:inherit; font-size:11px; letter-spacing:.3px;
   text-transform:none; font-weight:400; }
-#coachPanelBtn:hover { color:var(--text); }
-#coachPanelBtn.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
+#coachPanelBtn:hover, #coachHistBtn:hover { color:var(--text); }
+#coachPanelBtn.on, #coachHistBtn.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
 #coPanel { margin-top:9px; border-top:1px solid var(--line); padding-top:6px; }
 #coPanel .cp-row { display:flex; align-items:center; gap:8px; font-size:12.5px;
   padding:4px 0; }
