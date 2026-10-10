@@ -8018,6 +8018,7 @@ th { color:var(--muted); font-weight:500; }
         <span id="coachDot" title="连接状态"></span>
         <span class="cspacer"></span>
         <button id="coachPanelBtn" title="播报内容开关 + 云措辞模型（用哪个模型润色）">播报设置</button>
+        <button id="coachHistBtn" title="展开/收起播报历史（默认收起：历史会撑高卡片，把下面的「圈速与油量」顶出屏幕）">历史</button>
         <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">🔇 点我开语音</button>
       </h2>
       <div class="coach-row"><span>参考圈</span><b id="coRef">--</b></div>
@@ -8026,7 +8027,7 @@ th { color:var(--muted); font-weight:500; }
       <div class="coach-row"><span>下一个刹车点</span><b id="coBrake">--</b></div>
       <div id="coSay" class="idle">赛道工程师未启动</div>
       <div id="coPanel" hidden></div>
-      <div id="coHist"></div>
+      <div id="coHist" hidden></div>
     </div>
 
     <div class="card" id="c-rpm">
@@ -9308,6 +9309,19 @@ function coachPanelToggle(){
   if (coachPanelOpen) loadCoachPanel(false);
 }
 
+// 播报历史（#coHist）默认**收起**。
+// 🔴 它最长 116px，一旦展开就会把教练卡撑高 ~117px，进而把下面的「圈速与油量」
+//    整张卡往下推 —— 视口 ~850~900px 时，圈速**逐圈列表**正好被顶到可视区之外，
+//    用户看到的就是「教练一连接，圈速记录就不显示了；断开又回来了」（浏览器实测
+//    复现）。默认收起后，教练卡的连接态/未连接态高度一致，**不产生任何位移**；
+//    想看历史点一下「历史」按钮即可。
+let coachHistOpen = false;
+function coachHistToggle(){
+  coachHistOpen = !coachHistOpen;
+  $('coHist').hidden = !coachHistOpen;
+  $('coachHistBtn').className = coachHistOpen ? 'on' : '';
+}
+
 // silent=true 用于面板开着时的周期刷新：失败就静静等下一次，
 // 别因为一次抖动把面板收起来。
 function loadCoachPanel(silent){
@@ -9833,6 +9847,7 @@ function pollCoach(){
   // 播报内容面板：按钮开合 + 勾选改动（事件委托 —— 行是用 innerHTML
   // 生成的，逐行挂监听会在每次刷新后全部失效）
   $('coachPanelBtn').onclick = coachPanelToggle;
+  $('coachHistBtn').onclick = coachHistToggle;
   $('coPanel').addEventListener('change', function(ev){
     const cb = ev.target;
     if (!cb || cb.tagName !== 'INPUT') {
