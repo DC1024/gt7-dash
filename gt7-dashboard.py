@@ -8629,9 +8629,16 @@ function render(s) {
   //    所以电车用 isEV 单独放行。
   const canStrategy = (lf.length >= 1 && L.lap != null && L.laps_in_race > 0
     && L.laps_in_race >= L.lap && (isEV || L.gas_capacity > 0));
+  // 🔴 `avg` 必须声明在 if **外层**：下面的「进站窗口」要用它算最晚进站圈。
+  //    它是从 if 块里提上来的 —— 曾经写成块内 `const avg`，于是油车跑完第 1 圈
+  //    （canStrategy 成立）之后，块外那句 `avg > 0` 直接抛
+  //    `ReferenceError: avg is not defined`，render() 从这里**中断** →
+  //    它后面的圈速列表 / 实时曲线 / 行车轨迹 / G-G 图**全部永远停在初始状态**
+  //    （用户看到的就是「跑了好几圈，圈速列表还是空的占位符」）。
+  let avg = 0;
   if (canStrategy) {
     const used = lf.reduce((a, x) => a + Math.max(0, x[1]), 0);
-    const avg = used / lf.length;                       // %或 kWh / 圈
+    avg = used / lf.length;                             // %或 kWh / 圈
     const remain = L.laps_in_race - L.lap + 1;          // 含当前圈
     const projected = avg * remain;
     const margin = L.gas_level - projected;             // 百分点或 kWh
