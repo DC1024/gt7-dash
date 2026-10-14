@@ -8334,6 +8334,8 @@ th { color:var(--muted); font-weight:500; }
           style="font-weight:400;font-size:11px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"
           title="GT7 遥测不下发胎种，只能自己选；选了才有推荐温度与三色着色"></select>
         <span id="tyreTarget" style="font-size:11px;color:var(--muted)"></span>
+        <span id="tyreEditBtn" onclick="toggleTyreWinEdit()" title="编辑该胎种的工作温度窗口"
+          style="cursor:pointer;font-size:12px;opacity:.55">⚙</span>
       </span>
     </h2>
     <div class="wheels">
@@ -8348,6 +8350,18 @@ th { color:var(--muted); font-weight:500; }
       <span>右前 <b id="s1" style="font-family:var(--mono)">--</b></span>
       <span>左后 <b id="s2" style="font-family:var(--mono)">--</b></span>
       <span>右后 <b id="s3" style="font-family:var(--mono)">--</b></span>
+    </div>
+    <div id="tyreWinEdit" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:11.5px;line-height:2">
+      <div style="display:flex;flex-wrap:wrap;gap:5px 10px;align-items:center">
+        <span style="color:var(--muted)">低于</span><input id="twCold" type="number" step="1" min="-50" max="300" style="width:52px;padding:2px 4px;border:1px solid var(--line);border-radius:5px;background:var(--card);color:inherit;font-family:var(--mono)">°C <b style="color:#d9a441">报太凉</b>
+        <span style="color:var(--muted)">工作区间</span><input id="twLo" type="number" step="1" min="-50" max="300" style="width:52px;padding:2px 4px;border:1px solid var(--line);border-radius:5px;background:var(--card);color:inherit;font-family:var(--mono)">~<input id="twHi" type="number" step="1" min="-50" max="300" style="width:52px;padding:2px 4px;border:1px solid var(--line);border-radius:5px;background:var(--card);color:inherit;font-family:var(--mono)">°C
+        <span style="color:var(--muted)">高于</span><input id="twHot" type="number" step="1" min="-50" max="300" style="width:52px;padding:2px 4px;border:1px solid var(--line);border-radius:5px;background:var(--card);color:inherit;font-family:var(--mono)">°C <b style="color:#ff5b6e">报过热</b>
+      </div>
+      <div style="margin-top:6px;display:flex;gap:8px;align-items:center">
+        <button onclick="saveTyreWindow()" style="font-size:11px;padding:3px 10px;border:1px solid var(--accent,var(--line));border-radius:6px;background:transparent;color:var(--accent,var(--fg));cursor:pointer">保存</button>
+        <button onclick="resetTyreWindow()" style="font-size:11px;padding:3px 10px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--muted);cursor:pointer">恢复默认</button>
+        <span id="twMsg" style="color:var(--muted)"></span>
+      </div>
     </div>
     </div>
 
@@ -9894,6 +9908,7 @@ function renderCoachSlip(d){
 //    选了胎种：报实际温度 vs 该胎种窗口 → 到位绿 / 不足黄 / 超出红，
 //              且胎温播报按该窗口走；没选（unknown）→ 不着色、不播报。
 let coachTyreCompounds = null;      // {key: {label, lo, hi, cold, hot}}
+let coachTyreCompoundsDefault = null;  // 出厂默认，给"恢复默认"做对照
 let coachTyreCompound = 'unknown';
 let coachTyreRefreshN = 0;
 
@@ -9912,6 +9927,7 @@ function loadCoachTyre(silent){
 
 function renderCoachTyre(d){
   if (d.tyre_compounds) coachTyreCompounds = d.tyre_compounds;
+  if (d.tyre_compounds_default) coachTyreCompoundsDefault = d.tyre_compounds_default;
   const sel = $('coTyreCpd');
   if (!sel) return;
   // 下拉只填一次（避免重建时冲掉用户正展开的选项）
@@ -9934,6 +9950,83 @@ function renderCoachTyre(d){
   t.textContent = (!w || coachTyreCompound === 'unknown')
     ? '未选胎种（不播报胎温）'
     : ('推荐 ' + w.lo.toFixed(0) + '~' + w.hi.toFixed(0) + '°C');
+  // 🔴 编辑区开着时，切胎种/刷新要同步回填当前胎种的窗口；
+  //    但用户正打字的那个 input 不能覆盖（与滑块同款保护）。
+  const box = $('tyreWinEdit');
+  if (box && box.style.display !== 'none') {
+    const id = document.activeElement && document.activeElement.id || '';
+    if (id.indexOf('tw') !== 0) fillTyreWinEdit();
+  }
+}
+
+// —— 胎温窗口编辑（四轮卡 ⚙）——————————————————————————————————
+// 用户实测某条胎"圈速不衰减的温度带"和出厂默认差十几度很常见，
+// 必须能就地改，且改完落盘（教练重启/重部署不丢）。
+function toggleTyreWinEdit(){
+  const box = $('tyreWinEdit'); if (!box) return;
+  const open = box.style.display === 'none';
+  box.style.display = open ? '' : 'none';
+  if (open) fillTyreWinEdit();
+}
+
+function fillTyreWinEdit(){
+  const box = $('tyreWinEdit'), msg = $('twMsg');
+  if (!box) return;
+  if (!coachTyreCompound || coachTyreCompound === 'unknown'
+      || !coachTyreCompounds || !coachTyreCompounds[coachTyreCompound]) {
+    if (msg) msg.textContent = '请先选择胎种';
+    return;
+  }
+  const w = coachTyreCompounds[coachTyreCompound];
+  $('twCold').value = w.cold; $('twLo').value = w.lo;
+  $('twHi').value = w.hi;   $('twHot').value = w.hot;
+  if (msg) msg.textContent = '';
+}
+
+function _postTyreWindow(body, onOk){
+  const msg = $('twMsg');
+  if (msg) msg.textContent = '保存中…';
+  fetch(coachUrl + '/api/v1/coach/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  })
+    .then(function(r){
+      if (r.ok) return r.json();
+      return r.json().then(function(e){
+        throw new Error(e && e.error ? e.error : ('HTTP ' + r.status));
+      }, function(){ throw new Error('HTTP ' + r.status); });
+    })
+    .then(function(d){
+      if (d.config && d.config.tyre_compounds) {
+        coachTyreCompounds = d.config.tyre_compounds;
+        renderCoachTyre(d.config);   // 刷新推荐温度 + 编辑框（按钮非 input → 会重填）
+      }
+      onOk(d);
+    }, function(e){
+      if (msg) msg.textContent = '保存失败：' + e.message;
+    });
+}
+
+function saveTyreWindow(){
+  const c = coachTyreCompound, msg = $('twMsg');
+  if (!c || c === 'unknown') { if (msg) msg.textContent = '请先选择胎种'; return; }
+  let patch;
+  try {
+    const rd = function(id){ const v = parseFloat($(id).value);
+      if (isNaN(v)) throw new Error('请填写四位温度'); return v; };
+    patch = {cold: rd('twCold'), lo: rd('twLo'), hi: rd('twHi'), hot: rd('twHot')};
+  } catch(e){ if (msg) msg.textContent = e.message; return; }
+  _postTyreWindow({tyre_windows: {[c]: patch}}, function(){
+    if (msg) msg.textContent = '已保存（教练重启仍保留）';
+  });
+}
+
+function resetTyreWindow(){
+  const c = coachTyreCompound, msg = $('twMsg');
+  if (!c || c === 'unknown') { if (msg) msg.textContent = '请先选择胎种'; return; }
+  _postTyreWindow({tyre_windows: {[c]: null}}, function(){
+    if (msg) msg.textContent = '已恢复默认';
+  });
 }
 
 function setTyreCompound(v){
