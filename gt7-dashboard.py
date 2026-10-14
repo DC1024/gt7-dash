@@ -2030,6 +2030,11 @@ def session_track(path: Path) -> dict[str, Any]:
                 if guessed:
                     tr["name"] = guessed["name"]
                     tr["course_id"] = guessed["id"]
+                    # 🔴 打标记：这是**按圈长猜的**，不是用户确认过的。
+                    #    实测反例：Spa 实测 6931m，3% 容差内最近的是
+                    #    Fishermans Ranch(6893m) 而不是 Spa(7004m) —— 圈长相近的
+                    #    不同赛道**会认错**。标记出来，UI 才好提示"自动识别，待确认"。
+                    tr["auto_named"] = True
                     save_tracks(hist, lib)
             return {"track_id": tr["id"], "name": tr["name"],
                     "matched": bool(tr["name"]), "distance": hit.get("dist"),
@@ -2079,6 +2084,8 @@ def session_track(path: Path) -> dict[str, Any]:
         lib["tracks"].append({
             "id": track_id, "name": track_name,
             "course_id": top["id"] if top else None,
+            # 同上：按圈长猜的名字要打标记，UI 才能提示"自动识别，待确认"
+            "auto_named": bool(top),
             "course_candidates": [c["name"] for c in cands[:6]],
             "desc": fp["desc"], "ref_len_m": fp["ref_len_m"],
             "turns_cw": fp["turns_cw"],
@@ -3933,6 +3940,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 tracks = [{
                     "id": t["id"], "name": t.get("name") or "",
                     "ref_len_m": t.get("ref_len_m"),
+                    # 名字是**按圈长猜的**、未经用户确认 → true。
+                    # 消费方据此提示"自动识别，待确认"（圈长相近的不同赛道会认错）。
+                    "auto_named": bool(t.get("auto_named")),
                     "turns_cw": t.get("turns_cw"),
                     "created": t.get("created"),
                     "sessions": cnt.get(t["id"], 0),
@@ -7354,8 +7364,17 @@ def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
     trk = session_track(path)
     if trk.get("track_id") is not None:
         trk_label = _html.escape(trk.get("name") or f"未命名赛道 #{trk['track_id']}")
+        # 🔴 按圈长猜的名字必须**标出来**：圈长相近的不同赛道会认错
+        #    （实测 Spa 6931m 被认成 Fishermans Ranch 6893m）。标了用户才知道
+        #    "这个名字可能是别的赛道，点 ✎ 改"，而不是当作权威信息。
+        if trk.get("auto_named") or trk.get("candidates"):
+            cands = trk.get("candidates") or []
+            more = ("；其他可能：" + " / ".join(cands[1:4])) if len(cands) > 1 else ""
+            trk_label += ('<span style="color:var(--muted);font-size:11px" '
+                          'title="按圈长自动匹配，未经确认' + _html.escape(more)
+                          + '"> · 自动识别</span>')
         trk_title = (f"指纹距离 {trk.get('distance')}" if trk.get("matched")
-                     else "场次较少未匹配到已知赛道；点 ✎ 给它起名")
+                     else "按圈长自动匹配，可能认错；点 ✎ 确认/改名")
         trk_html = (f'{trk_label} '
                     f'<button title="{trk_title}" style="border:1px solid var(--line);'
                     f'background:var(--card);color:inherit;border-radius:6px;'
