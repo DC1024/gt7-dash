@@ -1606,3 +1606,201 @@ def lap_profile(frames: list[dict], lap_no: int = 0, step_m: float = 5.0,
         },
         "warnings": warnings,
     }
+
+
+# ===========================================================================
+# GT7 赛道表（内置）
+# ===========================================================================
+#
+# 🔴 为什么要内置一张表：GT7 协议**不下发赛道名**（jsonl 表头 `circuit` 恒为
+#    null，实测确认），所以"这条赛道叫什么 / 多长 / 几个弯"只能外部给。
+#    表来自社区整理的 ddm999/gt7info → `_data/db/course.csv`
+#    （字段 ID / Name / Length(m) / NumCorners / IsReverse / Category），
+#    这里只保留识别用得到的列，共 122 条。
+#    内置而不是运行时下载：跑在纯内网（PS5 + 本地服务器，无出海）也要能认赛道，
+#    而且这点数据量没必要每次走网络。
+#
+# 匹配策略（两步，成本从低到高）：
+#   1. `course_candidates()` 用**圈长**粗筛（默认 ±3%）——圈长是极强的一维
+#      特征：122 条里通常只剩 2~5 条候选（同一条赛道的多个布局长度相同，
+#      会一起留下，这正好是我们要的"疑似列表"）。
+#   2. 需要定案时再用本文件已有的 `track_fingerprint` 归一化形状比对 ——
+#      它对平移/尺度/旋转/绕行方向都不变，同赛道 ~0.006、不同赛道 ~0.24。
+_COURSE_CSV = """\
+ID,Name,Length,NumCorners,IsReverse,Category
+4,Daytona Tri-Oval,4023,4,0,circuit
+10,Suzuka Circuit,5807,20,0,circuit
+11,High Speed Ring,4345,6,0,original
+16,Fuji International Speedway,4563,16,0,circuit
+41,WeatherTech Raceway Laguna Seca,3602,11,0,circuit
+51,Deep Forest Raceway,4253,18,0,original
+95,Nurburgring Nordschleife,20832,73,0,circuit
+116,Mount Panorama Motor Racing Circuit,6213,23,0,circuit
+119,Brands Hatch Grand Prix Circuit,3946,9,0,circuit
+122,Willow Springs International Raceway: Big Willow,3951,10,0,circuit
+123,Willow Springs International Raceway: Streets of Willow Springs,2675,14,0,circuit
+125,Willow Springs International Raceway: Horse Thief Mile,1624,11,0,circuit
+152,Autodromo de Interlagos,4309,15,0,circuit
+154,Goodwood Motor Circuit,3809,7,0,circuit
+346,Brands Hatch Indy Circuit,1944,5,0,circuit
+347,Nurburgring Nordschleife Tourist Layout,20832,73,0,circuit
+348,Nurburgring 24h,25378,89,0,circuit
+349,Nurburgring GP,5148,17,0,circuit
+351,Tokyo Expressway - Central Clockwise,4405,13,0,city
+353,Fishermans Ranch,6893,40,0,snow_dirt
+354,Northern Isle Speedway,900,4,0,original
+356,Blue Moon Bay Speedway,3200,3,0,original
+357,BB Raceway,1665,5,0,original
+358,Alsace - Village,5423,17,0,original
+361,Tokyo Expressway - East Clockwise,7301,13,0,city
+362,Tokyo Expressway - South Clockwise,5201,17,0,city
+363,Dragon Trail - Seaside,5209,18,0,original
+365,Autodrome Lago Maggiore - Full Course,5809,17,0,original
+372,Colorado Springs - Lake,2990,15,0,snow_dirt
+376,Kyoto Driving Park - Yamagiwa,4912,15,0,original
+439,Alsace - Village Reverse,5423,17,1,original
+440,Kyoto Driving Park - Miyabi,1953,7,0,original
+442,Suzuka Circuit East Course,2243,9,0,circuit
+443,Fishermans Ranch Reverse,6893,40,1,snow_dirt
+444,BB Raceway Reverse,1665,5,1,original
+449,Blue Moon Bay Speedway Reverse,3200,3,1,original
+450,Tokyo Expressway - Central Counterclockwise,4369,14,0,city
+451,Tokyo Expressway - East Counterclockwise,7192,13,0,city
+452,Willow Springs International Raceway: Horse Thief Mile Reverse,1624,11,1,circuit
+453,Sardegna - Windmills,3310,14,0,snow_dirt
+454,24 Heures du Mans Racing Circuit,13629,38,0,circuit
+462,Circuit de Spa-Francorchamps,7004,21,0,circuit
+469,Autodromo Nazionale Monza,5793,11,0,circuit
+470,Red Bull Ring,4318,10,0,circuit
+471,Tsukuba Circuit,2045,8,0,circuit
+598,Willow Springs International Raceway: Streets of Willow Springs Reverse,2675,14,1,circuit
+599,Sardegna - Windmills Reverse,3310,14,1,snow_dirt
+600,Colorado Springs - Lake Reverse,2990,15,1,snow_dirt
+601,Dragon Trail - Seaside Reverse,5209,18,1,original
+602,Autodrome Lago Maggiore - Full Course Reverse,5809,17,1,original
+613,Kyoto Driving Park - Yamagiwa Reverse,4912,15,1,original
+742,Autodromo Nazionale Monza No Chicane,5755,9,0,circuit
+747,Deep Forest Raceway Reverse,4253,18,1,original
+776,Kyoto Driving Park - Yamagiwa+Miyabi,6846,19,0,original
+777,Kyoto Driving Park - Yamagiwa+Miyabi Reverse,6846,19,1,original
+790,Autodrome Lago Maggiore - East End Reverse,2010,8,1,original
+791,Autodrome Lago Maggiore - Centre Reverse,1706,8,1,original
+792,Autodrome Lago Maggiore - West End,2444,10,0,original
+793,Autodrome Lago Maggiore - Centre,1706,8,0,original
+794,Autodrome Lago Maggiore - West End Reverse,2444,10,1,original
+795,Autodrome Lago Maggiore - East End,2010,8,0,original
+819,Blue Moon Bay Speedway - Infield B,2860,5,0,original
+820,Blue Moon Bay Speedway - Infield A,3350,10,0,original
+822,Blue Moon Bay Speedway - Infield A Reverse,3350,10,1,original
+823,Blue Moon Bay Speedway - Infield B Reverse,2860,5,1,original
+825,Circuit de Sainte-Croix - A,9477,19,0,original
+826,Circuit de Sainte-Croix - A Reverse,9477,19,1,original
+827,Circuit de Sainte-Croix - B,7062,14,0,original
+828,Circuit de Sainte-Croix - B Reverse,7062,14,1,original
+829,Circuit de Sainte-Croix - C,10825,24,0,original
+830,Circuit de Sainte-Croix - C Reverse,10825,24,1,original
+837,Fuji International Speedway (Short),4526,14,0,circuit
+838,Sardegna - Road Track - C Reverse,2661,10,1,original
+839,Sardegna - Road Track - B Reverse,3893,13,1,original
+841,Sardegna - Road Track - B,3893,13,0,original
+843,Sardegna - Road Track - C,2661,10,0,original
+846,Red Bull Ring Short Track,2336,6,0,circuit
+847,Dragon Trail - Gardens,4352,17,0,original
+853,Dragon Trail - Gardens Reverse,4352,17,1,original
+854,24 Heures du Mans Racing Circuit No Chicane,13567,32,0,circuit
+874,Circuit de Barcelona-Catalunya Grand Prix Layout,4655,16,0,circuit
+896,Autopolis International Racing Course,4674,18,0,circuit
+898,Autopolis International Racing Course - Short Course,3022,11,0,circuit
+915,Tokyo Expressway - South Counterclockwise,6560,16,0,city
+921,Sardegna - Road Track - A,5113,15,0,original
+922,Sardegna - Road Track - A Reverse,5113,15,1,original
+1024,Trial Mountain Circuit,5434,15,0,original
+1034,Trial Mountain Circuit - Reverse,5434,15,1,original
+1069,High Speed Ring Reverse,4345,6,1,original
+1163,Daytona Road Course,5729,12,0,circuit
+1224,Alsace - Test Course,2118,7,0,original
+1225,Alsace - Test Course Reverse,2118,7,1,original
+1226,Autodrome Lago Maggiore - East,3643,11,0,original
+1231,Autodrome Lago Maggiore - East Reverse,3643,11,1,original
+1232,Autodrome Lago Maggiore - West,4168,13,0,original
+1233,Autodrome Lago Maggiore - West Reverse,4168,13,1,original
+1260,Special Stage Route X,30283,2,0,original
+1261,Special Stage Route X 400,30283,0,0,original
+1262,Special Stage Route X 1000,30283,0,0,original
+1269,Spa 24h Layout,7004,21,0,circuit
+1240,Watkins Glen Long Course,5423,11,0,circuit
+1264,Watkins Glen Short Course,3942,7,0,circuit
+1249,Circuit de Barcelona-Catalunya GP Layout No Chicane,4730,14,0,circuit
+1250,Circuit de Barcelona-Catalunya National,2977,11,0,circuit
+1265,Circuit de Barcelona-Catalunya Rallycross,1133,11,0,snow_dirt
+1247,Nurburgring Endurance,23864,85,0,circuit
+1248,Nurburgring Sprint,3629,12,0,circuit
+1292,Grand Valley - Highway 1,5099,18,0,circuit
+1293,Grand Valley - Highway 1 Reverse,5099,18,1,circuit
+1299,Grand Valley - South,3076,10,0,circuit
+1300,Grand Valley - South Reverse,3076,10,1,circuit
+1007,Michelin Raceway Road Atlanta,4088,12,0,circuit
+1273,Lake Louise Tri-Oval,3068,3,0,snow_dirt
+1308,Lake Louise Short Track,2577,7,0,snow_dirt
+1309,Lake Louise Long Track,3694,11,0,snow_dirt
+1316,Lake Louise Tri-Oval Reverse,3068,3,1,snow_dirt
+1317,Lake Louise Short Track Reverse,2577,7,1,snow_dirt
+1318,Lake Louise Long Track Reverse,3694,11,1,snow_dirt
+2001,Eiger Nordwand,2436,11,0,original
+2002,Eiger Nordwand Reverse,2436,11,1,original
+2003,Yas Marina Circuit,5281,16,0,circuit
+2004,Circuit Gilles-Villeneuve,4361,14,0,circuit
+"""
+
+_COURSE_CACHE: list[dict] | None = None
+
+
+def courses() -> list[dict]:
+    """内置赛道表（首次调用时解析一次，之后走缓存）。"""
+    global _COURSE_CACHE
+    if _COURSE_CACHE is not None:
+        return _COURSE_CACHE
+    lines = _COURSE_CSV.strip().splitlines()
+    out: list[dict] = []
+    for ln in lines[1:]:
+        p = ln.split(",")
+        if len(p) < 3:
+            continue
+        try:
+            length = float(p[2])
+        except ValueError:
+            continue
+        if length <= 0:
+            continue
+        out.append({
+            "id": int(p[0]) if p[0].strip().isdigit() else 0,
+            "name": p[1].strip(),
+            "length_m": length,
+            "corners": int(p[3]) if len(p) > 3 and p[3].strip().isdigit() else 0,
+            "reverse": p[4].strip() == "1" if len(p) > 4 else False,
+            "category": p[5].strip() if len(p) > 5 else "",
+        })
+    _COURSE_CACHE = out
+    return out
+
+
+def course_candidates(ref_len_m: float, tol: float = 0.03) -> list[dict]:
+    """按圈长粗筛内置赛道表，返回**按差距从小到大**排好的候选。
+
+    `ref_len_m` 用 `track_fingerprint()["ref_len_m"]`（沿轨迹折线实测的圈长）。
+    🔴 实测圈长与官方 Length 会有几个百分点的系统性偏差（走的不是同一条线），
+       所以容差默认给 3%；太紧（1%）会把正确赛道筛掉，太松（10%）会
+       留下一堆候选让人选不过来。
+    """
+    if not ref_len_m or ref_len_m <= 0:
+        return []
+    cand = []
+    for c in courses():
+        d = abs(c["length_m"] - ref_len_m) / ref_len_m
+        if d <= tol:
+            cand.append({"id": c["id"], "name": c["name"],
+                         "length_m": c["length_m"], "corners": c["corners"],
+                         "reverse": c["reverse"], "category": c["category"],
+                         "len_err": round(d, 4)})
+    cand.sort(key=lambda x: x["len_err"])
+    return cand

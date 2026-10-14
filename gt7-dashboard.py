@@ -2023,6 +2023,14 @@ def session_track(path: Path) -> dict[str, Any]:
         tr = next((t for t in lib["tracks"] if t["id"] == hit.get("track_id")),
                   None)
         if tr:
+            # 🔴 自带补名：老库里那些「未命名赛道 #N」是在内置赛道表之前建的，
+            #    现在按它们记下的圈长回捞一次名字（只补空的，不动用户改过的）。
+            if not tr.get("name") and tr.get("ref_len_m"):
+                guessed = _guess_track_name(tr["ref_len_m"])
+                if guessed:
+                    tr["name"] = guessed["name"]
+                    tr["course_id"] = guessed["id"]
+                    save_tracks(hist, lib)
             return {"track_id": tr["id"], "name": tr["name"],
                     "matched": bool(tr["name"]), "distance": hit.get("dist"),
                     "ref_len_m": tr.get("ref_len_m")}
@@ -2050,16 +2058,28 @@ def session_track(path: Path) -> dict[str, Any]:
         if best_d is None or d < best_d:
             best_id, best_d = tr["id"], d
 
+    top: dict | None = None
+    cands: list[dict] = []
     if best_d is not None and best_d <= _TRACK_MATCH_TOL:
         track_id, track_name, matched = best_id, next(
             t["name"] for t in lib["tracks"] if t["id"] == best_id), True
     else:
-        # 新建未命名赛道。名字留空，UI 显示「未命名赛道 #N」并给改名入口。
+        # 新建赛道：先用**圈长**去内置赛道表捞候选（见 gt7analysis.courses），
+        # 捞到就直接用官方名当默认名 —— 比「未命名赛道 #N」有用得多；
+        # 捞不到才留空，UI 仍给改名入口。
+        # 🔴 多个候选时不猜（同长度的正/逆布局最常见，靠圈长分不出来）：
+        #    取差距最小的那个当默认名，并把候选列表一并返回给 UI。
+        #    "名字可能是逆向版"可以改，"完全没名字"没法用。
         track_id = int(lib["next_id"])
         lib["next_id"] = track_id + 1
-        track_name, matched = "", False
+        top = _guess_track_name(fp.get("ref_len_m") or 0.0)
+        cands = gt7analysis.course_candidates(fp.get("ref_len_m") or 0.0)
+        track_name = top["name"] if top else ""
+        matched = False
         lib["tracks"].append({
             "id": track_id, "name": track_name,
+            "course_id": top["id"] if top else None,
+            "course_candidates": [c["name"] for c in cands[:6]],
             "desc": fp["desc"], "ref_len_m": fp["ref_len_m"],
             "turns_cw": fp["turns_cw"],
             "created": datetime.now().strftime("%Y-%m-%d"),
@@ -2073,7 +2093,23 @@ def session_track(path: Path) -> dict[str, Any]:
         pass    # 写不进就当会话内缓存用，下次再试
     return {"track_id": track_id, "name": track_name, "matched": matched,
             "distance": lib["sessions"][name]["dist"],
-            "ref_len_m": fp["ref_len_m"]}
+            "ref_len_m": fp["ref_len_m"],
+            "course_id": top["id"] if top else None,
+            "candidates": [c["name"] for c in cands[:6]]}
+
+
+def _guess_track_name(ref_len_m: float) -> dict | None:
+    """按圈长在内置赛道表里捞**最像**的一条（差距最小者）。
+
+    🔴 只按圈长，不按形状：内置表里没有几何数据（course.csv 只有长度/弯道数），
+       而实测圈长与官方 Length 通常差 <1%，足够把 122 条缩到 2~6 条。
+       剩下的歧义（同一条赛道的正/逆布局）交给用户改名解决。
+    """
+    if not ref_len_m or ref_len_m <= 0:
+        return None
+    import gt7analysis
+    cands = gt7analysis.course_candidates(ref_len_m)
+    return cands[0] if cands else None
 
 
 # ---------------------------------------------------------------------------
@@ -7670,7 +7706,12 @@ b, output, td.num { font-variant-numeric:tabular-nums; }
   padding:5px 0; border-bottom:1px solid var(--line); }
 .coach-row:last-of-type { border-bottom:none; }
 .coach-row span { color:var(--muted); }
-.coach-row b { font-family:var(--mono); font-weight:500; }
+.coach-row b { font-family:var(--mono); font-weight:500;
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* 参考圈来源里的场次链接：跨场次参考圈要能点进去看那一圈到底怎么跑的 */
+.coach-row b a { color:var(--accent); text-decoration:none;
+  border-bottom:1px dashed rgba(var(--accent-rgb),.5); }
+.coach-row b a:hover { border-bottom-style:solid; }
 /* delta：负 = 比参考快（绿），正 = 丢时间（红）。与圈速表的时间差同色。 */
 .coach-row b.neg { color:var(--ok); }
 .coach-row b.pos { color:var(--bad); }
@@ -7758,6 +7799,10 @@ input[type="color"] { width:32px; height:24px; padding:0; vertical-align:middle;
 .wheel span { display:block; font-size:11px; color:var(--muted); }
 .wheel b { font-size:calc(16px * var(--num-scale)); font-family:var(--mono); }
 .wheel.hot b { color:var(--bad); } .wheel.cold b { color:var(--accent); }
+/* 选了胎种之后的「到位/不足/超出」三色。区间来自教练的 TYRE_COMPOUNDS
+   （/api/v1/coach/config 的 tyre_compounds），不在这里写死任何温度数字——
+   否则教练那边改了窗口，卡片颜色对不上，又是一处静默分叉。 */
+.wheel.ok b { color:var(--ok); } .wheel.low b { color:var(--warn); }
 .gforce { text-align:center; padding:8px; border-radius:8px;
   background:rgba(128,128,128,.1); }
 .gforce b { font-size:calc(20px * var(--num-scale)); font-family:var(--mono); }
@@ -8264,7 +8309,14 @@ th { color:var(--muted); font-weight:500; }
   </div>
 
     <div class="card span2" id="c-wheel">
-    <h2>四轮状态</h2>
+    <h2>四轮状态
+      <span style="float:right;font-weight:400;display:inline-flex;gap:6px;align-items:center">
+        <select id="coTyreCpd" onchange="setTyreCompound(this.value)"
+          style="font-weight:400;font-size:11px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font-family:inherit"
+          title="GT7 遥测不下发胎种，只能自己选；选了才有推荐温度与三色着色"></select>
+        <span id="tyreTarget" style="font-size:11px;color:var(--muted)"></span>
+      </span>
+    </h2>
     <div class="wheels">
       <div class="wheel" id="w0"><span>左前</span><b>--</b></div>
       <div class="wheel" id="w1"><span>右前</span><b>--</b></div>
@@ -8615,13 +8667,26 @@ function render(s) {
   $('fLon').style.width = Math.min(100, Math.abs(lon) / 2 * 100) + '%';
   $('oLon').textContent = lon.toFixed(2);
 
-  // 四轮温度：过冷/过热变色
+  // 四轮温度：按**所选胎种**的工作窗口三色着色（到位绿 / 不足黄 / 超出红）。
+  // 🔴 窗口来自教练的 tyre_compounds，这里不写死温度；没选胎种则退回
+  //    旧的固定阈值着色，并在卡片上写明"未选胎种（不播报胎温）"。
   const names = ['w0','w1','w2','w3'];
+  const tw = (coachTyreCompound && coachTyreCompound !== 'unknown'
+              && coachTyreCompounds) ? coachTyreCompounds[coachTyreCompound]
+                                     : null;
   (L.tyre_temp || []).forEach((t, i) => {
     if (!names[i]) return;
     const el = $(names[i]);
     el.querySelector('b').textContent = Math.round(t) + '°';
-    el.className = 'wheel' + (t > 112 ? ' hot' : (t < 68 ? ' cold' : ''));
+    let cls = '';
+    if (tw && t > 0) {
+      if (t < tw.lo) cls = ' low';
+      else if (t > tw.hi) cls = ' hot';
+      else cls = ' ok';
+    } else {
+      cls = (t > 112 ? ' hot' : (t < 68 ? ' cold' : ''));
+    }
+    el.className = 'wheel' + cls;
   });
   $('gvec').textContent = Math.hypot(lat, lon).toFixed(2);
 
@@ -9596,6 +9661,7 @@ function renderCoachPanel(d){
     box.innerHTML = coachPanelShellHtml(coachPanelGroups.map(coachPanelRowHtml).join(''));
     loadCoachCloud(false);
     loadCoachSlip(false);
+    loadCoachTyre(false);
     return;
   }
   coachPanelGroups.forEach(function(g){
@@ -9800,6 +9866,80 @@ function renderCoachSlip(d){
   }
 }
 
+// —— 轮胎种类（四轮状态卡）——————————————————————————————————
+//
+// 🔴 GT7 遥测**不下发胎种**（也不下发天气/赛道温度），所以"这条胎的最佳工作
+//    温度"只能由车手自己选。窗口表由教练 /config 的 `tyre_compounds` 下发
+//    —— 前端**不写死任何温度数字**，否则教练改了窗口、卡片颜色对不上，
+//    又是一处静默分叉。
+//    选了胎种：报实际温度 vs 该胎种窗口 → 到位绿 / 不足黄 / 超出红，
+//              且胎温播报按该窗口走；没选（unknown）→ 不着色、不播报。
+let coachTyreCompounds = null;      // {key: {label, lo, hi, cold, hot}}
+let coachTyreCompound = 'unknown';
+let coachTyreRefreshN = 0;
+
+function loadCoachTyre(silent){
+  fetch(coachUrl + '/api/v1/coach/config')
+    .then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(renderCoachTyre, function(){
+      const s = $('coTyreCpd'); if (s) s.disabled = true;
+      const t = $('tyreTarget');
+      if (t && !silent) t.textContent = '当前教练不支持胎种设置（需新版教练）';
+    });
+}
+
+function renderCoachTyre(d){
+  if (d.tyre_compounds) coachTyreCompounds = d.tyre_compounds;
+  const sel = $('coTyreCpd');
+  if (!sel) return;
+  // 下拉只填一次（避免重建时冲掉用户正展开的选项）
+  if (sel.options.length <= 1 && coachTyreCompounds) {
+    Object.keys(coachTyreCompounds).forEach(function(k){
+      const w = coachTyreCompounds[k] || {};
+      const opt = document.createElement('option');
+      opt.value = k;
+      opt.textContent = w.label || k;
+      sel.appendChild(opt);
+    });
+  }
+  const r = (d.rules || {});
+  coachTyreCompound = r.tyre_compound || 'unknown';
+  if (document.activeElement !== sel) sel.value = coachTyreCompound;
+  const t = $('tyreTarget');
+  if (!t) return;
+  const w = (coachTyreCompound && coachTyreCompounds)
+          ? coachTyreCompounds[coachTyreCompound] : null;
+  t.textContent = (!w || coachTyreCompound === 'unknown')
+    ? '未选胎种（不播报胎温）'
+    : ('推荐 ' + w.lo.toFixed(0) + '~' + w.hi.toFixed(0) + '°C');
+}
+
+function setTyreCompound(v){
+  fetch(coachUrl + '/api/v1/coach/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rules: {tyre_compound: v}}),
+  })
+    .then(function(r){
+      if (r.ok) return r.json();
+      throw new Error('HTTP ' + r.status);
+    })
+    .then(function(d){ renderCoachTyre(d.config); },
+          function(e){
+            const t = $('tyreTarget');
+            if (t) t.textContent = '保存失败：' + e.message;
+          });
+}
+
+// 教练连上之后才会刷这份配置；卡片常驻（不在面板里），所以这里单独计数，
+// 不能挂在 coachPanelMaybeRefresh 上（那个只在面板打开时才跑）。
+function coachTyreMaybeRefresh(){
+  coachTyreRefreshN = (coachTyreRefreshN + 1) % 150;   // 200ms × 150 ≈ 30s
+  if (coachTyreRefreshN === 0) loadCoachTyre(true);
+}
+
 function saveCoachSlipPreset(){
   const sel = $('coSlipPreset'), msg = $('coSlipMsg');
   if (!sel || !msg) return;
@@ -9918,14 +10058,63 @@ function setCoachMuted(id, muted){
     .then(renderCoachPanel, function(){ loadCoachPanel(true); });
 }
 
+// —— 参考圈来源（本场第 X 圈 / <场次> 第 X 圈，后者可点击跳场次）——
+let coachSessionNames = null;   // {file: display_name}
+
+function loadCoachSessionNames(){
+  fetch('/api/v1/sessions')
+    .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function(d){
+      const m = {};
+      ((d && d.sessions) || []).forEach(function(x){
+        if (x && x.file) m[x.file] = x.display_name || x.file;
+      });
+      coachSessionNames = m;
+    }, function(){ coachSessionNames = {}; });
+}
+
+function sessionLabelOf(f){
+  if (coachSessionNames && coachSessionNames[f]) return coachSessionNames[f];
+  // 兜底：文件名自带日期时间和赛道，砍掉后缀就够认
+  return String(f || '').replace(/\.jsonl(\.gz)?$/i, '').replace(/\.gz$/i, '');
+}
+
+function renderCoachRef(d, s){
+  const el = $('coRef');
+  if (!el) return;
+  if (!d.ref_ready) { el.textContent = '建立中…'; return; }
+  const rf = s.ref_session_file, sf = s.sess_file;
+  const lap = (d.ref_lap == null) ? '?' : d.ref_lap;
+  if (!rf || (sf && rf === sf)) {
+    // 本场的圈 —— 说清是哪一圈 + 剖面来源（车载 60Hz 还是本地自攒 10Hz）
+    el.textContent = (s.ref_source === 'profile' ? '车载 60Hz · 本场第 '
+                                                 : '自攒 10Hz · 本场第 ')
+      + lap + ' 圈';
+    el.title = '参考圈 = 本场第 ' + lap + ' 圈';
+    return;
+  }
+  // 跨场次的圈：给链接，点进去是那一场的详情页
+  const nm = sessionLabelOf(rf);
+  el.innerHTML = '';
+  const a = document.createElement('a');
+  a.href = '/session?file=' + encodeURIComponent(rf);
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = nm + ' 第 ' + lap + ' 圈';
+  a.title = '参考圈来自另一个场次：' + rf + '（点开看那一场）';
+  el.appendChild(a);
+  el.title = '参考圈来自另一个场次：' + rf;
+}
+
 function renderCoach(d){
   coachRetry = COACH_POLL_MS;
   $('coachDot').className = 'on';
   const s = d.stats || {};
-  $('coRef').textContent = d.ref_ready
-    ? ((s.ref_source === 'profile' ? '车载 60Hz' : '自攒 10Hz')
-       + ' · 第 ' + d.ref_lap + ' 圈')
-    : '建立中…';
+  // —— 参考圈**来自哪一场 / 哪一圈** ——
+  // 🔴 来源不能只看 ref_source（profile/self/history）：本地缓存命中的那份
+  //    source 也是 profile，但它其实来自**另一个场次**。所以比对场次文件：
+  //    同一场 = "本场第 X 圈"；不同场 = 场次级链接，点了能跳去看那一场。
+  renderCoachRef(d, s);
   $('coS').textContent = (d.s_m == null) ? '--'
     : (Math.round(d.s_m) + ' / ' + Math.round(d.ref_len_m || 0) + ' m');
   const dv = d.delta_s, el = $('coDelta');
@@ -9967,6 +10156,7 @@ function renderCoach(d){
   }).join('');
   // 面板开着时顺路刷新"最近播报条数"（关着时这行什么都不做）
   coachPanelMaybeRefresh();
+  coachTyreMaybeRefresh();
 }
 
 function renderCoachOff(){
@@ -10037,6 +10227,11 @@ function pollCoach(){
   // 生成的，逐行挂监听会在每次刷新后全部失效）
   $('coachPanelBtn').onclick = coachPanelToggle;
   $('coachHistBtn').onclick = coachHistToggle;
+  // 胎种下拉在「四轮状态」卡里（常驻，不在播报面板内），
+  // 所以启动就要拉一次 —— 否则要等 30 s 才出现选项。
+  loadCoachTyre(true);
+  // 参考圈来源要显示场次显示名 → 先把 file→显示名 的映射备好
+  loadCoachSessionNames();
   $('coPanel').addEventListener('change', function(ev){
     const cb = ev.target;
     if (!cb || cb.tagName !== 'INPUT') {
