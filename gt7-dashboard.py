@@ -4645,6 +4645,21 @@ function hideLoad() {{
   var ov = document.getElementById('loadOv');
   if (ov) ov.style.display = 'none';
 }}
+// —— 全局错误兜底：任何 render 里抛的异常都打到 console，不再「静默藏卡」 ——
+// 🔴 历史上出过 render() 里 `avg is not defined` 抛错被外层 .catch 吞掉，
+//    结果是某几张卡悄悄冻结、控制台却看不出所以然。统一把未捕获错误和
+//    未处理 Promise 拒绝都打到 console，方便第一时间定位前端 bug。
+window.addEventListener('error', function (e) {{
+  console.error('[gt7-dash] 未捕获错误:', e.error || e.message,
+                (e.error && e.error.stack) ? '\\n' + e.error.stack : '');
+}});
+window.addEventListener('unhandledrejection', function (e) {{
+  console.error('[gt7-dash] 未处理 Promise 拒绝:', e.reason,
+                (e.reason && e.reason.stack) ? '\\n' + e.reason.stack : '');
+}});
+// 统一工具：在那些必须吞掉异常、只给用户看友好文案的 .catch 分支里用，
+// 避免「读取失败」四个字把真因藏起来。
+function renderErr(where, e) {{ console.error('[gt7-dash] ' + where + ' 渲染/取数失败:', e); }}
 </script>
 <div class="top">
   <a class="back" href="/">&larr; 返回仪表盘</a>
@@ -5149,7 +5164,8 @@ var CMP = __DATA__;
       refreshRlUI();
       drawRaceLineInto(cv, cv.width, cv.height);
       if (typeof hideLoad === 'function') hideLoad();
-    }).catch(function () {
+    }).catch(function (e) {
+      renderErr('赛车线', e);
       rlSegs = [];
       refreshRlUI();
       drawRaceLineInto(cv, cv.width, cv.height);
@@ -5574,7 +5590,8 @@ _DEVIATION_TMPL = r"""
     if (meta) meta.textContent = '计算中…';
     fetch(API + '/deviation?ref_lap=' + v + '&cmp_lap=' + dvLapNo)
       .then(function (r) { return r.json(); })
-      .then(function (d) { DV = d; renderDv(); }, function () {
+      .then(function (d) { DV = d; renderDv(); }, function (e) {
+        renderErr('走线偏差', e);
         if (meta) meta.textContent = '读取失败';
       });
   };
@@ -5587,12 +5604,14 @@ _DEVIATION_TMPL = r"""
     var refL = DV && DV.ref_lap;
     fetch(API + '/deviation?ref_lap=' + refL + '&cmp_lap=' + dvLapNo)
       .then(function (r) { return r.json(); })
-      .then(function (d) { DV = d; renderDv(); }, function () {
+      .then(function (d) { DV = d; renderDv(); }, function (e) {
+        renderErr('走线偏差', e);
         if (meta) meta.textContent = '读取失败';
       });
   };
 
-  function dvFetchFail() {
+  function dvFetchFail(e) {
+    renderErr('走线偏差', e);
     var meta = el('dvMeta'), box = el('dvStats');
     if (meta) meta.textContent = '读取失败';
     if (box) box.innerHTML = '<p class="dv-note">走线偏差数据请求失败（见控制台）。</p>';
@@ -5839,7 +5858,8 @@ _ANALYSIS_TMPL = r"""
     var meta = el('secMeta');
     if (meta) meta.textContent = '计算中…';
     fetch(API + '/sectors?n=' + secN).then(function (r) { return r.json(); })
-      .then(renderSec).catch(function () {
+      .then(renderSec, function (e) {
+        renderErr('分段', e);
         if (meta) meta.textContent = '读取失败';
       });
   };
@@ -7058,7 +7078,8 @@ _TELEMETRY_TMPL = r"""
     return fetch(u).then(function (r) { return r.json(); }).then(function (d) {
       if (d.error) { el('telePageInfo').textContent = d.error; return; }
       renderTable(d);
-    }).catch(function () {
+    }).catch(function (e) {
+      renderErr('遥测表', e);
       el('telePageInfo').textContent = '读取失败';
     });
   }
@@ -7159,7 +7180,8 @@ _TELEMETRY_TMPL = r"""
           renderReadout();
         }
       }
-    }).catch(function () {
+    }).catch(function (e) {
+      renderErr('遥测曲线', e);
       ready = true;
       rows = [];
       renderChart();
@@ -8394,6 +8416,21 @@ th { color:var(--muted); font-weight:500; }
 
 <script>
 const $ = id => document.getElementById(id);
+// —— 全局错误兜底：任何 render 里抛的异常都打到 console，不再「静默藏卡」 ——
+// 🔴 历史上出过 `avg is not defined` 在 render() 里抛错、被外层 .catch 吞掉，
+//    结果是某几张卡悄悄冻结、控制台却看不出所以然。这里统一把未捕获错误
+//    和未处理 Promise 拒绝都打到 console，方便第一时间定位前端 bug。
+window.addEventListener('error', function (e) {
+  console.error('[gt7-dash] 未捕获错误:', e.error || e.message,
+                (e.error && e.error.stack) ? '\n' + e.error.stack : '');
+});
+window.addEventListener('unhandledrejection', function (e) {
+  console.error('[gt7-dash] 未处理 Promise 拒绝:', e.reason,
+                (e.reason && e.reason.stack) ? '\n' + e.reason.stack : '');
+});
+// 统一的「渲染失败也记录到控制台」工具：在那些必须吞掉异常、只给用户看
+// 友好文案的 .catch 分支里用，避免「读取失败」四个字把真因藏起来。
+function renderErr(where, e) { console.error('[gt7-dash] ' + where + ' 渲染/取数失败:', e); }
 const RPM_MAX = 15000, SPEED_MAX = 320;
 let bestLap = null, lastFrame = null;
 // —— 转速表自适应量程的状态（一场内累计观测，换车重置） ——
