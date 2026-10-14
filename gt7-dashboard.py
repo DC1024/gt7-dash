@@ -4226,6 +4226,18 @@ THEME_CSS = r"""
   /* 排版密度与读数缩放：个性化面板调的就是这几个 */
   --pad-body:12px; --gap-grid:10px; --pad-card:12px 14px; --gap-card:12px;
   --num-scale:1;
+  /* —— 座舱观感层（对齐 GT-CLASS 遥测面板的视觉语言）——
+     面板渐变收尾 / 背景网格与光晕 / 圆角与投影 / 圈速表专用色。
+     🔴 这些是「结构变量」：每个主题都能用，不改就退化成原来的纯色卡片，
+        所以给的是中性安全值（半透明灰在浅色底和深色底上都成立）。 */
+  --panel-end:var(--card);
+  --card-2:rgba(128,128,128,.10);
+  --grid-line:rgba(128,128,128,.045);
+  --glow-a:rgba(var(--accent-rgb),.10);
+  --glow-b:rgba(var(--accent-rgb),.07);
+  --gold:#a9760a; --violet:#7c3aed;
+  --r-card:10px;
+  --shadow-card:0 1px 2px rgba(0,0,0,.04);
 }
 :root[data-density="compact"] {
   --pad-body:8px; --gap-grid:7px; --pad-card:8px 10px; --gap-card:8px;
@@ -4302,6 +4314,25 @@ THEME_CSS = r"""
   --cv-edge:rgba(234,230,255,.26); --cv-axis:rgba(234,230,255,.16);
   --cv-text:rgba(234,230,255,.6); --cv-shadow:rgba(0,0,0,.6);
   --cv-grid:rgba(234,230,255,.12);
+}
+/* —— 座舱：对齐 GT-CLASS 遥测面板 ——
+   近黑底 + 电光蓝，面板走渐变收尾（--panel-end 与 --card 拉开一档），
+   背景叠一层极淡网格 + 两团光晕，圆角收小到 8px、投影压深，
+   是「副屏当赛车仪表用」的默认推荐档。 */
+:root[data-theme="cockpit"] {
+  --bg:#06080c; --card:#0e131b; --line:#232c3a; --text:#eef2f8;
+  --muted:#7f8b9e; --accent:#00a3ff; --accent-rgb:0,163,255;
+  --ok:#31d07b; --warn:#ff8a00; --bad:#ff2d55;
+  --cv-bowl:rgba(255,255,255,.03); --cv-ring:rgba(255,255,255,.09);
+  --cv-edge:rgba(255,255,255,.22); --cv-axis:rgba(255,255,255,.16);
+  --cv-text:rgba(127,139,158,.9);  --cv-shadow:rgba(0,0,0,.55);
+  --cv-grid:rgba(255,255,255,.14);
+  --panel-end:rgba(10,14,20,.72); --card-2:#141a24;
+  --grid-line:rgba(255,255,255,.028);
+  --glow-a:rgba(0,163,255,.10); --glow-b:rgba(0,163,255,.06);
+  --gold:#ffd24a; --violet:#a06bff;
+  --r-card:8px;
+  --shadow-card:0 6px 24px -10px rgba(0,0,0,.65);
 }
 /* 「跟随系统」跟随 prefers-color-scheme；其余预设不受系统切换影响。
    🔴 必须带 [data-theme="auto"]：如果像旧版那样裸写 @media + :root，
@@ -4489,15 +4520,32 @@ def _page_shell(title: str, body: str) -> str:
 <style>
 * {{ box-sizing:border-box; margin:0; padding:0; }}
 {THEME_CSS}
-body {{ font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
-  background:var(--bg); color:var(--text); padding:16px; }}
+/* 与实时页同一套座舱底色（光晕 + 网格），子页面跟着一起换肤 */
+body {{ font-family:system-ui,-apple-system,'Segoe UI','PingFang SC',
+    'Microsoft YaHei',sans-serif;
+  color:var(--text); padding:16px; background-color:var(--bg);
+  background-image:
+    radial-gradient(1100px 620px at 78% -8%, var(--glow-a), transparent 60%),
+    radial-gradient(900px 560px at 8% 108%, var(--glow-b), transparent 62%);
+  background-attachment:fixed; -webkit-font-smoothing:antialiased; }}
+body::before {{ content:''; position:fixed; inset:0; z-index:-1;
+  pointer-events:none;
+  background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
+  background-size:44px 44px;
+  -webkit-mask-image:radial-gradient(circle at 50% 42%,#000 0%,transparent 82%);
+          mask-image:radial-gradient(circle at 50% 42%,#000 0%,transparent 82%); }}
 .top {{ display:flex; align-items:center; gap:12px; margin-bottom:14px; }}
 .top h1 {{ font-size:16px; font-weight:500; }}
 .back {{ color:var(--accent); text-decoration:none; font-size:13px; }}
-.card {{ background:var(--card); border:1px solid var(--line);
-  border-radius:10px; padding:14px 16px; margin-bottom:10px; }}
-h2 {{ font-size:12px; font-weight:500; color:var(--muted);
-  text-transform:uppercase; letter-spacing:.6px; margin-bottom:10px; }}
+.card {{ background:
+    linear-gradient(90deg,var(--accent),transparent 62%) top/100% 2px no-repeat,
+    linear-gradient(180deg,var(--card),var(--panel-end));
+  border:1px solid var(--line); border-radius:var(--r-card);
+  padding:14px 16px; margin-bottom:10px; position:relative; overflow:hidden; }}
+h2 {{ font-size:11.5px; font-weight:600; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.16em; margin-bottom:10px;
+  padding-left:9px; border-left:3px solid var(--accent); }}
 table {{ width:100%; border-collapse:collapse; font-size:13px; }}
 th,td {{ text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }}
 th {{ color:var(--muted); font-weight:500; font-size:12px; }}
@@ -7359,14 +7407,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 /*THEME_CSS*/
 /*ZOOM_CSS*/
-body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
-  background:var(--bg); color:var(--text); padding:var(--pad-body); }
-.bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap;
-  background:var(--card); border:1px solid var(--line); border-radius:10px;
+/* —— 座舱底色：两团主色光晕 + 一层极淡网格（径向遮罩到画面中心才显形）——
+   🔴 网格用 z-index:-1：body 背景之上、所有内容之下，这样卡片不用额外
+      抬 z-index 也不会被网格盖住（正 z-index 会盖住未定位的卡片）。 */
+body { font-family:system-ui,-apple-system,'Segoe UI','PingFang SC',
+    'Microsoft YaHei',sans-serif;
+  color:var(--text); padding:var(--pad-body); background-color:var(--bg);
+  background-image:
+    radial-gradient(1100px 620px at 78% -8%, var(--glow-a), transparent 60%),
+    radial-gradient(900px 560px at 8% 108%, var(--glow-b), transparent 62%);
+  background-attachment:fixed; -webkit-font-smoothing:antialiased; }
+body::before { content:''; position:fixed; inset:0; z-index:-1;
+  pointer-events:none;
+  background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
+  background-size:44px 44px;
+  -webkit-mask-image:radial-gradient(circle at 50% 42%,#000 0%,transparent 82%);
+          mask-image:radial-gradient(circle at 50% 42%,#000 0%,transparent 82%); }
+/* 读数一律等宽数字：跳动的数字不左右抖，是仪表盘的基本要求 */
+b, output, td.num { font-variant-numeric:tabular-nums; }
+/* 顶栏：与卡片同一套语言（顶部 2px 主色渐变线 + 渐变收尾） */
+.bar { display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+  background:
+    linear-gradient(90deg,var(--accent),transparent 62%) top/100% 2px no-repeat,
+    linear-gradient(180deg,var(--card),var(--panel-end));
+  border:1px solid var(--line); border-radius:var(--r-card);
   padding:10px 16px; margin-bottom:var(--gap-grid);
   position:sticky; top:var(--pad-body); z-index:10;
-  backdrop-filter:blur(10px);
-  box-shadow:0 4px 18px rgba(0,0,0,.06); }
+  backdrop-filter:blur(10px); box-shadow:var(--shadow-card); }
 /* 顶栏导航：胶囊式，hover 染主题色（深浅色主题通用） */
 .bar .nav { margin-left:auto; display:flex; gap:4px; }
 .bar .nav a { color:var(--muted); text-decoration:none; font-size:13px;
@@ -7377,17 +7445,30 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .dot.off { background:var(--bad); }
 .dot.wait { background:var(--warn); animation:pulse 1.2s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
-.stat { font-size:13px; color:var(--muted); }
+/* 顶栏的「标签 + 读数」竖排两行、标签小号带字距 —— 对齐 GT-CLASS 顶栏
+   CIRCUIT / SESSION / LAP 那种信息条。中文标签字号不压太小，保证能读。 */
+.stat { display:grid; gap:0; line-height:1.22; font-size:10.5px;
+  letter-spacing:.06em; color:var(--muted); font-weight:600; }
 .stat b { color:var(--text); font-variant-numeric:tabular-nums;
-  font-family:var(--mono); font-weight:600; margin-left:4px; }
+  font-family:var(--mono); font-weight:600; font-size:13.5px;
+  letter-spacing:.02em; margin-left:0; }
 .grid { display:grid; grid-template-columns:1fr 1fr; gap:var(--gap-grid); }
 @media(max-width:820px){ .grid{grid-template-columns:1fr} }
 /* 三栏行：圈速 | G力球 | G-G散点。用 auto-fit 让它窄屏自动换行 */
 .grid3 { grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
-.card { background:var(--card); border:1px solid var(--line);
-  border-radius:10px; padding:var(--pad-card); }
-.card h2 { font-size:12px; font-weight:500; color:var(--muted);
-  text-transform:uppercase; letter-spacing:.6px; margin-bottom:10px; }
+/* 卡片 → 面板：顶部 2px 主色渐变线 + 渐变收尾 + 小圆角 + 压深投影 */
+.card { background:
+    linear-gradient(90deg,var(--accent),transparent 62%) top/100% 2px no-repeat,
+    linear-gradient(180deg,var(--card),var(--panel-end));
+  border:1px solid var(--line); border-radius:var(--r-card);
+  padding:var(--pad-card); position:relative; overflow:hidden;
+  box-shadow:var(--shadow-card); }
+/* 标题左侧 3px 主色竖条（GT-CLASS 面板头）。
+   🔴 用 border-left 而不是 ::before —— ::before 已被编辑模式的拖拽把手
+      ⠿ 占用（.cgrid .card.editmode > h2::before），会打架。 */
+.card h2 { font-size:11.5px; font-weight:600; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.16em; margin-bottom:10px;
+  padding-left:9px; border-left:3px solid var(--accent); }
 .dials { display:flex; align-items:center; justify-content:space-around; }
 .gauge { position:relative; width:132px; height:132px; }
 .gauge svg { transform:rotate(135deg); }
@@ -7435,15 +7516,39 @@ body { font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 .laps span { display:block; font-size:11px; color:var(--muted); }
 .laps b { font-size:calc(15px * var(--num-scale)); font-family:var(--mono); }
 /* 每圈圈速列表（新圈在上，最快圈绿色★） */
-.laplist { margin-top:10px; max-height:172px; overflow-y:auto; }
-.laprow { display:flex; justify-content:space-between; align-items:center;
-  padding:4px 9px; border-bottom:1px solid var(--line); font-size:12.5px; }
-.laprow span { color:var(--muted); }
-.laprow b { font-family:var(--mono); font-weight:500; }
-.laprow.best b { color:#198754; }
-.laprow.best span::after { content:' ★最快'; color:#198754; font-size:10px; }
-.laprow.empty { color:var(--muted); justify-content:center;
-  border-bottom:none; padding:10px 0; }
+/* 每圈圈速列表 —— 对齐 GT-CLASS 底部的 lap strip：
+   新圈在上，等宽数字对齐成列；最快圈紫色标 BEST，与最快圈的差值按快慢着色。 */
+.laplist { margin-top:10px; max-height:172px; overflow-y:auto;
+  display:grid; gap:2px; }
+.laprow { display:grid; grid-template-columns:46px 1fr 62px; gap:8px;
+  align-items:center; padding:4px 8px; border-radius:6px;
+  font-variant-numeric:tabular-nums; }
+.laprow .lno { font-style:normal; color:var(--muted);
+  font-family:var(--mono); font-weight:700; font-size:11.5px; }
+.laprow .lt { font-family:var(--mono); font-weight:600; font-size:13px; }
+.laprow .ld { font-style:normal; text-align:right; font-size:11.5px;
+  font-family:var(--mono); color:var(--muted); }
+.laprow .ld.a { color:var(--ok); }
+.laprow .ld.b { color:var(--bad); }
+.laprow.best { background:rgba(var(--accent-rgb),.06); }
+.laprow.best .lno, .laprow.best .lt, .laprow.best .ld { color:var(--violet); }
+.laprow.best .ld { font-weight:700; }
+.laprow.cur { background:rgba(var(--accent-rgb),.08);
+  box-shadow:inset 0 0 0 1px rgba(var(--accent-rgb),.28); }
+.laprow.cur .lno, .laprow.cur .lt { color:var(--accent); }
+.laprow.empty { display:block; text-align:center; color:var(--muted);
+  font-size:12px; padding:10px 0; }
+/* 踏板轨迹（对齐 GT-CLASS 的 Pedal Trace）：油门在上、刹车在下的面积图 */
+.ptrace-wrap { margin-top:11px; }
+.ptrace-lgd { display:flex; align-items:center; gap:10px; margin-bottom:5px;
+  font-size:10px; letter-spacing:.1em; font-weight:600; color:var(--muted); }
+.ptrace-lgd i { display:inline-block; width:8px; height:8px;
+  border-radius:2px; margin-right:5px; vertical-align:middle; }
+.ptrace-lgd .sp { flex:1; }
+.ptrace-lgd .dim { font-weight:400; opacity:.72; letter-spacing:.04em; }
+#ptrace { display:block; width:100%; height:104px; border-radius:6px;
+  background:var(--card-2); }
+
 #map { border-radius:8px; background:rgba(128,128,128,.06); }
 #gg { border-radius:8px; }
 /* G 力球读数 */
@@ -8083,6 +8188,14 @@ th { color:var(--muted); font-weight:500; }
       <div class="bar-row"><label>纵向 G</label>
         <div class="track"><div class="fill lon" id="fLon" style="width:0"></div></div>
         <output id="oLon">0.00</output></div>
+      <div class="ptrace-wrap">
+        <div class="ptrace-lgd">
+          <span><i style="background:var(--ok)"></i>油门</span>
+          <span><i style="background:var(--bad)"></i>刹车</span>
+          <span class="sp"></span><span class="dim">最近 20 秒</span>
+        </div>
+        <canvas id="ptrace" width="600" height="104"></canvas>
+      </div>
     </div>
 
     <div class="card" id="c-lap">
@@ -8236,6 +8349,8 @@ const THEMES = [
    c:['#04100a','#08180f','#39ff14']},
   {id:'midnight', name:'午夜紫', desc:'暗紫长夜复盘向',
    c:['#0c0a18','#15122a','#9b6bff']},
+  {id:'cockpit',  name:'座舱（推荐）', desc:'近黑底＋电光蓝，面板渐变与网格质感，副屏仪表向',
+   c:['#06080c','#0e131b','#00a3ff']},
 ];
 const ACCENTS = ['#0d6efd','#0a84ff','#00e0c6','#198754','#b45309',
                  '#e10600','#e83e8c','#9b6bff','#39ff14','#ffb020'];
@@ -8488,6 +8603,9 @@ function render(s) {
   const thr = Math.round(L.throttle * 100), brk = Math.round(L.brake * 100);
   $('fThr').style.width = thr + '%'; $('oThr').textContent = thr + '%';
   $('fBrk').style.width = brk + '%'; $('oBrk').textContent = brk + '%';
+  // 踏板轨迹：这里 L.throttle / L.brake 是 0~1，直接喂给环形缓冲
+  pushPedal(L.throttle || 0, L.brake || 0);
+  drawPedalTrace();
 
   // G 力：转成百分比显示（±2g 满量程）
   const lat = (L.g_force && L.g_force[1]) || 0;
@@ -8714,8 +8832,16 @@ function render(s) {
     const best = Math.min.apply(null, lt.map(x => x[1]));
     el.innerHTML = lt.slice().reverse().map(([n, ms]) => {
       const isBest = ms === best && lt.length > 1;
+      // 与最快圈的差值（秒）。最快圈自己显示 BEST；其余按快慢着色：
+      // 0.3s 内算「咬得住」给绿，再慢就是红 —— 一眼看出哪圈掉时间了。
+      const d = (ms - best) / 1000;
+      const dtx = isBest ? 'BEST' : '+' + d.toFixed(2);
+      const dcls = isBest ? '' : (d <= 0.3 ? ' a' : ' b');
+      const no = n < 10 ? '0' + n : String(n);
       return '<div class="laprow' + (isBest ? ' best' : '') + '">' +
-             '<span>第 ' + n + ' 圈</span><b>' + fmtMs(ms) + '</b></div>';
+             '<i class="lno">' + no + '</i>' +
+             '<b class="lt">' + fmtMs(ms) + '</b>' +
+             '<i class="ld' + dcls + '">' + dtx + '</i></div>';
     }).join('');
   }
 
@@ -9121,6 +9247,60 @@ function ggTheme() {
     text: gvar('--cv-text', 'rgba(0,0,0,.5)'),
     shadow: gvar('--cv-shadow', 'rgba(0,0,0,.22)'),
   };
+}
+
+// —— 踏板轨迹（对齐 GT-CLASS 的 Pedal Trace）：油门在上、刹车在下的面积图 ——
+// 🔴 按**时间**裁剪而不是按帧数：轮询间隔会随机器负载 / 网络浮动，
+//    按帧数裁剪会让「最近 20 秒」这句承诺在不同机器上窗口长度不一样。
+const PEDAL_WIN_MS = 20000;
+let pedalTrace = [];
+function pushPedal(thr01, brk01) {
+  const now = Date.now();
+  pedalTrace.push({ t: now, th: thr01, br: brk01 });
+  const cut = now - PEDAL_WIN_MS;
+  while (pedalTrace.length && pedalTrace[0].t < cut) pedalTrace.shift();
+  if (pedalTrace.length > 600) {
+    pedalTrace.splice(0, pedalTrace.length - 600);
+  }
+}
+function drawPedalTrace() {
+  const cv = $('ptrace');
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height, mid = H / 2, amp = mid - 6;
+  ctx.clearRect(0, 0, W, H);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = gvar('--cv-axis', 'rgba(0,0,0,.12)');
+  ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(W, mid); ctx.stroke();
+  ctx.setLineDash([3, 5]);
+  ctx.strokeStyle = gvar('--cv-grid', 'rgba(128,128,128,.18)');
+  ctx.beginPath();
+  ctx.moveTo(0, mid / 2); ctx.lineTo(W, mid / 2);
+  ctx.moveTo(0, mid + mid / 2); ctx.lineTo(W, mid + mid / 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  const n = pedalTrace.length;
+  if (n < 2) return;
+  const step = W / (n - 1);
+  // 面积用 globalAlpha 叠透明度：这样主题色不管写成 hex 还是 rgba 都能用，
+  // 不用再为每种主题准备一套半透明色。
+  function shape(key, dir, color) {
+    let k;
+    ctx.beginPath(); ctx.moveTo(0, mid);
+    for (k = 0; k < n; k++) {
+      ctx.lineTo(k * step, mid + dir * pedalTrace[k][key] * amp);
+    }
+    ctx.lineTo((n - 1) * step, mid); ctx.closePath();
+    ctx.globalAlpha = .28; ctx.fillStyle = color; ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    for (k = 0; k < n; k++) {
+      ctx.lineTo(k * step, mid + dir * pedalTrace[k][key] * amp);
+    }
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.stroke();
+  }
+  shape('th', -1, gvar('--ok', '#198754'));
+  shape('br', 1, gvar('--bad', '#dc3545'));
 }
 
 function drawBallInto(cv, W, H) {
