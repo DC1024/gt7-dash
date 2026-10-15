@@ -146,8 +146,10 @@ GT7 不下发赛道名，所以本服务**按轨迹形状自己认**：对某个
 - 打开 `/tracks`（顶栏「赛道地图」）看系统认出了哪些赛道，每条都画出形状图
 - 名字不对就改：改完点「保存」，或名字本来对就点「✓ 已记录」
 - 认领结果写进 `data/tracks.json`，**同赛道所有场次（含历史）一起生效**
-- 没认出来的名字会标「自动识别·待确认」——那是按圈长猜的，圈长相近的不同
-  赛道确实会猜错，所以以你确认为准
+- 没认出来的名字会标「自动识别·待确认」——那是按圈长猜的（候选来自
+  [ddm999/gt7info](https://github.com/ddm999/gt7info) 的 course.csv，
+  只含长度/弯道数、没有几何数据），圈长相近的不同赛道确实会猜错，
+  所以以你确认为准
 - 想批量补：用 `POST /api/v1/tracks/register` 一次标注（算指纹 → 挂靠 → 写名）
 
 ## 🧩 工作原理
@@ -217,8 +219,9 @@ compose 里加 `--ps5 192.168.x.x`（默认 auto 自动发现）。
 
 **车型显示成 `CAR-ID-3656` 这种？**
 那是社区车型表还没收录的车（数字码是 GT7 自己在遥测包里下发的，一定准；
-缺的只是「码 → 名字」这一张表）。在数据目录放一张 `data/cars_extra.csv`
-就能补上，格式和主表一样 `ID,ShortName,Maker`，**它优先于社区表**：
+缺的只是「码 → 名字」这一张表，来自 [ddm999/gt7info](https://github.com/ddm999/gt7info)）。
+在数据目录放一张 `data/cars_extra.csv` 就能补上，格式和主表一样
+`ID,ShortName,Maker`，**它优先于社区表**：
 
 ```csv
 ID,ShortName,Maker
@@ -238,6 +241,14 @@ GT7 的遥测包里**没有**这个字段（我们逐字段核对过偏移表，
 
 ## 🙏 致谢
 
+- [ddm999/gt7info](https://github.com/ddm999/gt7info) — **车型与赛道数据**。
+  本项目用到它的两张表：
+  - `_data/db/cars.csv`（车辆 ID → 车名）：由 `helper/download_cars_csv.py`
+    下载到 `data/cars.csv`，用来把遥测里的 `carCode` 显示成车名。
+    自动更新地址：<https://ddm999.github.io/gt7info/data/db/cars.csv>
+  - `_data/db/course.csv`（赛道 ID / 名称 / 长度 / 弯道数）：共 122 条，
+    已内置进 `gt7analysis.py`，用于按圈长候选赛道名（内置而非运行时下载，
+    是为了纯内网也能认赛道）。
 - [InvoGT](https://github.com/InvolveDanny/InvoGT) — 字段偏移的权威参考
 - [go-gt7-telemetry](https://github.com/snipem/go-gt7-telemetry) — 解密参数
 - [Nenkai/gt7-udp](https://github.com/Nenkai) — 早期协议逆向
