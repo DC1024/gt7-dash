@@ -2141,8 +2141,9 @@ def session_track(path: Path) -> dict[str, Any]:
         #    "名字可能是逆向版"可以改，"完全没名字"没法用。
         track_id = int(lib["next_id"])
         lib["next_id"] = track_id + 1
-        top = _guess_track_name(fp.get("ref_len_m") or 0.0)
-        cands = gt7analysis.course_candidates(fp.get("ref_len_m") or 0.0)
+        top = _guess_track_name(fp.get("ref_len_m") or 0.0) if not lib.get("frozen") else None
+        cands = (gt7analysis.course_candidates(fp.get("ref_len_m") or 0.0)
+                 if not lib.get("frozen") else [])
         track_name = top["name"] if top else ""
         matched = False
         lib["tracks"].append({
@@ -3122,9 +3123,12 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数） |
+| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named） |
 | `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
+| `POST /api/v1/tracks/<id>/confirm` `{}` | 用户确认该赛道名正确：清掉 auto_named 标记，UI 不再提示待确认 |
+| `GET /tracks` | 赛道库管理页（Web）：查看系统识别的赛道形状 + 名称，可改名、确认 |
+| `GET /trash-view?file=<名>` | 回收站场次查看页（Web）：摘要 + 轨迹缩略图，便于判断要不要删除 |
 | `POST /api/v1/tracks/register` `{"file": "<场次文件>", "name": "真实赛道名"}` | 一键标注（补齐赛道库主入口）：算指纹→挂靠/新建→写名，同赛道所有场次一起生效 |
 
 - 代表圈挑选：圈长（坐标折线长度）相对**中位数** ±5% 先剔脏圈/残圈，
@@ -3606,7 +3610,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True, "purged": 0}, cors=True)
                     return
                 cnt = 0
-                for tf in trash.glob("*.jsonl"):
+                for tf in list(trash.glob("*.jsonl")) + list(trash.glob("*.jsonl.gz")):
                     try:
                         tf.unlink()
                         cnt += 1
@@ -3667,6 +3671,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                 404, cors=True)
                 return
             tr["name"] = new
+            tr["verified"] = True
+            tr["auto_named"] = False
+            tr.pop("course_candidates", None)
             save_tracks(hist, lib)
             self._send_json({"ok": True, "id": tid, "name": new,
                              "hint": "已保存，同赛道所有场次一起生效"},
@@ -3713,6 +3720,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                 404, cors=True)
                 return
             tr["name"] = new
+            tr["verified"] = True
             # 🔴 用户已确认名字：清掉「按圈长猜」的标记与候选，避免 UI 再提示待确认
             tr["auto_named"] = False
             tr.pop("course_candidates", None)
@@ -3720,6 +3728,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "track_id": tid, "name": new,
                              "matched": bool(info.get("matched")),
                              "hint": "已写入赛道库，同赛道所有场次一起生效"},
+                            cors=True)
+            return
+
+        # /api/v1/tracks/<id>/confirm —— 用户确认某赛道名正确：清掉「自动识别」
+        #   标记，UI 不再提示待确认。这是用户「记录」赛道的一步（名字不变）。
+        if (len(seg) == 6 and seg[1:4] == ["api", "v1", "tracks"]
+                and seg[5] == "confirm"):
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                tid = int(seg[4])
+            except ValueError:
+                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                return
+            lib = load_tracks(hist)
+            tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
+            if not tr:
+                self._send_json({"error": "track not found", "id": tid},
+                                404, cors=True)
+                return
+            tr["verified"] = True
+            tr["auto_named"] = False
+            save_tracks(hist, lib)
+            self._send_json({"ok": True, "id": tid, "verified": True},
                             cors=True)
             return
 
@@ -3954,6 +3985,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
                 self._send_html(build_sessions_page(hist))
 
+            elif path == "/tracks":
+                # 赛道库管理页（查看系统识别的赛道形状 + 名称，可改可固化）
+                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+                self._send_html(build_tracks_page(hist))
+
+            elif path == "/trash-view":
+                # 回收站场次的轻量查看页（判断要不要删除，不必先恢复）
+                name = query.get("file", [""])[0]
+                if not name:
+                    self._send_html("<h1>缺少 file 参数</h1>", 400)
+                    return
+                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+                self._send_html(build_trash_view_page(hist, name))
+
             elif path == "/session":
                 # 单场次详情页
                 name = query.get("file", [""])[0]
@@ -4058,6 +4103,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     # 名字是**按圈长猜的**、未经用户确认 → true。
                     # 消费方据此提示"自动识别，待确认"（圈长相近的不同赛道会认错）。
                     "auto_named": bool(t.get("auto_named")),
+                    "verified": bool(t.get("verified")),
                     "turns_cw": t.get("turns_cw"),
                     "created": t.get("created"),
                     "sessions": cnt.get(t["id"], 0),
@@ -4316,7 +4362,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
                 s = load_settings(hist)
                 trash = hist / "_trash"
-                tfiles = list(trash.glob("*.jsonl")) if trash.is_dir() else []
+                tfiles = ((list(trash.glob("*.jsonl")) + list(trash.glob("*.jsonl.gz")))
+                          if trash.is_dir() else [])
                 tsize = 0
                 try:
                     tsize = sum(f.stat().st_size for f in tfiles)
@@ -4848,6 +4895,7 @@ function loadTrashSettings() {
         return '<tr data-anom="' + anom + '"><td style="font-size:12px;font-family:var(--mono)">' + t.name + badge +
           '</td><td class="num">' + t.size_kb + ' KB</td><td class="num">' + t.modified +
           '</td><td class="num">' +
+          '<a class="sbtn" href="/trash-view?file=' + encodeURIComponent(t.name) + '">查看</a>' +
           '<button class="sbtn" data-trash="' + nm + '" data-act="restore">↩ 恢复</button>' +
           '<button class="sbtn" data-trash="' + nm + '" data-act="delete">✕ 彻底删除</button>' +
           '</td></tr>';
@@ -7456,6 +7504,283 @@ def build_sessions_page(hist: Path) -> str:
     return _page_shell("历史场次", body)
 
 
+# —— 赛道库管理页 / 回收站查看页 共享的样式与脚本 ——
+# 🔴 这些块是「纯字符串」（非 f-string），里面的 { } 都是 JS/CSS 字面量，
+#    不要当成 Python 占位符。只有页面 body 里用 f-string 拼动态值。
+TRACKS_CSS = """<style>
+.tk-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+  gap:14px;margin-top:6px}
+.tk-card{display:flex;gap:14px;background:var(--card);border:1px solid var(--line);
+  border-radius:12px;padding:14px;align-items:center}
+.tk-info{flex:1;min-width:0}
+.tk-row{display:flex;align-items:center;gap:8px}
+.tk-name{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);
+  border-radius:8px;padding:6px 8px}
+.tk-badge{white-space:nowrap;font-size:11px}
+.tk-verified{color:var(--ok)}
+.tk-auto{color:var(--warn)}
+.tk-none{color:var(--muted)}
+.tk-meta{font-size:12px;color:var(--muted);margin:4px 0 8px}
+.tk-acts{display:flex;gap:8px}
+.tv-wrap{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.tv-facts{border-collapse:collapse;font-size:13px}
+.tv-facts td{padding:4px 10px 4px 0;border-bottom:1px solid var(--line)}
+.tv-facts .fk{color:var(--muted);white-space:nowrap}
+</style>"""
+
+TRACKS_PAGE_JS = r"""
+// 画赛道形状（desc 指纹或回收站轨迹点，都是 [[x,z],...]）。
+// z 取反，和游戏内置小地图方向一致。
+function drawTrackDesc(cv, pts){
+  if(!cv || !pts || pts.length < 2) return;
+  var PAD = 10;
+  var x0=Infinity,x1=-Infinity,z0=Infinity,z1=-Infinity;
+  for(var i=0;i<pts.length;i++){
+    var x=pts[i][0], z=pts[i][1];
+    if(x<x0)x0=x; if(x>x1)x1=x; if(z<z0)z0=z; if(z>z1)z1=z;
+  }
+  var spanX=Math.max(x1-x0,1e-6), spanZ=Math.max(z1-z0,1e-6);
+  var sc=Math.min((cv.width-2*PAD)/spanX,(cv.height-2*PAD)/spanZ);
+  var ox=(cv.width-spanX*sc)/2 - x0*sc;
+  var oy=(cv.height-spanZ*sc)/2 - z0*sc;
+  var px=function(x){return ox+x*sc;};
+  var py=function(z){return cv.height-(oy+z*sc);};
+  var ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.lineCap='round';
+  ctx.strokeStyle=getComputedStyle(document.documentElement)
+    .getPropertyValue('--accent') || '#0d6efd';
+  ctx.beginPath();
+  ctx.moveTo(px(pts[0][0]),py(pts[0][1]));
+  for(var i=1;i<pts.length;i++) ctx.lineTo(px(pts[i][0]),py(pts[i][1]));
+  ctx.stroke();
+}
+function drawAllTracks(){
+  document.querySelectorAll('canvas.trackDesc').forEach(function(cv){
+    try{ drawTrackDesc(cv, JSON.parse(cv.dataset.desc||'[]')); }
+    catch(e){ if(typeof renderErr==='function') renderErr('track-desc',e);
+              else console.error(e); }
+  });
+}
+function trackSave(btn){
+  var card=btn.closest('.tk-card'); if(!card) return;
+  var id=card.getAttribute('data-id');
+  var inp=card.querySelector('input.tk-name');
+  var v=inp.value.trim(); if(!v){ alert('名称不能为空'); return; }
+  fetch('/api/v1/tracks/'+id+'/rename',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){ alert('保存失败：'+(d.error||'')); return; }
+      card.querySelector('.tk-badge').innerHTML=
+        '<span class="tk-verified" title="你已确认">✓ 已记录</span>';
+    }).catch(function(e){ alert('保存失败：'+e); });
+}
+function trackConfirm(btn){
+  var card=btn.closest('.tk-card'); if(!card) return;
+  var id=card.getAttribute('data-id');
+  fetch('/api/v1/tracks/'+id+'/confirm',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){ alert('确认失败：'+(d.error||'')); return; }
+      card.querySelector('.tk-badge').innerHTML=
+        '<span class="tk-verified" title="你已确认">✓ 已记录</span>';
+    }).catch(function(e){ alert('确认失败：'+e); });
+}
+"""
+
+
+def _session_trajectory(path: Path, max_points: int = 160) -> list[list[float]]:
+    """回收站查看页用的轨迹缩略：取代表圈（点最多的有效圈）的降采样 [x, z]。
+
+    与历史列表缩略图同口径（已移除），只用于「查看」页画个小地图帮用户判断。
+    无坐标返回 []。
+    """
+    try:
+        _, store = _load_frames(path)
+    except Exception:
+        return []
+    if not store:
+        return []
+    frames = store.frames()
+    from collections import defaultdict
+    by_lap: dict[int, list] = defaultdict(list)
+    for f in frames:
+        lap = f.get("lap")
+        if lap and lap > 0:
+            by_lap[lap].append(f)
+    if by_lap:
+        frames = max(by_lap.values(), key=len)
+    pts = [(f.get("car_x"), f.get("car_z")) for f in frames]
+    pts = [(x, z) for x, z in pts if x is not None and z is not None]
+    if len(pts) < 2:
+        return []
+    if len(pts) > max_points:
+        stride = len(pts) / max_points
+        out = [pts[int(i * stride)] for i in range(max_points - 1)]
+        out.append(pts[-1])
+        pts = out
+    return [[round(float(x), 2), round(float(z), 2)] for x, z in pts]
+
+
+def build_tracks_page(hist: Path) -> str:
+    """赛道库管理页：查看系统识别的赛道形状 + 名称，可修改保存、标记已记录。
+
+    每条赛道画它的**几何指纹 desc**（归一化形状，即「系统已识别记录的地图」），
+    旁边是可编辑名称 + 保存/已记录按钮。这是补齐赛道库的主界面。
+    """
+    import html as _html
+    lib = load_tracks(hist)
+    cnt: dict[int, int] = {}
+    for s in lib["sessions"].values():
+        tid = s.get("track_id")
+        if tid is not None:
+            cnt[tid] = cnt.get(tid, 0) + 1
+    frozen = bool(lib.get("frozen"))
+    cards = []
+    for t in lib["tracks"]:
+        tid = t["id"]
+        name = t.get("name") or ""
+        desc = t.get("desc") or []
+        verified = bool(t.get("verified"))
+        auto = bool(t.get("auto_named")) and not verified
+        ref = t.get("ref_len_m")
+        turns = ("顺时针" if t.get("turns_cw") is True
+                 else "逆时针" if t.get("turns_cw") is False else "未知")
+        sessions = cnt.get(tid, 0)
+        if verified:
+            badge = '<span class="tk-verified" title="你已确认">✓ 已记录</span>'
+        elif auto:
+            badge = ('<span class="tk-auto" title="按圈长自动匹配，未经确认；'
+                     '改对名字后点保存/已记录">自动识别·待确认</span>')
+        else:
+            badge = '<span class="tk-none" title="尚未命名">未命名</span>'
+        desc_attr = _html.escape(json.dumps(desc, ensure_ascii=False))
+        cards.append(f"""
+    <div class="tk-card" data-id="{tid}">
+      <canvas class="trackDesc" data-desc="{desc_attr}" width="200" height="130"
+        style="background:rgba(128,128,128,.06);border-radius:8px"></canvas>
+      <div class="tk-info">
+        <div class="tk-row">
+          <input class="tk-name" value="{_html.escape(name)}" placeholder="未命名赛道"
+            maxlength="60" style="font-size:15px;font-weight:600">
+          <span class="tk-badge">{badge}</span>
+        </div>
+        <div class="tk-meta">圈长 {(ref or 0):.0f} m · {turns} · {sessions} 场</div>
+        <div class="tk-acts">
+          <button class="sbtn" onclick="trackSave(this)">保存</button>
+          <button class="sbtn" onclick="trackConfirm(this)">✓ 已记录</button>
+        </div>
+      </div>
+    </div>""")
+    if lib["tracks"]:
+        n_verified = sum(1 for t in lib["tracks"] if t.get("verified"))
+        summary = f"共 {len(lib['tracks'])} 条赛道 · 已记录 {n_verified} 条"
+        body = TRACKS_CSS + f"""
+<div class="top">
+  <a class="back" href="/">← 实时仪表盘</a>
+  <a class="back" href="/sessions">历史场次</a>
+  <span style="margin-left:auto;font-size:13px;color:var(--muted)">{summary}</span>
+</div>
+<p style="font-size:12.5px;color:var(--muted);margin:6px 0 12px">
+  下面是系统按轨迹形状识别出的赛道。形状图画的是「系统记录到的赛道轮廓」；
+  名字若是「自动识别·待确认」说明是按圈长猜的、可能不对——改对后点
+  <b>保存</b>（保存名字）或 <b>✓ 已记录</b>（确认名字正确）。全部赛道核对完成后，
+  请告诉我，我再把完整数据库正式固化进项目。</p>
+<div class="tk-grid">
+{''.join(cards)}
+</div>
+<script>
+{TRACKS_PAGE_JS}
+</script>"""
+    else:
+        body = TRACKS_CSS + f"""
+<div class="top"><a class="back" href="/">← 实时仪表盘</a>
+  <a class="back" href="/sessions">历史场次</a></div>
+<p style="font-size:13px;color:var(--muted)">赛道库还是空的——先去跑几圈，
+  历史场次页加载时会自动识别赛道形状并出现在这里。</p>"""
+    return _page_shell("赛道地图", body)
+
+
+def build_trash_view_page(hist: Path, name: str) -> str:
+    """回收站场次的轻量查看页：摘要 + 轨迹缩略图，方便判断要不要删除。"""
+    import html as _html
+    trash = hist / "_trash"
+    target = (trash / Path(name).name).resolve()
+    target = resolve_session(target)
+    if (not str(target).startswith(str(trash)) or not target.exists()
+            or not is_session_file(target)):
+        return _page_shell("回收站查看",
+            '<div class="card"><h2>文件不存在或已清理</h2>'
+            '<p><a href="/sessions">返回历史场次</a></p></div>')
+    try:
+        st = target.stat()
+    except OSError:
+        st = None
+    size_kb = round((st.st_size if st else 0) / 1024, 1)
+    modified = (datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                if st else "-")
+    try:
+        stats = analyze_session(target)
+    except Exception as e:
+        stats = {"error": f"解析失败: {e}"}
+    anomalous = _is_anomalous(_best_lap_of(target))
+    car = stats.get("car_name") or "未知"
+    dur = stats.get("duration")
+    laps = stats.get("laps") or []
+    valid = [l for l in laps if not l.get("incomplete")]
+    best = stats.get("best_lap")
+    reason = ("异常场次：没有完成圈，或唯一圈不足 20 秒（菜单 / 停车场 / 刚点火残片）"
+              if anomalous else "用户手动删除的场次")
+    traj = _session_trajectory(target)
+    traj_attr = _html.escape(json.dumps(traj, ensure_ascii=False))
+    facts = [("车型", _html.escape(str(car))),
+             ("大小", f"{size_kb} KB"),
+             ("删除时间", _html.escape(modified)),
+             ("时长", f"{dur:.1f}s" if isinstance(dur, (int, float)) else "-"),
+             ("有效圈", str(len(valid)))]
+    if best:
+        facts.append(("最快圈", f"{best['time']:.3f}s（第 {best['lap']} 圈）"))
+    facts_html = "".join(
+        f"<tr><td class='fk'>{k}</td><td>{v}</td></tr>" for k, v in facts)
+    traj_note = "" if traj else "（车辆未移动，无轨迹）"
+    nm = _html.escape(name)
+    body = TRACKS_CSS + f"""
+<div class="top">
+  <a class="back" href="/sessions">← 历史场次（回收站）</a>
+</div>
+<div class="card">
+  <h2 style="word-break:break-all">{nm}
+    <span class="anom-badge">回收站</span></h2>
+  <p style="font-size:12.5px;color:var(--muted);margin:2px 0 10px">{reason}</p>
+  <div class="tv-wrap">
+    <canvas class="trackDesc" data-desc="{traj_attr}" width="320" height="200"
+      style="background:rgba(128,128,128,.06);border-radius:8px"></canvas>
+    <div>
+      <table class="tv-facts">{facts_html}</table>
+      <div class="tk-meta" style="margin-top:8px">{traj_note}</div>
+    </div>
+  </div>
+  <div class="tk-acts" style="margin-top:14px">
+    <button class="sbtn" onclick="trashAct('{nm}','restore')">↩ 恢复到历史</button>
+    <button class="sbtn" onclick="trashAct('{nm}','delete')">✕ 彻底删除</button>
+  </div>
+</div>
+<script>
+{TRACKS_PAGE_JS}
+function trashAct(name, act){{
+  if(act==='delete' && !confirm('彻底删除该场次？此操作不可恢复。')) return;
+  fetch('/api/v1/trash/'+encodeURIComponent(name)+'/'+act,
+    {{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}})
+    .then(function(r){{return r.json();}}).then(function(d){{
+      if(!d.ok){{ alert('操作失败：'+(d.error||'')); return; }}
+      location.href='/sessions';
+    }}).catch(function(e){{ alert('操作失败：'+e); }});
+}}
+drawAllTracks();
+</script>"""
+    return _page_shell("回收站查看", body)
+
+
 def build_session_page(path: Path, stats: dict, ref_lap_no: int | None = None,
                        cmp_lap_no: int | None = None) -> str:
     """单场次详情：把离线统计展示成人能读的页面。"""
@@ -7998,6 +8323,7 @@ th { color:var(--muted); font-weight:500; }
   <span class="stat" id="carWrap" style="display:none">车 <b id="carname">-</b></span>
   <span class="nav">
     <a href="/sessions">历史场次</a>
+    <a href="/tracks">赛道地图</a>
     <a href="#" id="prefLink" onclick="event.preventDefault(); togglePrefPanel(true)">个性化</a>
     <a href="#" id="layoutLink" onclick="event.preventDefault(); toggleLayoutPanel(true)">布局</a>
     <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)">术语说明</a>

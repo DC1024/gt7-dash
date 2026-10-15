@@ -325,9 +325,12 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数） |
+| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named） |
 | `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
+| `POST /api/v1/tracks/<id>/confirm` `{}` | 用户确认该赛道名正确：清掉 auto_named 标记，UI 不再提示待确认 |
+| `GET /tracks` | 赛道库管理页（Web）：查看系统识别的赛道形状 + 名称，可改名、确认 |
+| `GET /trash-view?file=<名>` | 回收站场次查看页（Web）：摘要 + 轨迹缩略图，便于判断要不要删除 |
 | `POST /api/v1/tracks/register` `{"file": "<场次文件>", "name": "真实赛道名"}` | 一键标注（补齐赛道库主入口）：算指纹→挂靠/新建→写名，同赛道所有场次一起生效 |
 
 - 代表圈挑选：圈长（坐标折线长度）相对**中位数** ±5% 先剔脏圈/残圈，

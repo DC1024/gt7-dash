@@ -86,6 +86,7 @@ class TestTrackRegister:
         entry = next(t for t in tracks["tracks"] if t["id"] == tid)
         assert entry["name"] == "Test Circuit X"
         assert entry["auto_named"] is False
+        assert entry["verified"] is True
 
         # 列表该场带名（不再显示占位「未知/未命名」）
         _, sl = _req(port, "GET", "/api/v1/sessions?limit=50")
