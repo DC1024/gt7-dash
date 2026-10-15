@@ -1105,6 +1105,51 @@ def save_tracks(history_dir: Path, data: dict[str, Any]) -> None:
     fp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+def _file_sig(stat: "os.stat_result") -> list:
+    """场次文件的「状态快照」 [mtime_s, size]，用来判断赛道映射是否还对得上。
+
+    🔴 赛道指纹是**文件当前内容**的函数，但识别结果被当不可变缓存永久存了。
+       正在录制的场次文件会**一直变大** —— 拿它识别出来的指纹是半截的（实测：
+       一条 SUGO 第一圈刚跑 700m 时被识别，成了 689m 的假赛道，且再不重算）。
+       把识别那一刻的 (mtime, size) 一起存进映射，文件对不上就说明当时识别的
+       是残片 → 作废重算。老映射没有 sig 视为「待重算」。
+    """
+    return [int(stat.st_mtime), int(stat.st_size)]
+
+
+def _session_file_sig(path: Path) -> list | None:
+    """取文件当前快照；读不到返回 None（当作「无法判断」，保守不失效）。"""
+    try:
+        return _file_sig(path.stat())
+    except OSError:
+        return None
+
+
+def _gc_empty_tracks(lib: dict[str, Any]) -> int:
+    """把「一场都不挂」的赛道自动归档（不删除，可恢复），返回归档条数。
+
+    🔴 空壳赛道只会由「映射被作废重算」产生：原本挂在它名下的场次发现是在
+       半截文件上识别出来的，重算后被并回了**真正的**那条赛道，于是留下一个
+       零场次的假壳。它不该继续占着「赛道地图」主列表 → 归档。
+       语义与场次回收站一致：可恢复（restore）、可彻底删除（delete）。
+       用户已 verified 的赛道不动，避免误伤手工标注。
+    """
+    used = set()
+    for s in lib.get("sessions", {}).values():
+        tid = s.get("track_id")
+        if tid is not None:
+            used.add(tid)
+    n = 0
+    for t in lib.get("tracks", []):
+        if (t["id"] not in used and not t.get("verified")
+                and not t.get("archived")):
+            t["archived"] = True
+            t["archived_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            t["archived_reason"] = "识别结果已并回其它赛道（无场次）"
+            n += 1
+    return n
+
+
 def _first_car_code(path: Path) -> int:
     """轻量读场次首帧的 car_code（车型码，用于列表展示）。
 
@@ -1412,6 +1457,8 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     _kick_archive_sweep(history_dir, live)
     # 缺赛道识别的场次：收集起来，循环结束后在后台线程补（不阻塞列表响应）。
     missing_track: list[Path] = []
+    # 已映射、但文件快照对不上（当时是在半截/活场文件上识别的）→ 也送去重算。
+    stale_track: list[Path] = []
     for f in glob_sessions(history_dir)[:limit]:
         try:
             stat = f.stat()
@@ -1483,9 +1530,19 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                 if rl:
                     entry["track_name"] = f"未命名赛道 (~{int(round(rl))}m)"
             entry["track_id"] = tid if tid else None
+            # 🔴 识别只对「已跑完」的场次做（与残片自动归档同一把尺）：
+            #   * anomalous（无完成圈 / 唯一圈 <20s）= 菜单 / 停车场 / 刚点火残片；
+            #   * live（文件近 20s 内还在写）= 正在录制，此刻文件是**半截**的。
+            #   拿这两种文件算指纹，会把「刚跑出的半圈」当成整条赛道 ——
+            #   2026-10-16 实测：一条 SUGO 第一圈只跑到 689m 时被识别，就此成了
+            #   一条 689m 的假赛道且再不重算。等它跑完，下次加载自然会补识别。
             if not tid:
-                # 这场还没识别过赛道：交给后台补（不阻塞本请求）。
-                missing_track.append(f)
+                if not anomalous and not entry["live"]:
+                    missing_track.append(f)
+            elif not entry["live"] and th.get("sig") != _file_sig(stat):
+                # 已映射，但快照对不上（当时是半截/活场，或老映射没存快照）
+                # → 送进后台重算（自愈：并回真赛道、留下空壳再归档）。
+                stale_track.append(f)
             # 展示名：手动改名优先，否则按默认模板组合
             entry["display_name"] = (entry["custom_name"]
                                      or _session_display_name(entry, tpl))
@@ -1496,8 +1553,8 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     sessions.sort(key=lambda s: (not s["favorite"],))
     # 后台补赛道识别：首次打开历史页把没识别过的场次一次性算完并落库，
     # 之后列表页直接读 tracks.json 映射（零解析开销），跨部署持久。
-    if missing_track:
-        _kick_track_identify_sweep(history_dir, missing_track)
+    if missing_track or stale_track:
+        _kick_track_identify_sweep(history_dir, missing_track + stale_track)
     return sessions
 
 
@@ -2150,6 +2207,18 @@ def session_track(path: Path) -> dict[str, Any]:
     # —— 快路径：已识别过 ——
     hit = lib["sessions"].get(name)
     if hit:
+        # 🔴 映射存的是「识别那一刻的文件快照」(mtime+size)。对不上 = 文件后来
+        #    长大了 = 当时是活场/半截 → 那份指纹作废，走慢路径重算（自愈）。
+        #    老映射没存 sig（None != 当前快照）也一并重算一次，之后就有 sig 了。
+        cur_sig = _session_file_sig(path)
+        if cur_sig is not None and hit.get("sig") != cur_sig:
+            lib["sessions"].pop(name, None)
+            try:
+                save_tracks(hist, lib)
+            except OSError:
+                pass
+            hit = None
+    if hit:
         tr = next((t for t in lib["tracks"] if t["id"] == hit.get("track_id")),
                   None)
         if tr:
@@ -2224,7 +2293,11 @@ def session_track(path: Path) -> dict[str, Any]:
             "sample_session": name,
         })
     lib["sessions"][name] = {"track_id": track_id, "dist": round(best_d, 4)
-                             if best_d is not None else None}
+                             if best_d is not None else None,
+                             # 记下识别这一刻的文件快照：文件再变就说明当时是残片
+                             "sig": _session_file_sig(path)}
+    # 重算后可能有赛道变空壳（原挂靠的场次并回了真赛道）→ 归档，别占主列表。
+    _gc_empty_tracks(lib)
     try:
         save_tracks(hist, lib)
     except OSError:
@@ -3263,6 +3336,8 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 | `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
 | `POST /api/v1/tracks/<id>/confirm` `{}` | 用户确认该赛道名正确：清掉 auto_named 标记，UI 不再提示待确认 |
+| `POST /api/v1/tracks/<id>/restore` `{}` | 恢复「已归档」赛道：清掉 archived 标记，回到主网格 |
+| `POST /api/v1/tracks/<id>/delete` `{}` | 彻底删除赛道（不可恢复）；仍挂着场次时返回 409 |
 | `GET /tracks` | 赛道库管理页（Web）：查看系统识别的赛道形状 + 名称，可改名、确认 |
 | `GET /trash-view?file=<名>` | 回收站场次查看页（Web）：摘要 + 轨迹缩略图，便于判断要不要删除 |
 | `POST /api/v1/tracks/register` `{"file": "<场次文件>", "name": "真实赛道名"}` | 一键标注（补齐赛道库主入口）：算指纹→挂靠/新建→写名，同赛道所有场次一起生效 |
@@ -3273,6 +3348,15 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
   表示未命名，详情页显示「未命名赛道 #N」并给 ✎ 改名入口。
 - 场次→赛道映射也在这个文件里：**详情页首次打开时识别并落库**，
   列表页只读映射展示赛道名，绝不触发识别本身（那要解析整场 jsonl）。
+- 映射带场次文件的 `sig`（mtime+size）快照：文件继续写入后快照失配，
+  下次访问自动重算指纹——录制中途被扫到而建的「半圈赛道」会在跑完后
+  自愈并回真赛道，不再永久错分。
+- **识别只对「已跑完」的场次做**（无完成圈 / 唯一圈 <20s / 正在录制的活场
+  一律不进识别队列），从源头杜绝拿半圈指纹建赛道。
+- 一场都不挂、也未被你确认过的赛道会**自动进「已归档」区**
+  （`tracks[].archived=true`，含 `archived_at`/`archived_reason`），
+  语义同场次回收站：赛道页底部折叠展示，可恢复、可彻底删除。
+  `GET /api/v1/tracks` 每项带 `archived` / `archived_at` 字段。
 - 无有效圈的场次返回 `{error}`，不落库、不影响页面。
 
 ### 赛道 BoP 与官方 logo（附加字段，可为空）
@@ -3963,6 +4047,59 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             cors=True)
             return
 
+        # /api/v1/tracks/<id>/restore —— 把「已归档」的赛道恢复（去掉归档标记）。
+        #   语义与场次回收站的「恢复到历史」一致：可恢复。
+        if (len(seg) == 6 and seg[1:4] == ["api", "v1", "tracks"]
+                and seg[5] == "restore"):
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                tid = int(seg[4])
+            except ValueError:
+                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                return
+            lib = load_tracks(hist)
+            tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
+            if not tr:
+                self._send_json({"error": "track not found", "id": tid},
+                                404, cors=True)
+                return
+            tr.pop("archived", None)
+            tr.pop("archived_at", None)
+            tr.pop("archived_reason", None)
+            save_tracks(hist, lib)
+            self._send_json({"ok": True, "id": tid, "archived": False},
+                            cors=True)
+            return
+
+        # /api/v1/tracks/<id>/delete —— 从赛道库里**彻底删除**一条赛道
+        #   （不可恢复）。只允许删「一场都没挂」的赛道（通常就是已归档的空壳），
+        #   否则会凭空抹掉历史场次指向的赛道 → 有场次时返回 409。
+        if (len(seg) == 6 and seg[1:4] == ["api", "v1", "tracks"]
+                and seg[5] == "delete"):
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                tid = int(seg[4])
+            except ValueError:
+                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                return
+            lib = load_tracks(hist)
+            tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
+            if not tr:
+                self._send_json({"error": "track not found", "id": tid},
+                                404, cors=True)
+                return
+            used = any(s.get("track_id") == tid
+                       for s in lib["sessions"].values())
+            if used:
+                self._send_json({"error": "该赛道还挂着场次，不能删除",
+                                 "id": tid}, 409, cors=True)
+                return
+            lib["tracks"] = [t for t in lib["tracks"] if t["id"] != tid]
+            save_tracks(hist, lib)
+            self._send_json({"ok": True, "id": tid, "deleted": True},
+                            cors=True)
+            return
+
         # —— 录像 ↔ 遥测 锚点：POST /api/v1/sessions/<name>/video ——
         # 绑定 / 改偏移 / 自动探测 / 解绑，全走这一个端点（POST + body），
         # 不额外开 DELETE —— 免得 CORS 预检还要放行新方法。
@@ -4318,6 +4455,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     # 消费方据此提示"自动识别，待确认"（圈长相近的不同赛道会认错）。
                     "auto_named": bool(t.get("auto_named")),
                     "verified": bool(t.get("verified")),
+                    # 已归档：0 场次的空壳赛道（识别结果被并回真赛道后留下的）。
+                    # 仍在清单里返回（不是删除），前端把它排到「已归档」区，可恢复/删除。
+                    "archived": bool(t.get("archived")),
+                    "archived_at": t.get("archived_at"),
                     "turns_cw": t.get("turns_cw"),
                     "created": t.get("created"),
                     "sessions": cnt.get(t["id"], 0),
@@ -7779,6 +7920,15 @@ TRACKS_CSS = """<style>
 .tv-facts{border-collapse:collapse;font-size:13px}
 .tv-facts td{padding:4px 10px 4px 0;border-bottom:1px solid var(--line)}
 .tv-facts .fk{color:var(--muted);white-space:nowrap}
+/* 已归档赛道（0 场次的空壳，识别结果被并回真赛道后留下的）：
+   默认折叠，避免污染主列表；语义同场次回收站 —— 可恢复、可彻底删除。 */
+.tk-arch{margin-top:18px;border-top:1px solid var(--line);padding-top:10px}
+.tk-arch>summary{cursor:pointer;font-size:12.5px;color:var(--muted);list-style:none}
+.tk-arch>summary::-webkit-details-marker{display:none}
+.tk-arch .tk-card{opacity:.66;border-style:dashed}
+.tk-nametxt{font-size:15px;font-weight:600;flex:1;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.tk-danger{color:#e5484d;border-color:#e5484d66}
 </style>"""
 
 TRACKS_PAGE_JS = r"""
@@ -7838,6 +7988,27 @@ function trackConfirm(btn){
       card.querySelector('.tk-badge').innerHTML=
         '<span class="tk-verified" title="你已确认">✓ 已记录</span>';
     }).catch(function(e){ alert('确认失败：'+e); });
+}
+function trackRestore(btn){
+  var card=btn.closest('.tk-card'); if(!card) return;
+  var id=card.getAttribute('data-id');
+  fetch('/api/v1/tracks/'+id+'/restore',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){ alert('恢复失败：'+(d.error||'')); return; }
+      location.reload();
+    }).catch(function(e){ alert('恢复失败：'+e); });
+}
+function trackDelete(btn){
+  var card=btn.closest('.tk-card'); if(!card) return;
+  var id=card.getAttribute('data-id');
+  if(!confirm('彻底删除这条赛道记录？不可恢复。')) return;
+  fetch('/api/v1/tracks/'+id+'/delete',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){ alert('删除失败：'+(d.error||'')); return; }
+      location.reload();
+    }).catch(function(e){ alert('删除失败：'+e); });
 }
 """
 
@@ -7941,9 +8112,11 @@ def build_tracks_page(hist: Path) -> str:
     # 目录不存在 = 用户没拉过，走"只画形状"的分支，不是错误。
     logo_dir = hist / "tracklogos"
     cards = []
+    arch_cards = []
     for t in lib["tracks"]:
         tid = t["id"]
         name = t.get("name") or ""
+        archived = bool(t.get("archived"))
         desc = t.get("desc") or []
         verified = bool(t.get("verified"))
         auto = bool(t.get("auto_named")) and not verified
@@ -7970,6 +8143,28 @@ def build_tracks_page(hist: Path) -> str:
                              f'alt="" loading="lazy" '
                              f'title="{_html.escape(name or "赛道 logo")}">')
         desc_attr = _html.escape(json.dumps(desc, ensure_ascii=False))
+        if archived:
+            # 已归档赛道：只读展示 + 恢复/彻底删除，不进主网格
+            arch_at = _html.escape(str(t.get("archived_at") or "-"))
+            arch_reason = _html.escape(str(t.get("archived_reason") or ""))
+            arch_cards.append(f"""
+    <div class="tk-card" data-id="{tid}">
+      <canvas class="trackDesc" data-desc="{desc_attr}" width="200" height="130"
+        style="background:rgba(128,128,128,.06);border-radius:8px"></canvas>
+      <div class="tk-info">
+        <div class="tk-row">
+          {logo_html}
+          <span class="tk-nametxt" title="{arch_reason}">{_html.escape(name or "未命名赛道")}</span>
+          <span class="tk-badge">{badge}</span>
+        </div>
+        <div class="tk-meta">圈长 {(ref or 0):.0f} m · {turns} · {sessions} 场 · 归档于 {arch_at}</div>
+        <div class="tk-acts">
+          <button class="sbtn" onclick="trackRestore(this)">↩ 恢复</button>
+          <button class="sbtn tk-danger" onclick="trackDelete(this)">✕ 彻底删除</button>
+        </div>
+      </div>
+    </div>""")
+            continue
         cards.append(f"""
     <div class="tk-card" data-id="{tid}">
       <canvas class="trackDesc" data-desc="{desc_attr}" width="200" height="130"
@@ -7989,8 +8184,21 @@ def build_tracks_page(hist: Path) -> str:
       </div>
     </div>""")
     if lib["tracks"]:
-        n_verified = sum(1 for t in lib["tracks"] if t.get("verified"))
+        n_active = sum(1 for t in lib["tracks"] if not t.get("archived"))
+        n_verified = sum(1 for t in lib["tracks"]
+                         if t.get("verified") and not t.get("archived"))
+        n_arch = len(arch_cards)
         summary = f"共 {len(lib['tracks'])} 条赛道 · 已记录 {n_verified} 条"
+        arch_html = ""
+        if n_arch:
+            arch_html = f"""
+<details class="tk-arch">
+  <summary>已归档赛道（{n_arch}）— 识别结果已并入其它赛道，或长期无场次挂靠；
+    可恢复，也可彻底删除 ▾</summary>
+  <div class="tk-grid">
+{''.join(arch_cards)}
+  </div>
+</details>"""
         body = TRACKS_CSS + f"""
 <div class="top">
   <a class="back" href="/">← 实时仪表盘</a>
@@ -8005,6 +8213,7 @@ def build_tracks_page(hist: Path) -> str:
 <div class="tk-grid">
 {''.join(cards)}
 </div>
+{arch_html}
 <script>
 {TRACKS_PAGE_JS}
 drawAllTracks();
