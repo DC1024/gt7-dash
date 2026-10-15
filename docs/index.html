@@ -50,6 +50,10 @@
   .feat .ic { font-size:26px; }
   .feat h3 { font-size:16px; margin:10px 0 6px; }
   .feat p { color:var(--muted); font-size:13.8px; }
+  .feat code, p.sub code, .feat b { color:var(--text); }
+  .feat code, p.sub code { background:#0d1421; border:1px solid var(--line);
+    border-radius:5px; padding:1px 6px; font-size:12.5px;
+    font-family:'Cascadia Code',Consolas,monospace; }
   .code { background:#0d1421; border:1px solid var(--line); border-radius:12px;
     padding:18px 22px; font-family:'Cascadia Code',Consolas,monospace;
     font-size:13.5px; overflow-x:auto; color:#c9d5e8; }
@@ -69,6 +73,7 @@
   <a href="#features">特性</a>
   <a href="#deploy">部署</a>
   <a href="#api">API</a>
+  <a href="#coach">副驾</a>
   <a class="gh" href="https://github.com/DC1024/gt7-dash" target="_blank">GitHub →</a>
 </div></header>
 
@@ -84,7 +89,7 @@
     <div><b>60Hz</b>实时帧率</div>
     <div><b>0</b>第三方依赖</div>
     <div><b>296B</b>逐包解密</div>
-    <div><b>5+</b>公开API端点</div>
+    <div><b>37</b>公开API端点</div>
   </div>
 </div></section>
 
@@ -95,21 +100,38 @@
   <div class="feat"><div class="ic">🔵</div><h3>G 力球</h3>
     <p>仿赛车仪表的小球随 G 值实时摇晃：刹车向前、过弯向侧，
        弹簧动画平滑跟随，一眼读懂抓地力状态。</p></div>
-  <div class="feat"><div class="ic">🗺️</div><h3>行车轨迹</h3>
-    <p>整车轨迹按 G 力着色自动绘制——重刹点和急弯一目了然，
-       跑完一场完整保留。</p></div>
+  <div class="feat"><div class="ic">🗺️</div><h3>赛道地图 · 自动识别</h3>
+    <p>GT7 不下发赛道名，于是按轨迹的几何指纹自己认：同源场次指纹距离
+       0.006、不同赛道 0.24，差 40 倍。<code>/tracks</code> 页画出每条赛道
+       的形状让你核对，改名后同赛道所有场次一起生效。</p></div>
+  <div class="feat"><div class="ic">🚗</div><h3>行车轨迹双着色</h3>
+    <p>整车轨迹可在「按踏板着色」与「按 G 力着色」之间切换，圈号就地切不用
+       刷新页面——刹车粉→红、油门青→绿，G 力按合成值铺蓝→绿→橙→红。</p></div>
   <div class="feat"><div class="ic">📊</div><h3>G-G 图（抓地力圆）</h3>
     <p>整场横向/纵向 G 散点铺开，外边界就是轮胎极限——
        看看你到底用了几成抓地力。</p></div>
-  <div class="feat"><div class="ic">⏱️</div><h3>每圈圈速</h3>
-    <p>逐圈自动记录、最快圈高亮，冲线即上榜；
-       场次结束数据保留，历史随时回看。</p></div>
-  <div class="feat"><div class="ic">📂</div><h3>场次自动归档</h3>
-    <p>进赛道自动开始、回菜单自动结束，每场比赛独立成档；
-       支持收藏、改名、删除管理。</p></div>
-  <div class="feat"><div class="ic">🔌</div><h3>公开数据 API</h3>
-    <p>解密后的结构化数据带 CORS 直接暴露——写你自己的分析工具、
-       直播覆盖层、AI 解说，都不用重复造轮子。</p></div>
+  <div class="feat"><div class="ic">⏱️</div><h3>分段计时 · 理论最快圈</h3>
+    <p>把一圈切成 N 段逐段对比你自己的最好成绩，拼出「理论最快圈」，
+       哪一段在丢时间一目了然。</p></div>
+  <div class="feat"><div class="ic">📉</div><h3>走线偏差与轮胎滑移</h3>
+    <p>走线偏差给出相对参考圈的逐米横向偏移热力图；滑移检测由四轮角速度
+       自标定轮胎半径，识别空转与抱死。</p></div>
+  <div class="feat"><div class="ic">🎬</div><h3>事件时间线 · 集锦高光</h3>
+    <p>打滑 / 碰撞 / 极限刹车 / 出界自动打点；集锦按「置信度 × 类型权重」
+       排序，直接给出可喂 ffmpeg 的起止时间，剪视频不用自己找点。</p></div>
+  <div class="feat"><div class="ic">🔍</div><h3>逐帧可查可导</h3>
+    <p>全通道时序曲线带十字光标读数、逐帧原始数据表可翻页，
+       按整场或单圈导出 CSV（带 BOM，Excel 不乱码）。</p></div>
+  <div class="feat"><div class="ic">📂</div><h3>场次管理 · 无损归档</h3>
+    <p>进赛道自动开始、回菜单自动结束；老场次自动压成无损
+       <code>.jsonl.gz</code> 省 95% 空间。回收站里的场次
+       <b>点进去就能看</b>摘要和轨迹，确认没用再删。</p></div>
+  <div class="feat"><div class="ic">🎨</div><h3>10 套主题 · 布局自定义</h3>
+    <p>含新「座舱」主题（近黑底＋电光蓝，副屏仪表向）。卡片可拖拽排序、
+       隐藏、半宽整行，多套布局保存切换。</p></div>
+  <div class="feat"><div class="ic">🔌</div><h3>37 个公开 API 端点</h3>
+    <p>实时 / 场次 / 逐帧与分析 / 赛道 / 回收站 / 设置全覆盖，
+       带 CORS、字段与单位全部写进文档，版本化承诺只加不改。</p></div>
 </div>
 
 <h2 class="sec" id="deploy">三分钟部署</h2>
@@ -132,9 +154,20 @@ docker compose up -d<br><br>
 <span class="k">GET</span> /api/v1/laps<br><br>
 <span class="c"># 历史场次 → 单场统计</span><br>
 <span class="k">GET</span> /api/v1/sessions<br>
-<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;
+<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;<br><br>
+<span class="c"># 赛道库（自动识别出来的赛道）</span><br>
+<span class="k">GET</span> /api/v1/tracks<br>
+<span class="k">POST</span> /api/v1/tracks/register
 </div>
 <div class="code">
+<span class="c"># 单场分析（任选）</span><br>
+<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;/sectors?n=4<br>
+<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;/slip<br>
+<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;/deviation<br>
+<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;/profile<br>
+<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;/events<br>
+<span class="k">GET</span> /api/v1/sessions/&lt;file&gt;/highlights<br><br>
+<span class="c"># 返回示例（实时帧节选）</span><br>
 {<br>
 &nbsp;&nbsp;<span class="k">"car"</span>: {<br>
 &nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"speed_kph"</span>: 217.4,<br>
@@ -148,11 +181,40 @@ docker compose up -d<br><br>
 }
 </div>
 </div>
+<p class="sub" style="margin-top:24px">共 <b>37 个端点</b>，完整字段与单位说明见
+  <a href="https://github.com/DC1024/gt7-dash/blob/main/API文档.md" target="_blank"
+     style="color:var(--accent)">API文档.md</a>，
+  或直接访问运行中的 <code>/api/v1/docs</code>。</p>
+
+<h2 class="sec" id="coach">再来个实时副驾</h2>
+<p class="sub">同一份遥测，多一个「赛道工程师」在该说话的时候说一句。</p>
+<div class="feats">
+  <div class="feat"><div class="ic">🎧</div><h3>gt7-coach · 赛道工程师</h3>
+    <p>独立进程、独立仓库，纯本地判断、零云依赖。盯着同一份遥测，
+       用浏览器语音念出来——「1.5 秒后重刹区，参考最低 92」这种。
+       仪表盘实时页会多出一张卡片显示它的状态与播报内容。</p></div>
+  <div class="feat"><div class="ic">🧠</div><h3>判断在本地，措辞可以上云</h3>
+    <p>所有判断都在本地完成（硬实时 &lt;300ms 绝不依赖网络），
+       只有「这句话怎么说」可以选填一个云模型润色；没填就走本地模板，
+       没 key 就完全不外呼。</p></div>
+  <div class="feat"><div class="ic">🔗</div><h3>两边只靠 HTTP 联通</h3>
+    <p>教练读本服务的公开 v1（<code>/api/v1/live</code>、
+       <code>/sessions/&lt;f&gt;/profile</code>），卡片读教练的
+       <code>/api/v1/coach/state</code>。教练没启动时仪表盘照常工作。</p></div>
+</div>
+<div class="code" style="margin-top:18px">
+<span class="c"># 在**玩家电脑**上跑（扬声器旁边，不是服务器）</span><br>
+git clone https://github.com/DC1024/gt7-coach <span class="k">&&</span> cd gt7-coach<br>
+python -m gt7coach serve --dash http://&lt;本机IP&gt;:8787
+</div>
+
+</div><!-- /.wrap —— 这个闭合标签原本就漏了，导致 footer 被包进内容区 -->
 
 <footer><div class="wrap">
-  GT7 Dash · MIT License · 数据本地处理，不上传任何云端<br><br>
+  GT7 Dash v1.1.0 · MIT License · 数据本地处理，不上传任何云端<br><br>
   <a href="https://github.com/DC1024/gt7-dash" target="_blank">GitHub 仓库</a> ·
   <a href="https://github.com/DC1024/gt7-dash/blob/main/API文档.md" target="_blank">API 文档</a> ·
+  <a href="https://github.com/DC1024/gt7-coach" target="_blank">gt7-coach 赛道工程师</a> ·
   <a href="https://www.gran-turismo.com/" target="_blank">Gran Turismo 7</a>
 </div></footer>
 </body>

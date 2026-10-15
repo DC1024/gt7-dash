@@ -3455,10 +3455,10 @@ _GZIP_ENABLED = True        # --no-gzip 关掉（排障 / 抓包时看明文）
 
 
 # 版本号唯一定义处。发版时只改这一行。
-# 命名习惯跟随 git tag：这里是 `1.0.1`，对应发行标识 `v1.0.1`。
+# 命名习惯跟随 git tag：这里是 `1.1.0`，对应发行标识 `v1.1.0`。
 # 之所以单独设一个常量：此前 HTTP `Server:` 头里写死过 "GT7Dashboard/1.0"，
 # 发版时容易漏改（coach 那边已经踩过一次同样的坑）。
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 DEFAULT_PORT = 8787
 
