@@ -879,27 +879,29 @@ def session_thumb(path: Path, max_points: int = 120) -> list[list[float]]:
     """历史列表用的缩略轨迹：取代表圈（点最多的有效圈）的降采样 [x, z] 折线。
 
     给历史场次页每行画一个小地图缩略图用。只取一圈（轨迹形状足够认赛道），
-    选**帧数最多**的有效圈当代表（完整一圈、不走 analyze_session 省一次全量分析）；
-    整场无有效圈时退回全帧轨迹（菜单态也能有个大致形状）。
+    选**帧数最多**的有效圈当代表（完整一圈）。
+    🔴 不走 clean_laps / analyze_session 的全量距离·速度分析（缩略图用不上，
+    那套对大盘次要几百毫秒）——仅按 `lap` 轻量分组取最长的一圈，省一大笔。
+    整场无有效圈（菜单/停车场态）退回全帧轨迹（也能有个大致形状）。
     拿不到坐标 → 返回 []（前端显示占位文案，不报错）。
     """
     try:
-        _, grouped, _ = _valid_laps(path)
+        _, store = _load_frames(path)
     except Exception:
         return []
-    frames: list = []
-    if grouped:
-        # 点最多的有效圈 = 最完整的一圈（比"最快圈"便宜，缩略图够用）
-        frames = max(grouped.values(), key=len)
-    else:
-        # 没有有效圈：退回全帧（菜单/停车场态也能有个大致形状）
-        try:
-            _, store = _load_frames(path)
-            frames = store.frames() if store else []
-        except Exception:
-            frames = []
-    if not frames:
+    if not store:
         return []
+    frames = store.frames()
+    # 按 lap 轻量分组：取「点最多的有效圈」作代表（完整一圈）；
+    # 菜单态（无 lap>0）保留全帧。
+    from collections import defaultdict
+    by_lap: dict[int, list] = defaultdict(list)
+    for f in frames:
+        lap = f.get("lap")
+        if lap and lap > 0:
+            by_lap[lap].append(f)
+    if by_lap:
+        frames = max(by_lap.values(), key=len)
     pts = [(f.get("car_x"), f.get("car_z")) for f in frames]
     pts = [(x, z) for x, z in pts if x is not None and z is not None]
     if len(pts) < 2:
@@ -1059,6 +1061,30 @@ _TRACK_MATCH_TOL = 0.05
 # 命中阈值。依据（7 个真实场次、6 条赛道的探针实测）：同赛道指纹 RMS 距离
 # 0.0056，最近的不同赛道 0.2426 —— 间隔 43 倍。取 0.05：比同赛道值高一个
 # 数量级（容下抽稀/丢包造成的形状抖动），离异赛道值还有 5 倍安全余量。
+
+
+# 历史列表「地图」列的缩略轨迹缓存：data/thumbs.json
+#   { "<场次文件名>": {"mtime": <float>, "path": [[x,z]×N]} }
+# 🔴 缩略图要解析整场 jsonl（大盘次几百 MB），不能每次打开历史页都重算——
+#    首次算完按「文件名 + mtime」落盘，之后秒回（文件没变就命中）。
+_THUMBS_LOCK = threading.Lock()
+
+
+def load_thumbs(history_dir: Path) -> dict[str, Any]:
+    fp = history_dir / "thumbs.json"
+    try:
+        d = json.loads(fp.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_thumbs(history_dir: Path, data: dict[str, Any]) -> None:
+    fp = history_dir / "thumbs.json"
+    try:
+        fp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def load_tracks(history_dir: Path) -> dict[str, Any]:
@@ -3969,6 +3995,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # 历史列表一次性取所有场的缩略轨迹（避免每行各发一个请求）。
                 # 🔴 必须排在下面 `path.startswith("/api/v1/sessions/")` 之前，
                 #    否则 /thumbs 会被当成场次名吞掉 → 404。
+                # 🔴 缓存：缩略图要解析整场 jsonl（大盘次几百 MB），不能每次重算；
+                #    首次算完按「文件名 + mtime」落 data/thumbs.json，之后秒回。
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 files = [x for x in query.get("files", [""])[0].split(",") if x]
                 try:
@@ -3976,17 +4004,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     mp = 120
                 mp = max(8, min(mp, 400))
-                thumbs: dict[str, list] = {}
-                for nm in files:
-                    target = (hist / Path(nm).name).resolve()
-                    target = resolve_session(target)
-                    if (not str(target).startswith(str(hist)) or not target.exists()
-                            or not is_session_file(target)):
-                        continue
-                    try:
-                        thumbs[Path(nm).name] = session_thumb(target, mp)
-                    except Exception:
-                        thumbs[Path(nm).name] = []
+                with _THUMBS_LOCK:
+                    cache = load_thumbs(hist)
+                    thumbs: dict[str, list] = {}
+                    dirty = False
+                    for nm in files:
+                        key = Path(nm).name
+                        target = (hist / key).resolve()
+                        target = resolve_session(target)
+                        if (not str(target).startswith(str(hist))
+                                or not target.exists()
+                                or not is_session_file(target)):
+                            continue
+                        hit = cache.get(key)
+                        try:
+                            mtime = target.stat().st_mtime
+                        except OSError:
+                            mtime = None
+                        if (hit and isinstance(hit, dict) and hit.get("path")
+                                and hit.get("mtime") == mtime):
+                            thumbs[key] = hit["path"]
+                            continue
+                        try:
+                            p = session_thumb(target, mp)
+                        except Exception:
+                            p = []
+                        thumbs[key] = p
+                        cache[key] = {"mtime": mtime, "path": p}
+                        dirty = True
+                    if dirty:
+                        save_thumbs(hist, cache)
                 self._send_json({"thumbs": thumbs}, cors=True)
 
             elif path == "/api/v1/tracks":
