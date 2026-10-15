@@ -157,3 +157,25 @@ class TestCarName:
 
     def test_missing_csv_no_crash(self, tmp_path):
         assert car_name_of(3459, str(tmp_path / "absent.csv")) == "CAR-ID-3459"
+
+    def test_extra_table_covers_community_gap(self, tmp_path):
+        """社区表还没收录的车（如 3656）由手工补充表补上。"""
+        csv = tmp_path / "cars.csv"
+        csv.write_text("ID,ShortName,Maker\n3459,918 Spyder '13,136\n",
+                       encoding="utf-8")
+        (tmp_path / "cars_extra.csv").write_text(
+            "ID,ShortName,Maker\n3656,Xiaomi Vision Gran Turismo,\n",
+            encoding="utf-8")
+        # 补充表与主表同目录 → 自动生效，不用改调用处
+        assert car_name_of(3656, str(csv)) == "Xiaomi Vision Gran Turismo"
+        # 主表该有的照旧
+        assert car_name_of(3459, str(csv)) == "918 Spyder '13"
+
+    def test_extra_table_overrides_community(self, tmp_path):
+        """补充表优先：玩家自己标的名字覆盖社区表的（万一社区译名不合意）。"""
+        csv = tmp_path / "cars.csv"
+        csv.write_text("ID,ShortName,Maker\n3459,918 Spyder '13,136\n",
+                       encoding="utf-8")
+        (tmp_path / "cars_extra.csv").write_text(
+            "ID,ShortName,Maker\n3459,保时捷 918,\n", encoding="utf-8")
+        assert car_name_of(3459, str(csv)) == "保时捷 918"

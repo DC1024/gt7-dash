@@ -9,32 +9,63 @@ from __future__ import annotations
 
 import bisect
 import math
+from pathlib import Path
 
 # —— 车型解析 ——————————————————————————————
 
 _CAR_CSV_CACHE: dict[str, dict[str, str]] = {}
 
 
-def car_name_of(code: int, csv_path: str | None = None) -> str:
+def _load_car_csv(path: str) -> dict[str, str]:
+    """读一张 `ID,ShortName,Maker` 表 → {ID: 车名}。读不到就是空表，不抛。
+
+    🔴 车名里可能带逗号吗？社区表的 ShortName 实测不含逗号，所以直接
+       split(',') 是安全的；真出现也只会截短，不会污染别的行。
+
+    🔴 用 utf-8-sig 而不是 utf-8：补充表多半是玩家用 Excel 填的，Excel 存
+       UTF-8 会带 BOM。用 utf-8 读的话首行 ID 变成 "\ufeffID"，isdigit()
+       判不过 —— 症状是「明明填了却查不到」，很难往编码上想。
+    """
+    table: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            for line in fh.read().splitlines()[1:]:
+                seg = line.split(",")
+                if len(seg) >= 2 and seg[0].strip().isdigit():
+                    table[seg[0].strip()] = seg[1].strip()
+    except OSError:
+        pass
+    return table
+
+
+def _extra_path_for(csv_path: str | None) -> str | None:
+    """社区表旁边那张手工补充表的路径（同目录 `cars_extra.csv`）。"""
+    if not csv_path:
+        return None
+    return str(Path(csv_path).with_name("cars_extra.csv"))
+
+
+def car_name_of(code: int, csv_path: str | None = None,
+                extra_path: str | None = None) -> str:
     """carCode → 车名。表来自 helper/download_cars_csv.py 下载的社区 CSV
     （格式 `ID,ShortName,Maker`，首行表头）。无表或未命中返回 CAR-ID-xxx。
+
+    **补充表优先**：同目录下的 `cars_extra.csv`（没有就自动按 `<csv目录>/cars_extra.csv`
+    找）会先查。这是给「社区表还没收录的车」留的手工入口 —— 例如 3656
+    （Xiaomi Vision Gran Turismo）在社区表里查不到，玩家自己标上就能显示正名。
 
     结果按 csv 路径缓存，多次调用只读一次文件。
     """
     if not code or code <= 0:
         return ""
-    key = csv_path or ""
+    ex = extra_path if extra_path is not None else _extra_path_for(csv_path)
+    key = f"{csv_path or ''}|{ex or ''}"
     if key not in _CAR_CSV_CACHE:
         table: dict[str, str] = {}
         if csv_path:
-            try:
-                with open(csv_path, encoding="utf-8", errors="replace") as fh:
-                    for line in fh.read().splitlines()[1:]:
-                        seg = line.split(",")
-                        if len(seg) >= 2 and seg[0].strip().isdigit():
-                            table[seg[0].strip()] = seg[1].strip()
-            except OSError:
-                pass
+            table.update(_load_car_csv(csv_path))
+        if ex:
+            table.update(_load_car_csv(ex))     # 手工标注覆盖社区表
         _CAR_CSV_CACHE[key] = table
     return _CAR_CSV_CACHE[key].get(str(code), f"CAR-ID-{code}")
 

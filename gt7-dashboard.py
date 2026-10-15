@@ -2877,7 +2877,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
 （`favorite: bool`、`custom_name: string`），收藏的场次排在最前。
-列表每项还带 `car_name`（车型短名，从 `cars.csv` 查 ShortName，查不到为空串）。
+列表每项还带 `car_name`（车型短名，从 `cars.csv` 查 ShortName，
+同目录的 `cars_extra.csv` 手工补充表优先，都查不到为 `CAR-ID-<码>`）。
 `anomalous: bool` 表示异常场次（没有任何完成圈 / 唯一圈 <20s，多为菜单、停车场、
 刚点火的残片）。这类场次在「历史场次」页加载时会**自动归档到下方回收站**（可恢复，
 保留期内可一键恢复），因此主列表里通常看不到它们；回收站卡片内可勾选「只看异常场次」
@@ -2911,7 +2912,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `lap_times` | array | `[[第几圈, 圈速毫秒], ...]` |
 | `lap_started_at` | float | 当前圈起点的墙上时刻（秒，time.time()）。接收器每次冲线更新；仪表盘用它反推上一圈用时，作为 GT7 不报 last_lap 时的兜底圈速来源 |
 | `car_code` | int | 车型码（全场非 0 众数；读不到为 0） |
-| `car_name` | string | 车型短名，`cars.csv` 查 ShortName，查不到空串 |
+| `car_name` | string | 车型短名，`cars.csv` 查 ShortName（`cars_extra.csv` 补充表优先），查不到为 `CAR-ID-<码>` |
 | `laps` | array | 逐圈详情，见下表 |
 | `best_lap` | object 或 null | 最快圈 `{lap, time}`；无完整圈为 null |
 
