@@ -167,7 +167,59 @@ def test_old_card_name_gone(embedded, doc_file):
     assert "参考圈赛车线" not in doc_file
 
 
+def test_two_copies_are_identical(embedded, doc_file):
+    """两份副本必须**全文**一致，而不只是关键段落一致。
+
+    2026-10-15 实测：只比对段落时，内嵌文档比 API文档.md 多出 4 行
+    （`anomalous` 说明 + `lap_started_at` 字段行）却全绿 —— 段落级比对
+    盖不住"新增段落"这种漂移。改成全文比对，以后改一边忘另一边必红。
+    """
+    assert embedded.strip() == doc_file.strip()
+
+
 def test_distance_axis_caveat_documented(embedded, doc_file):
     """时间差曲线按距离对齐这个坑，两份文档都要写。"""
     for text in (embedded, doc_file):
         assert "按距离对齐" in text
+
+
+# 实现在 gt7-dashboard.py 里的全部 v1 端点（GET 链 + POST 链）。
+# 新增端点忘了写进文档，这条会红 —— 文档「接口一览」必须覆盖全部。
+_IMPLEMENTED = [
+    "/api/v1/live", "/api/v1/laps", "/api/v1/sessions", "/api/v1/tracks",
+    "/api/v1/sessions/<文件名>", "/api/v1/sessions/<文件名>/download",
+    "/api/v1/sessions/<文件名>/series", "/api/v1/sessions/<文件名>/frames",
+    "/api/v1/sessions/<文件名>/csv", "/api/v1/sessions/<文件名>/raceline",
+    "/api/v1/sessions/<文件名>/sectors", "/api/v1/sessions/<文件名>/slip",
+    "/api/v1/sessions/<文件名>/deviation", "/api/v1/sessions/<文件名>/track",
+    "/api/v1/sessions/<文件名>/events", "/api/v1/sessions/<文件名>/pitstops",
+    "/api/v1/sessions/<文件名>/compare",
+    "/api/v1/sessions/<文件名>/highlights",
+    "/api/v1/sessions/<文件名>/video", "/api/v1/sessions/<文件名>/profile",
+    "/api/v1/settings", "/api/v1/docs",
+    "/api/v1/sessions/<文件名>/favorite", "/api/v1/sessions/<文件名>/rename",
+    "/api/v1/sessions/<文件名>/archive", "/api/v1/sessions/<文件名>/delete",
+    "/api/v1/trash/purge", "/api/v1/trash/<文件名>/restore",
+    "/api/v1/trash/<文件名>/delete", "/api/v1/settings/trash-retention",
+    "/api/v1/settings/name-template", "/api/v1/settings/archive-after",
+    "/api/v1/tracks/<id>/rename", "/api/v1/tracks/<id>/confirm",
+    "/api/v1/tracks/register",
+]
+
+
+def _overview(text: str) -> str:
+    return _slice(text, "## 接口一览", "### 参数")
+
+
+def test_every_endpoint_in_overview(embedded):
+    """接口一览必须列出全部端点（2026-10-15 前只列了 16 条，漏 21 条）。"""
+    ov = _overview(embedded)
+    missing = [p for p in _IMPLEMENTED if p not in ov]
+    assert not missing, f"接口一览缺少端点：{missing}"
+
+
+def test_manual_archive_documented(embedded, doc_file):
+    """手动归档（POST .../archive）之前整份文档都没提。"""
+    for text in (embedded, doc_file):
+        assert "`/api/v1/sessions/<文件名>/archive`" in text
+        assert "正在录制的场次返回 400" in text

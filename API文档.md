@@ -9,28 +9,86 @@
 
 ## 接口一览
 
+下面是**全部 v1 端点**（分组列出）。带 `<文件名>` 的路径里填
+`GET /api/v1/sessions` 返回的场次文件名（归档过的填 `.jsonl.gz` 也认）。
+逐帧 / 分析类接口的返回结构见下方同名章节。
+
+### 实时
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/v1/live?frames=N` | 实时遥测：最新一帧 + 最近 N 帧历史 + 轨迹 + G-G 散点 |
 | GET | `/api/v1/laps` | 当前场次的每圈成绩与最快圈 |
+
+### 场次列表与详情
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
 | GET | `/api/v1/sessions` | 历史场次文件列表 |
 | GET | `/api/v1/sessions/<文件名>` | 指定场次的统计摘要 |
 | GET | `/api/v1/sessions/<文件名>/download` | 下载原始 jsonl（attachment） |
 | POST | `/api/v1/sessions/<文件名>/favorite` | 收藏/取消收藏，body `{"value": true}` |
 | POST | `/api/v1/sessions/<文件名>/rename` | 改名，body `{"value": "新名称"}` |
+| POST | `/api/v1/sessions/<文件名>/archive` | 手动归档：就地压成无损 `.jsonl.gz`（正在录制的场次返回 400） |
 | POST | `/api/v1/sessions/<文件名>/delete` | 删除（移入服务器 `data/_trash/`，保留期后自动清除） |
-| GET | `/api/v1/settings` | 回收站保留期/清单与场次命名模板 |
-| POST | `/api/v1/settings/trash-retention` | 设置回收站保留天数，body `{"value": 30}`（0=永不清理） |
-| POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
+
+### 逐帧与分析（每类的返回结构见下方同名章节）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/sessions/<文件名>/series?lap=N&max_points=2400` | 整场（或第 N 圈）降采样时序，用于画曲线 |
+| GET | `/api/v1/sessions/<文件名>/frames?offset=0&limit=200&lap=N` | 分页逐帧数据（`limit` 上限 1000），用于表格 |
+| GET | `/api/v1/sessions/<文件名>/csv?lap=N` | 全量 CSV 下载（带 UTF-8 BOM，Excel 直接打开不乱码） |
+| GET | `/api/v1/sessions/<文件名>/raceline?lap=N` | 第 N 圈的行车轨迹（`lap` 缺省 = 最快圈） |
+| GET | `/api/v1/sessions/<文件名>/sectors?n=4` | 分段计时 + 理论最快圈（`n` = 段数 2~10） |
+| GET | `/api/v1/sessions/<文件名>/slip?max_points=120` | 轮胎滑移：空转 / 抱死检测 |
+| GET | `/api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | 走线偏差：相对参考圈的逐米横向偏移 |
+| GET | `/api/v1/sessions/<文件名>/profile?lap=N&step=5&prominence=12` | 一圈的按赛道位置索引剖面（刹车入点 / 弯心 / 给油点） |
+| GET | `/api/v1/sessions/<文件名>/compare?ref_lap=N&cmp_lap=M` | 圈间对比数据（时间差曲线 + 关键点配对） |
+| GET | `/api/v1/sessions/<文件名>/events?lap=N` | 驾驶事件时间线（打滑 / 碰撞 / 极限刹车 / 出界…） |
+| GET | `/api/v1/sessions/<文件名>/pitstops` | 进站与名次：进站检测 / stint 分析 / 名次时间线 |
+| GET | `/api/v1/sessions/<文件名>/highlights?top=10&pad_before=2&pad_after=1.5&min_score=0&types=&lap=` | 集锦剪辑时间轴（给出可喂 ffmpeg 的 `clip_start` / `duration`） |
+| GET | `/api/v1/sessions/<文件名>/video` | 录像↔遥测锚点：读取当前绑定 |
+| POST | `/api/v1/sessions/<文件名>/video` | 绑定录像 / 自动探测 / 解绑（`{clear:true}`） |
+
+### 赛道识别
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named） |
+| GET | `/api/v1/sessions/<文件名>/track` | 识别该场，返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
+| POST | `/api/v1/tracks/<id>/rename` | body `{"value": "名"}`：赛道改名，同赛道所有场次一起生效 |
+| POST | `/api/v1/tracks/<id>/confirm` | body `{}`：确认该赛道名正确，清掉「自动识别」标记 |
+| POST | `/api/v1/tracks/register` | body `{"file": "<场次文件>", "name": "真实赛道名"}`：一键标注（补齐赛道库主入口） |
+
+### 回收站与设置
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
 | POST | `/api/v1/trash/purge` | 清空回收站（彻底删除全部） |
 | POST | `/api/v1/trash/<文件名>/restore` | 从回收站恢复场次到列表 |
 | POST | `/api/v1/trash/<文件名>/delete` | 彻底删除回收站中的单个场次 |
-| POST | `/api/v1/settings/archive-after` | 设置自动归档保留天数，body `{"value": 30}`（0=不自动归档；归档为无损 `.jsonl.gz`） |
-| GET | `/api/v1/docs` | 本文档 |
+| GET | `/api/v1/settings` | 回收站保留期/清单、归档保留期与场次命名模板 |
+| POST | `/api/v1/settings/trash-retention` | 回收站保留天数，body `{"value": 30}`（0=永不清理） |
+| POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
+| POST | `/api/v1/settings/archive-after` | 自动归档保留天数，body `{"value": 30}`（0=不自动归档） |
+
+### 文档
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/docs` | 本文档（text/markdown） |
+
+> 另有 `/api/health`、`/api/state`、`/api/stats`、`/api/session` 是仪表盘页面
+> 自己用的**内部接口**，不在 v1 承诺范围内（不保证兼容），这里不展开。
 
 `favorite` 与 `custom_name` 会合并在 `GET /api/v1/sessions` 的返回里
 （`favorite: bool`、`custom_name: string`），收藏的场次排在最前。
 列表每项还带 `car_name`（车型短名，从 `cars.csv` 查 ShortName，查不到为空串）。
+`anomalous: bool` 表示异常场次（没有任何完成圈 / 唯一圈 <20s，多为菜单、停车场、
+刚点火的残片）。这类场次在「历史场次」页加载时会**自动归档到下方回收站**（可恢复，
+保留期内可一键恢复），因此主列表里通常看不到它们；回收站卡片内可勾选「只看异常场次」
+单独筛出这些异常项。进行中的活场不会被误移（靠 status.json 的录制状态保护）。
 
 ### 参数
 
@@ -58,6 +116,7 @@
 | `max_speed_kph` | float | 本场极速（km/h） |
 | `completed_laps` | int | 已完成圈数 |
 | `lap_times` | array | `[[第几圈, 圈速毫秒], ...]` |
+| `lap_started_at` | float | 当前圈起点的墙上时刻（秒，time.time()）。接收器每次冲线更新；仪表盘用它反推上一圈用时，作为 GT7 不报 last_lap 时的兜底圈速来源 |
 | `car_code` | int | 车型码（全场非 0 众数；读不到为 0） |
 | `car_name` | string | 车型短名，`cars.csv` 查 ShortName，查不到空串 |
 | `laps` | array | 逐圈详情，见下表 |
