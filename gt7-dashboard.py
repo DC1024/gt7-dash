@@ -7691,6 +7691,7 @@ def build_tracks_page(hist: Path) -> str:
 </div>
 <script>
 {TRACKS_PAGE_JS}
+drawAllTracks();
 </script>"""
     else:
         body = TRACKS_CSS + f"""

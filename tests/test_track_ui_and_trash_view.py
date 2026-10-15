@@ -83,6 +83,22 @@ class TestTrackPageAndConfirm:
         assert "trackFreeze" not in html
         assert "/api/v1/tracks/freeze" not in html
 
+    def test_赛道页面真的调用绘制函数(self, srv, dash):
+        # 回归：2026-10-15 线上页面只有 drawAllTracks 定义、没有调用，
+        # 26 张 canvas 全空白。定义在共享块里，调用必须单独断言。
+        # （空赛道库走无脚本的空态分支，所以这里要放一条赛道。）
+        hist = Path(srv.history_dir)
+        (hist / "tracks.json").write_text(json.dumps({
+            "next_id": 2,
+            "tracks": [{"id": 1, "name": "形状回归", "desc": [[0, 0], [1, 1]],
+                        "ref_len_m": 900, "turns_cw": True}],
+            "sessions": {},
+        }), encoding="utf-8")
+        html = dash.build_tracks_page(hist)
+        pos_def = html.find("function drawAllTracks")
+        pos_call = html.rfind("drawAllTracks();")
+        assert pos_def != -1 and pos_call > pos_def
+
     def test_confirm_标记已确认(self, srv):
         hist = Path(srv.history_dir)
         (hist / "tracks.json").write_text(json.dumps({
