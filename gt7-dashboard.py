@@ -1132,7 +1132,10 @@ def _gc_empty_tracks(lib: dict[str, Any]) -> int:
        半截文件上识别出来的，重算后被并回了**真正的**那条赛道，于是留下一个
        零场次的假壳。它不该继续占着「赛道地图」主列表 → 归档。
        语义与场次回收站一致：可恢复（restore）、可彻底删除（delete）。
-       用户已 verified 的赛道不动，避免误伤手工标注。
+       🔴 verified 的空壳**也归档**：2026-10-16 实测 SUGO 假赛道是用户当年
+       手工命名的（verified=True），若豁免 verified 它就永远占着主网格。
+       归档可逆（restore 一键回来），误伤可挽回；真赛道不会被误伤——
+       它名下的场次映射还在（trash 掉的场次也不清映射），不会变空壳。
     """
     used = set()
     for s in lib.get("sessions", {}).values():
@@ -1141,8 +1144,7 @@ def _gc_empty_tracks(lib: dict[str, Any]) -> int:
             used.add(tid)
     n = 0
     for t in lib.get("tracks", []):
-        if (t["id"] not in used and not t.get("verified")
-                and not t.get("archived")):
+        if t["id"] not in used and not t.get("archived"):
             t["archived"] = True
             t["archived_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
             t["archived_reason"] = "识别结果已并回其它赛道（无场次）"

@@ -282,17 +282,18 @@ class TestArchivedTrackUI:
 # ---------- gc ----------
 
 class TestGcEmptyTracks:
-    def test_挂靠中不归档_空壳归档_已归档不重复打标(self, dash):
+    def test_挂靠中不归档_空壳含verified一律归档_幂等(self, dash):
         lib = {"tracks": [
             {"id": 1, "name": "在用"},
             {"id": 2, "name": "空壳"},
             {"id": 3, "name": "已归档", "archived": True},
-            {"id": 4, "name": "用户确认过", "verified": True},
+            {"id": 4, "name": "用户确认过的空壳", "verified": True},
         ], "sessions": {"a.jsonl": {"track_id": 1}}}
-        assert dash._gc_empty_tracks(lib) == 1
+        assert dash._gc_empty_tracks(lib) == 2
         assert not lib["tracks"][0].get("archived")
         assert lib["tracks"][1]["archived"] is True
         assert lib["tracks"][2].get("archived") is True   # 原样保留
-        assert not lib["tracks"][3].get("archived"), "verified 不动"
+        assert lib["tracks"][3]["archived"] is True, \
+            "verified 空壳也归档（SUGO 假赛道当年被手工命名过）"
         # 再跑：没有新增
         assert dash._gc_empty_tracks(lib) == 0
