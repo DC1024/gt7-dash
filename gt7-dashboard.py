@@ -321,6 +321,38 @@ _FRAMES_CACHE: dict[str, tuple[float, int, dict, "FrameStore"]] = {}
 # ThreadingHTTPServer 是多线程的：缓存的读-改-写必须加锁，否则并发请求下
 # dict 可能在迭代中被另一个线程修改（RuntimeError / 读到半成品条目）。
 _CACHE_LOCK = threading.RLock()
+# LRU 容量：同时缓存的场次数上限 + 缓存帧数总上限（防内存膨胀）。
+# 🔴 历史场次之间来回切：旧上限只有 2 条，等于每次切场都冷解析一遍
+# （一场 217k 帧冷解析约 10s，热路径亚秒级），用户体感就是「点历史场次一直转圈」。
+# 提到 6 条 + 总帧数上限 250 万后，近期看过的场次都留在缓存里，二次进入秒开。
+_FRAME_CACHE_MAX_ENTRIES = 6
+_FRAME_CACHE_MAX_FRAMES = 2_500_000
+_CACHED_FRAMES_TOTAL = 0
+
+
+def _frames_cache_forget(key: str) -> None:
+    """移除一个缓存条目并维护帧数计数（调用方需持 _CACHE_LOCK）。"""
+    ent = _FRAMES_CACHE.pop(key, None)
+    if ent is not None:
+        global _CACHED_FRAMES_TOTAL
+        _CACHED_FRAMES_TOTAL -= len(ent[3])
+
+
+def _frames_cache_evict() -> None:
+    """在 entry 上限与帧数上限内驱逐最久未用的条目（调用方需持 _CACHE_LOCK）。
+
+    dict 保持插入顺序，next(iter) 即最久未用；命中时通过 _frames_cache_touch
+    把条目移到末尾续命，从而成为真正的 LRU 而非纯 FIFO。
+    """
+    while _FRAMES_CACHE and (len(_FRAMES_CACHE) > _FRAME_CACHE_MAX_ENTRIES
+                             or _CACHED_FRAMES_TOTAL > _FRAME_CACHE_MAX_FRAMES):
+        _frames_cache_forget(next(iter(_FRAMES_CACHE)))
+
+
+def _frames_cache_touch(key: str, ent) -> None:
+    """命中后把条目移到末尾（LRU 续命），调用方需持 _CACHE_LOCK。"""
+    _FRAMES_CACHE.pop(key, None)
+    _FRAMES_CACHE[key] = ent
 
 # —— 逐帧字段里「全库真正会读」的那些 ——
 # 实测一场 217475 帧的场次有 52 个逐帧字段，但代码真正会读的只有下面 16 个。
@@ -824,7 +856,14 @@ def _parse_frames(path: Path) -> tuple[dict, FrameStore]:
 
 
 def _load_frames(path: Path) -> tuple[dict, FrameStore]:
-    """读场次 jsonl（header + 全部帧），带 2 条目缓存，返回列式 FrameStore。"""
+    """读场次 jsonl（header + 全部帧），带 LRU 缓存（按 path + mtime/size 失效），
+    返回列式 FrameStore。
+
+    🔴 缓存从 2 条提到 6 条 + 总帧数上限：历史场次之间来回切不再是每次冷解析
+    （一场 217k 帧冷解析约 10s，热路径亚秒级）。jsonl 落盘后不可变，
+    mtime+size 失效足够。dict 保持插入顺序 + 命中时 _frames_cache_touch 续命，
+    实现成真 LRU 而非 FIFO。
+    """
     key = str(path)
     try:
         st = path.stat()
@@ -834,15 +873,17 @@ def _load_frames(path: Path) -> tuple[dict, FrameStore]:
     with _CACHE_LOCK:
         hit = _FRAMES_CACHE.get(key)
         if hit and (hit[0], hit[1]) == sig:
+            _frames_cache_touch(key, hit)   # LRU 续命
             return hit[2], hit[3]
     try:
         header, store = _parse_frames(path)
     except (OSError, json.JSONDecodeError, ValueError):
         return {}, FrameStore.empty()
     with _CACHE_LOCK:
-        while len(_FRAMES_CACHE) >= 2:   # 只留最近 2 个场次，防内存膨胀
-            _FRAMES_CACHE.pop(next(iter(_FRAMES_CACHE)))
+        _frames_cache_evict()
         _FRAMES_CACHE[key] = (sig[0], sig[1], header, store)
+        global _CACHED_FRAMES_TOTAL
+        _CACHED_FRAMES_TOTAL += len(store)
     return header, store
 
 
@@ -1207,8 +1248,8 @@ def archive_session(f: Path) -> bool:
             return False
         os.replace(tmp, gz)
         with _CACHE_LOCK:
-            _FRAMES_CACHE.pop(str(f), None)
-            _FRAMES_CACHE.pop(str(gz), None)
+            _frames_cache_forget(str(f))
+            _frames_cache_forget(str(gz))
         f.unlink()
         return True
     except (OSError, EOFError, gzip.BadGzipFile):
@@ -10401,6 +10442,21 @@ let coachUrl = (function(){
   if (!location.hostname) return 'http://127.0.0.1:8788';
   return location.protocol + '//' + location.hostname + ':8788';
 })();
+
+// 给教练服务（通常跑在玩家电脑 :8788）的所有取数套一个超时：万一 8788 不可达
+// （远程只转发了 8787、或教练没起），原生 fetch 会一直 pending 直到 TCP 超时，
+// 浏览器标签的加载圈就不会停，体感就是「进历史场次一直转圈」。用 AbortController
+// 在 8 秒内主动放弃，失败走既有的兜底（renderCoachOff / 收起面板），标签不再卡圈。
+const COACH_TIMEOUT_MS = 8000;
+function coachFetch(path, opts){
+  opts = opts || {};
+  const ac = new AbortController();
+  const t = setTimeout(function(){ ac.abort(); }, COACH_TIMEOUT_MS);
+  opts.signal = ac.signal;
+  return fetch(coachUrl + path, opts).then(function(r){
+    clearTimeout(t); return r;
+  }, function(e){ clearTimeout(t); throw e; });
+}
 // 默认不发声：① 浏览器要求先有一次用户手势才允许自动播放；
 //              ② 别在用户没准备的时候突然出声。点一下按钮即开启。
 let coachSpeakOn = false;
@@ -10453,7 +10509,7 @@ function coachHistToggle(){
 // silent=true 用于面板开着时的周期刷新：失败就静静等下一次，
 // 别因为一次抖动把面板收起来。
 function loadCoachPanel(silent){
-  fetch(coachUrl + '/api/v1/coach/panel')
+  coachFetch('/api/v1/coach/panel')
     .then(function(r){
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
@@ -10566,7 +10622,7 @@ function saveCoachSub(id, on){
     (g.subs || []).forEach(function(s){ if (s.id === id) s.on = on; });
   });
   renderCoachPanel({groups: coachPanelGroups});
-  fetch(coachUrl + '/api/v1/coach/config', {
+  coachFetch('/api/v1/coach/config', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({rules: patch}),
@@ -10598,7 +10654,7 @@ function saveCoachSub(id, on){
 let coachCloud = null;      // 服务端返回的最后一版云状态
 
 function loadCoachCloud(silent){
-  fetch(coachUrl + '/api/v1/coach/cloud')
+  coachFetch('/api/v1/coach/cloud')
     .then(function(r){
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
@@ -10657,7 +10713,7 @@ function saveCoachModel(){
   // 🔴 #H 三框一次 POST。key 框填的是**环境变量名**——真 key 待在环境变量里，
   //    服务端对明文 key 会直接 400 拒收，这里不用重复校验。
   const bodyData = {model: model, base_url: base, api_key_env: envName};
-  fetch(coachUrl + '/api/v1/coach/cloud', {
+  coachFetch('/api/v1/coach/cloud', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(bodyData),
@@ -10693,7 +10749,7 @@ function saveCoachModel(){
 //    该档基线，之后滑块微调改的就是 slip_threshold 本身。这里既不存预设学名、
 //    也不存基线值——全以 /api/v1/coach/config 返回为准（单一事实源）。
 function loadCoachSlip(silent){
-  fetch(coachUrl + '/api/v1/coach/config')
+  coachFetch('/api/v1/coach/config')
     .then(function(r){
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
@@ -10754,7 +10810,7 @@ let coachTyreCompound = 'unknown';
 let coachTyreRefreshN = 0;
 
 function loadCoachTyre(silent){
-  fetch(coachUrl + '/api/v1/coach/config')
+  coachFetch('/api/v1/coach/config')
     .then(function(r){
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
@@ -10827,7 +10883,7 @@ function fillTyreWinEdit(){
 function _postTyreWindow(body, onOk){
   const msg = $('twMsg');
   if (msg) msg.textContent = '保存中…';
-  fetch(coachUrl + '/api/v1/coach/config', {
+  coachFetch('/api/v1/coach/config', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body),
   })
@@ -10871,7 +10927,7 @@ function resetTyreWindow(){
 }
 
 function setTyreCompound(v){
-  fetch(coachUrl + '/api/v1/coach/config', {
+  coachFetch('/api/v1/coach/config', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({rules: {tyre_compound: v}}),
   })
@@ -10899,7 +10955,7 @@ function saveCoachSlipPreset(){
   const preset = sel.value;
   msg.className = 'cp-hint';
   msg.textContent = '保存中…';
-  fetch(coachUrl + '/api/v1/coach/config', {
+  coachFetch('/api/v1/coach/config', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({rules: {slip_preset: preset}}),
   })
@@ -10926,7 +10982,7 @@ function saveCoachSlipThreshold(){
   if (val) val.textContent = thr.toFixed(2);
   msg.className = 'cp-hint';
   msg.textContent = '保存中…';
-  fetch(coachUrl + '/api/v1/coach/config', {
+  coachFetch('/api/v1/coach/config', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({rules: {slip_threshold: thr}}),
   })
@@ -10996,7 +11052,7 @@ function setCoachMuted(id, muted){
     g.muted = m;                    // 乐观更新：勾选立刻跟手
   });
   renderCoachPanel({groups: coachPanelGroups});
-  fetch(coachUrl + '/api/v1/coach/panel', {
+  coachFetch('/api/v1/coach/panel', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({muted: next}),
@@ -11148,7 +11204,7 @@ function askCoachUrl(){
 }
 
 function pollCoach(){
-  fetch(coachUrl + '/api/v1/coach/state')
+  coachFetch('/api/v1/coach/state')
     .then(function(r){
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
