@@ -875,44 +875,9 @@ def race_line_session(path: Path, lap_no: int, decimate: int = 6) -> dict[str, A
         return {"error": str(e)}
 
 
-def session_thumb(path: Path, max_points: int = 120) -> list[list[float]]:
-    """历史列表用的缩略轨迹：取代表圈（点最多的有效圈）的降采样 [x, z] 折线。
-
-    给历史场次页每行画一个小地图缩略图用。只取一圈（轨迹形状足够认赛道），
-    选**帧数最多**的有效圈当代表（完整一圈）。
-    🔴 不走 clean_laps / analyze_session 的全量距离·速度分析（缩略图用不上，
-    那套对大盘次要几百毫秒）——仅按 `lap` 轻量分组取最长的一圈，省一大笔。
-    整场无有效圈（菜单/停车场态）退回全帧轨迹（也能有个大致形状）。
-    拿不到坐标 → 返回 []（前端显示占位文案，不报错）。
-    """
-    try:
-        _, store = _load_frames(path)
-    except Exception:
-        return []
-    if not store:
-        return []
-    frames = store.frames()
-    # 按 lap 轻量分组：取「点最多的有效圈」作代表（完整一圈）；
-    # 菜单态（无 lap>0）保留全帧。
-    from collections import defaultdict
-    by_lap: dict[int, list] = defaultdict(list)
-    for f in frames:
-        lap = f.get("lap")
-        if lap and lap > 0:
-            by_lap[lap].append(f)
-    if by_lap:
-        frames = max(by_lap.values(), key=len)
-    pts = [(f.get("car_x"), f.get("car_z")) for f in frames]
-    pts = [(x, z) for x, z in pts if x is not None and z is not None]
-    if len(pts) < 2:
-        return []
-    # 降采样：按 stride 抽点，首尾必保留（总数不超 max_points）
-    if len(pts) > max_points:
-        stride = len(pts) / max_points
-        out = [pts[int(i * stride)] for i in range(max_points - 1)]
-        out.append(pts[-1])   # 用真末帧兜底闭合并不超预算
-        pts = out
-    return [[round(float(x), 2), round(float(z), 2)] for x, z in pts]
+# 历史列表曾用 canvas 缩略轨迹图（session_thumb + /thumbs 端点 + thumbs.json
+# 缓存）。2026-10-15 改为「赛道名文字」列：识别复用详情页的 session_track，
+# 结果持久化到 data/tracks.json，列表页零解析开销。相关代码已移除。
 
 
 # 场次元数据（收藏 / 自定义名称）存 data/sessions_meta.json：
@@ -1063,28 +1028,8 @@ _TRACK_MATCH_TOL = 0.05
 # 数量级（容下抽稀/丢包造成的形状抖动），离异赛道值还有 5 倍安全余量。
 
 
-# 历史列表「地图」列的缩略轨迹缓存：data/thumbs.json
-#   { "<场次文件名>": {"mtime": <float>, "path": [[x,z]×N]} }
-# 🔴 缩略图要解析整场 jsonl（大盘次几百 MB），不能每次打开历史页都重算——
-#    首次算完按「文件名 + mtime」落盘，之后秒回（文件没变就命中）。
-_THUMBS_LOCK = threading.Lock()
-
-
-def load_thumbs(history_dir: Path) -> dict[str, Any]:
-    fp = history_dir / "thumbs.json"
-    try:
-        d = json.loads(fp.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_thumbs(history_dir: Path, data: dict[str, Any]) -> None:
-    fp = history_dir / "thumbs.json"
-    try:
-        fp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+# 历史列表「地图」列已改为赛道名文字（2026-10-15），缩略图缓存（thumbs.json）
+# 随之废弃移除。赛道识别结果改存 data/tracks.json（见 session_track / load_tracks）。
 
 
 def load_tracks(history_dir: Path) -> dict[str, Any]:
@@ -1287,6 +1232,46 @@ def _kick_archive_sweep(history_dir: Path, live: bool) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+# 赛道识别后台补：与归档 sweep 同一思路（不阻塞列表页、不并发跑第二遍）。
+# 列表页只对「缺 track_id」的场次调用，首跑把历史遗留场次一次性识别完并
+# 落 data/tracks.json；之后这些场次直接读映射，零解析开销。
+_TRACK_IDENT_LOCK = threading.Lock()
+_TRACK_IDENT_RUNNING = False
+
+
+def _kick_track_identify_sweep(history_dir: Path, paths: list[Path]) -> None:
+    """后台线程补赛道识别（不阻塞列表页，也不并发跑第二遍）。
+
+    `session_track` 首次要解析整场 jsonl（大盘次几百 MB），不能放在列表
+    请求里同步算——丢给 daemon 线程，列表页立即返回（缺名的场先显示
+    「未知赛道」，刷新即有名）。
+    """
+    global _TRACK_IDENT_RUNNING
+    if _TRACK_IDENT_RUNNING:
+        return
+    pending = [p for p in paths if p and p.exists()]
+    if not pending:
+        return
+
+    def _run() -> None:
+        global _TRACK_IDENT_RUNNING
+        try:
+            for p in pending:
+                try:
+                    session_track(p)
+                except Exception:
+                    # 单场失败不影响其他场（识别是增值功能，不阻断列表）。
+                    continue
+        finally:
+            _TRACK_IDENT_RUNNING = False
+
+    with _TRACK_IDENT_LOCK:
+        if _TRACK_IDENT_RUNNING:
+            return
+        _TRACK_IDENT_RUNNING = True
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def sweep_archive(history_dir: Path, days: float,
                   live: bool = False) -> int:
     """把超过 `days` 天没动过的场次压成 .jsonl.gz，返回本次归档了几场。
@@ -1361,6 +1346,9 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     # 🔴 绝不在列表页触发识别本身——那要解析整场 jsonl。
     _lib = load_tracks(history_dir)
     _track_names = {t["id"]: t.get("name") or "" for t in _lib["tracks"]}
+    # 圈长表：赛道名缺失时拼「未命名赛道 (~圈长m)」占位（能区分不同未知场，
+    # 且不臆造官方名——圈长不在内置库的赛道无法可靠猜名）。
+    _track_lens = {t["id"]: (t.get("ref_len_m") or 0) for t in _lib["tracks"]}
     sessions = []
     # 是否正在录制（一次判定，循环内复用）——用于保护活场不被自动归档
     live = _recording_active(history_dir)
@@ -1368,6 +1356,8 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     # 归档（老场次压缩成 .jsonl.gz）在**后台**跑：压一场 250MB 要几秒，
     # 放进列表页的请求里会让页面卡住。
     _kick_archive_sweep(history_dir, live)
+    # 缺赛道识别的场次：收集起来，循环结束后在后台线程补（不阻塞列表响应）。
+    missing_track: list[Path] = []
     for f in glob_sessions(history_dir)[:limit]:
         try:
             stat = f.stat()
@@ -1429,7 +1419,14 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                 or {}
             tid = th.get("track_id")
             entry["track_name"] = _track_names.get(tid, "") if tid else ""
+            if not entry["track_name"] and tid:
+                rl = _track_lens.get(tid)
+                if rl:
+                    entry["track_name"] = f"未命名赛道 (~{int(round(rl))}m)"
             entry["track_id"] = tid if tid else None
+            if not tid:
+                # 这场还没识别过赛道：交给后台补（不阻塞本请求）。
+                missing_track.append(f)
             # 展示名：手动改名优先，否则按默认模板组合
             entry["display_name"] = (entry["custom_name"]
                                      or _session_display_name(entry, tpl))
@@ -1438,6 +1435,10 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
             continue
     # 收藏的排前面，其余按时间倒序（原顺序）
     sessions.sort(key=lambda s: (not s["favorite"],))
+    # 后台补赛道识别：首次打开历史页把没识别过的场次一次性算完并落库，
+    # 之后列表页直接读 tracks.json 映射（零解析开销），跨部署持久。
+    if missing_track:
+        _kick_track_identify_sweep(history_dir, missing_track)
     return sessions
 
 
@@ -3991,51 +3992,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                  "data_dir": str(hist),
                                  "sessions": list_sessions(hist)}, cors=True)
 
-            elif path == "/api/v1/sessions/thumbs":
-                # 历史列表一次性取所有场的缩略轨迹（避免每行各发一个请求）。
-                # 🔴 必须排在下面 `path.startswith("/api/v1/sessions/")` 之前，
-                #    否则 /thumbs 会被当成场次名吞掉 → 404。
-                # 🔴 缓存：缩略图要解析整场 jsonl（大盘次几百 MB），不能每次重算；
-                #    首次算完按「文件名 + mtime」落 data/thumbs.json，之后秒回。
-                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-                files = [x for x in query.get("files", [""])[0].split(",") if x]
-                try:
-                    mp = int(query.get("max_points", ["120"])[0])
-                except ValueError:
-                    mp = 120
-                mp = max(8, min(mp, 400))
-                with _THUMBS_LOCK:
-                    cache = load_thumbs(hist)
-                    thumbs: dict[str, list] = {}
-                    dirty = False
-                    for nm in files:
-                        key = Path(nm).name
-                        target = (hist / key).resolve()
-                        target = resolve_session(target)
-                        if (not str(target).startswith(str(hist))
-                                or not target.exists()
-                                or not is_session_file(target)):
-                            continue
-                        hit = cache.get(key)
-                        try:
-                            mtime = target.stat().st_mtime
-                        except OSError:
-                            mtime = None
-                        if (hit and isinstance(hit, dict) and hit.get("path")
-                                and hit.get("mtime") == mtime):
-                            thumbs[key] = hit["path"]
-                            continue
-                        try:
-                            p = session_thumb(target, mp)
-                        except Exception:
-                            p = []
-                        thumbs[key] = p
-                        cache[key] = {"mtime": mtime, "path": p}
-                        dirty = True
-                    if dirty:
-                        save_thumbs(hist, cache)
-                self._send_json({"thumbs": thumbs}, cors=True)
-
             elif path == "/api/v1/tracks":
                 # 赛道库清单：识别出的所有赛道 + 各自挂了多少场次
                 hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
@@ -4917,66 +4873,8 @@ function sessDel(file) {
   if (!confirm('确定删除这场数据？\\n（移入下方「回收站」，可恢复或彻底删除）')) return;
   sessPost(file, 'delete', null);
 }
-// —— 历史列表「地图」列：每行画一个缩略轨迹 ——
-// 一次性把本页所有场的缩略轨迹（/api/v1/sessions/thumbs）取回再逐行画，
-// 避免 N 行各发一个请求；拿不到坐标的场显示占位文案。
-function drawThumb(cv, path) {
-  if (!cv || !path || path.length < 2) return;
-  var ctx = cv.getContext('2d');
-  ctx.clearRect(0, 0, cv.width, cv.height);
-  var PAD = 8;
-  var x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-  for (var i = 0; i < path.length; i++) {
-    var x = path[i][0], z = path[i][1];
-    if (x < x0) x0 = x; if (x > x1) x1 = x;
-    if (z < z0) z0 = z; if (z > z1) z1 = z;
-  }
-  var spanX = Math.max(x1 - x0, 1), spanZ = Math.max(z1 - z0, 1);
-  var sc = Math.min((cv.width - 2 * PAD) / spanX, (cv.height - 2 * PAD) / spanZ);
-  var ox = (cv.width - spanX * sc) / 2 - x0 * sc;
-  var oy = (cv.height - spanZ * sc) / 2 - z0 * sc;
-  var px = function (x) { return ox + x * sc; };
-  // z 取反，画出来才和游戏内置小地图方向一致（见主仪表盘 drawMapInto）
-  var py = function (z) { return cv.height - (oy + z * sc); };
-  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = getComputedStyle(document.documentElement)
-    .getPropertyValue('--accent') || '#0d6efd';
-  ctx.beginPath();
-  ctx.moveTo(px(path[0][0]), py(path[0][1]));
-  for (var i = 1; i < path.length; i++) ctx.lineTo(px(path[i][0]), py(path[i][1]));
-  ctx.stroke();
-}
-function loadSessionThumbs() {
-  var cvs = document.querySelectorAll('canvas.mapThumb');
-  if (!cvs.length) return;
-  var files = [];
-  cvs.forEach(function (cv) {
-    var f = cv.getAttribute('data-file'); if (f) files.push(f);
-  });
-  if (!files.length) return;
-  fetch('/api/v1/sessions/thumbs?files=' + encodeURIComponent(files.join(',')))
-    .then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }, function (e) { throw e; })
-    .then(function (d) {
-      var thumbs = (d && d.thumbs) || {};
-      cvs.forEach(function (cv) {
-        var f = cv.getAttribute('data-file');
-        var p = thumbs[f];
-        if (p && p.length >= 2) { drawThumb(cv, p); return; }
-        var c = cv.getContext('2d');
-        c.fillStyle = 'rgba(128,128,128,.5)';
-        c.font = '11px system-ui,sans-serif'; c.textAlign = 'center';
-        c.fillText('无轨迹', cv.width / 2, cv.height / 2);
-      });
-    }, function (e) {
-      if (typeof renderErr === 'function') renderErr('session-thumbs', e);
-      else console.error('[gt7-dash] session-thumbs', e);
-    });
-}
-loadSessionThumbs();
+// 历史列表「赛道」列已改为赛道名文字（2026-10-15），不再画 canvas 缩略图；
+// 赛道识别由后端 list_sessions 后台补并写入 data/tracks.json。
 </script>
 """
 
@@ -7423,10 +7321,7 @@ def build_sessions_page(hist: Path) -> str:
           }{'<span class="dim"> · ' + _html.escape(s['track_name']) + '</span>' if s.get('track_name') else ''}</td>
       <td>{s['modified']}</td>
       <td class="num">{s['size_kb']} KB</td>
-      <td style="text-align:center;padding:4px 6px">
-        <canvas class="mapThumb" data-file="{s['file']}" width="132" height="84"
-          style="background:rgba(128,128,128,.06);border-radius:6px;display:block;margin:0 auto"></canvas>
-      </td>
+      <td style="font-size:12.5px">{_html.escape(s.get('track_name') or '未知赛道')}</td>
       <td class="num">
         <button class="sbtn" title="收藏"
           onclick="sessPost('{s['file']}','favorite',{str(not s['favorite']).lower()})">{'★' if s['favorite'] else '☆'}</button>
@@ -7451,7 +7346,7 @@ def build_sessions_page(hist: Path) -> str:
   <table id="sessTable">
     <tr><th>场次</th><th>车型</th><th>采集时间</th>
         <th style="text-align:right">大小</th>
-        <th>地图</th>
+        <th>赛道</th>
         <th style="text-align:right">操作</th></tr>
     {''.join(rows)}
   </table>
