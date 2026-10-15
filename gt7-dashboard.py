@@ -875,6 +875,43 @@ def race_line_session(path: Path, lap_no: int, decimate: int = 6) -> dict[str, A
         return {"error": str(e)}
 
 
+def session_thumb(path: Path, max_points: int = 120) -> list[list[float]]:
+    """历史列表用的缩略轨迹：取代表圈（点最多的有效圈）的降采样 [x, z] 折线。
+
+    给历史场次页每行画一个小地图缩略图用。只取一圈（轨迹形状足够认赛道），
+    选**帧数最多**的有效圈当代表（完整一圈、不走 analyze_session 省一次全量分析）；
+    整场无有效圈时退回全帧轨迹（菜单态也能有个大致形状）。
+    拿不到坐标 → 返回 []（前端显示占位文案，不报错）。
+    """
+    try:
+        _, grouped, _ = _valid_laps(path)
+    except Exception:
+        return []
+    frames: list = []
+    if grouped:
+        # 点最多的有效圈 = 最完整的一圈（比"最快圈"便宜，缩略图够用）
+        frames = max(grouped.values(), key=len)
+    else:
+        # 没有有效圈：退回全帧（菜单/停车场态也能有个大致形状）
+        try:
+            _, store = _load_frames(path)
+            frames = store.frames() if store else []
+        except Exception:
+            frames = []
+    if not frames:
+        return []
+    pts = [(f.get("car_x"), f.get("car_z")) for f in frames]
+    pts = [(x, z) for x, z in pts if x is not None and z is not None]
+    if len(pts) < 2:
+        return []
+    # 降采样：按 stride 抽点，首尾必保留（总数不超 max_points）
+    if len(pts) > max_points:
+        stride = len(pts) / max_points
+        out = [pts[int(i * stride)] for i in range(max_points - 1)]
+        out.append(pts[-1])   # 用真末帧兜底闭合并不超预算
+        pts = out
+    return [[round(float(x), 2), round(float(z), 2)] for x, z in pts]
+
 
 # 场次元数据（收藏 / 自定义名称）存 data/sessions_meta.json：
 # jsonl 是不可变的原始数据，用户的标注必须放在边车文件里，
@@ -3928,6 +3965,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                  "data_dir": str(hist),
                                  "sessions": list_sessions(hist)}, cors=True)
 
+            elif path == "/api/v1/sessions/thumbs":
+                # 历史列表一次性取所有场的缩略轨迹（避免每行各发一个请求）。
+                # 🔴 必须排在下面 `path.startswith("/api/v1/sessions/")` 之前，
+                #    否则 /thumbs 会被当成场次名吞掉 → 404。
+                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+                files = [x for x in query.get("files", [""])[0].split(",") if x]
+                try:
+                    mp = int(query.get("max_points", ["120"])[0])
+                except ValueError:
+                    mp = 120
+                mp = max(8, min(mp, 400))
+                thumbs: dict[str, list] = {}
+                for nm in files:
+                    target = (hist / Path(nm).name).resolve()
+                    target = resolve_session(target)
+                    if (not str(target).startswith(str(hist)) or not target.exists()
+                            or not is_session_file(target)):
+                        continue
+                    try:
+                        thumbs[Path(nm).name] = session_thumb(target, mp)
+                    except Exception:
+                        thumbs[Path(nm).name] = []
+                self._send_json({"thumbs": thumbs}, cors=True)
+
             elif path == "/api/v1/tracks":
                 # 赛道库清单：识别出的所有赛道 + 各自挂了多少场次
                 hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
@@ -4809,6 +4870,66 @@ function sessDel(file) {
   if (!confirm('确定删除这场数据？\\n（移入下方「回收站」，可恢复或彻底删除）')) return;
   sessPost(file, 'delete', null);
 }
+// —— 历史列表「地图」列：每行画一个缩略轨迹 ——
+// 一次性把本页所有场的缩略轨迹（/api/v1/sessions/thumbs）取回再逐行画，
+// 避免 N 行各发一个请求；拿不到坐标的场显示占位文案。
+function drawThumb(cv, path) {
+  if (!cv || !path || path.length < 2) return;
+  var ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  var PAD = 8;
+  var x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (var i = 0; i < path.length; i++) {
+    var x = path[i][0], z = path[i][1];
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (z < z0) z0 = z; if (z > z1) z1 = z;
+  }
+  var spanX = Math.max(x1 - x0, 1), spanZ = Math.max(z1 - z0, 1);
+  var sc = Math.min((cv.width - 2 * PAD) / spanX, (cv.height - 2 * PAD) / spanZ);
+  var ox = (cv.width - spanX * sc) / 2 - x0 * sc;
+  var oy = (cv.height - spanZ * sc) / 2 - z0 * sc;
+  var px = function (x) { return ox + x * sc; };
+  // z 取反，画出来才和游戏内置小地图方向一致（见主仪表盘 drawMapInto）
+  var py = function (z) { return cv.height - (oy + z * sc); };
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = getComputedStyle(document.documentElement)
+    .getPropertyValue('--accent') || '#0d6efd';
+  ctx.beginPath();
+  ctx.moveTo(px(path[0][0]), py(path[0][1]));
+  for (var i = 1; i < path.length; i++) ctx.lineTo(px(path[i][0]), py(path[i][1]));
+  ctx.stroke();
+}
+function loadSessionThumbs() {
+  var cvs = document.querySelectorAll('canvas.mapThumb');
+  if (!cvs.length) return;
+  var files = [];
+  cvs.forEach(function (cv) {
+    var f = cv.getAttribute('data-file'); if (f) files.push(f);
+  });
+  if (!files.length) return;
+  fetch('/api/v1/sessions/thumbs?files=' + encodeURIComponent(files.join(',')))
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }, function (e) { throw e; })
+    .then(function (d) {
+      var thumbs = (d && d.thumbs) || {};
+      cvs.forEach(function (cv) {
+        var f = cv.getAttribute('data-file');
+        var p = thumbs[f];
+        if (p && p.length >= 2) { drawThumb(cv, p); return; }
+        var c = cv.getContext('2d');
+        c.fillStyle = 'rgba(128,128,128,.5)';
+        c.font = '11px system-ui,sans-serif'; c.textAlign = 'center';
+        c.fillText('无轨迹', cv.width / 2, cv.height / 2);
+      });
+    }, function (e) {
+      if (typeof renderErr === 'function') renderErr('session-thumbs', e);
+      else console.error('[gt7-dash] session-thumbs', e);
+    });
+}
+loadSessionThumbs();
 </script>
 """
 
@@ -7255,6 +7376,10 @@ def build_sessions_page(hist: Path) -> str:
           }{'<span class="dim"> · ' + _html.escape(s['track_name']) + '</span>' if s.get('track_name') else ''}</td>
       <td>{s['modified']}</td>
       <td class="num">{s['size_kb']} KB</td>
+      <td style="text-align:center;padding:4px 6px">
+        <canvas class="mapThumb" data-file="{s['file']}" width="132" height="84"
+          style="background:rgba(128,128,128,.06);border-radius:6px;display:block;margin:0 auto"></canvas>
+      </td>
       <td class="num">
         <button class="sbtn" title="收藏"
           onclick="sessPost('{s['file']}','favorite',{str(not s['favorite']).lower()})">{'★' if s['favorite'] else '☆'}</button>
@@ -7279,6 +7404,7 @@ def build_sessions_page(hist: Path) -> str:
   <table id="sessTable">
     <tr><th>场次</th><th>车型</th><th>采集时间</th>
         <th style="text-align:right">大小</th>
+        <th>地图</th>
         <th style="text-align:right">操作</th></tr>
     {''.join(rows)}
   </table>
