@@ -3125,6 +3125,7 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 | `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数） |
 | `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
+| `POST /api/v1/tracks/register` `{"file": "<场次文件>", "name": "真实赛道名"}` | 一键标注（补齐赛道库主入口）：算指纹→挂靠/新建→写名，同赛道所有场次一起生效 |
 
 - 代表圈挑选：圈长（坐标折线长度）相对**中位数** ±5% 先剔脏圈/残圈，
   幸存圈里挑用时最短的——最快圈走线最干净。
@@ -3669,6 +3670,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
             save_tracks(hist, lib)
             self._send_json({"ok": True, "id": tid, "name": new,
                              "hint": "已保存，同赛道所有场次一起生效"},
+                            cors=True)
+            return
+
+        # /api/v1/tracks/register —— 一键标注：把某场次标注为指定赛道名，
+        #   一次性完成「算指纹 → 挂靠/新建赛道 → 写名」并落库。
+        #   body {"file": "<场次文件名>", "name": "<真实赛道名>"}。
+        #   同赛道（指纹在 _TRACK_MATCH_TOL 内）的所有场次一起生效。
+        #   🔴 这是「补齐赛道库」的主入口：用户每跑一圈，标注一次即可，
+        #      之后该赛道任何场次（含历史）都自动显示这个名字。
+        if (len(seg) == 5 and seg[1:4] == ["api", "v1", "tracks"]
+                and seg[4] == "register"):
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except Exception:
+                body = {}
+            fname = str(body.get("file") or "").strip()
+            new = str(body.get("name") or "").strip()[:60]
+            if not fname or not new:
+                self._send_json({"error": "file 与 name 都不能为空"}, 400,
+                                cors=True)
+                return
+            target = (hist / Path(fname).name).resolve()
+            target = resolve_session(target)
+            if (not str(target).startswith(str(hist)) or not target.exists()
+                    or not is_session_file(target)):
+                self._send_json({"error": "session not found", "file": fname},
+                                404, cors=True)
+                return
+            info = session_track(target)
+            if "error" in info:
+                self._send_json({"error": "无法识别该场次赛道（可能无有效圈）",
+                                 "detail": info.get("error")}, 422, cors=True)
+                return
+            tid = info["track_id"]
+            lib = load_tracks(hist)
+            tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
+            if not tr:
+                self._send_json({"error": "track not found", "id": tid},
+                                404, cors=True)
+                return
+            tr["name"] = new
+            # 🔴 用户已确认名字：清掉「按圈长猜」的标记与候选，避免 UI 再提示待确认
+            tr["auto_named"] = False
+            tr.pop("course_candidates", None)
+            save_tracks(hist, lib)
+            self._send_json({"ok": True, "track_id": tid, "name": new,
+                             "matched": bool(info.get("matched")),
+                             "hint": "已写入赛道库，同赛道所有场次一起生效"},
                             cors=True)
             return
 
