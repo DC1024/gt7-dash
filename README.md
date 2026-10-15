@@ -7,11 +7,13 @@
 ![GHCR](https://img.shields.io/badge/镜像-ghcr.io-blue)
 ![License](https://img.shields.io/badge/许可-MIT-green)
 
-> **当前版本：v1.1.0** —— 本版新增**赛道地图**：系统按轨迹几何指纹自动识别赛道，
-> 在 `/tracks` 页画出每条赛道的形状供你核对，名字不对可就地改名保存、确认后
-> 全场次生效；回收站里的场次现在**点进去就能看**（摘要 + 轨迹），不用先恢复
-> 再判断删不删。界面一并重塑（新增「座舱」主题、圈速列表改分栏表、踏板卡加
-> 20 秒轨迹面积图），公开 API 的文档补成完整清单（37 个端点）。
+> **当前版本：v1.2.0** —— 延续上版的**赛道地图**与界面重塑，本版把
+> [ddm999/gt7info](https://github.com/ddm999/gt7info) 的车型数据用得更足：
+> 场次与实时界面现在显示**车型名片**（品牌 + 车名 + 赛事组别徽章）；
+> `/tracks` 页给有标注的赛道加 **BoP 档位徽章**、并可选显示**官方赛道 logo**
+> （跑 `python helper/download_track_logos.py ./data` 拉取，图是游戏素材不入库）；
+> 新增 `GET /api/v1/tyres` 返回社区实测的**轮胎寿命与湿地特性**参考表。
+> 公开 API 的文档补成完整清单（38 个端点）。
 
 ## ⬇️ 下载（Windows 免安装）
 
@@ -31,6 +33,17 @@ http://127.0.0.1:8787 查看。
   一键标注。识别结果存在 `data/tracks.json`（边车文件，跨部署/重装都不丢）
 - **回收站可直接查看（新）**：回收站里的场次点「查看」就进详情页看摘要和轨迹，
   确认没用再彻底删除——不用像以前那样先恢复才能看
+- **车型名片（新）**：历史场次列表与实时界面现在显示「品牌 + 车名 + 赛事组别徽章」，
+  例如 `Porsche` 918 Spyder '13 `Gr.X`、Suzuki Escudo `Gr.X`。品牌来自
+  ddm999/gt7info 的 `maker.csv`，组别（`Gr.1`~`Gr.4` / `Gr.B` / `Gr.X`）来自
+  `cargrp.csv`，两张表都已内置；街车与未收录车自动不显示徽章
+- **赛道 BoP 与官方 logo（新）**：`/tracks` 页给有标注的赛道加 **BoP 档位徽章**
+  （高速 / 中速 / 低速，社区人工标注，仅部分赛道有）；并可选显示**官方赛道 logo**
+  （跑 `python helper/download_track_logos.py ./data` 拉到 `data/tracklogos/`，
+  图是游戏美术素材、**不随仓库分发**——没拉过时页面自动退回只画形状）
+- **轮胎参考数据（新）**：新增 `GET /api/v1/tyres` 返回社区实测的**各胎种寿命圈数**
+  与**湿地胎特性**（积水打滑阈值等）。🔴 这是参考资料不是遥测量——GT7 不下发胎种 /
+  天气 / 积水率，不能用于实时判断，返回体里 `note` 也写了这句
 - **行车轨迹双着色**：详情页的「行车轨迹」卡片可在「按踏板着色」与「按 G 力着色」
   之间自由切换（与实时仪表盘的轨迹同算法），圈号也能就地切换、不必刷新页面——
   踏板口径下刹车粉→红、油门青→绿，G 力口径按合成 G 大小铺蓝→绿→橙→红
@@ -64,8 +77,8 @@ http://127.0.0.1:8787 查看。
 - **个性化外观**：10 套主题预设（跟随系统 / 浅色 / 深色 / OLED 赛道黑 / 米黄护眼 /
   GT 竞速 / 冰川蓝 / HUD 荧光 / 午夜紫 / **座舱**）、强调色自选、卡片间距与读数大小、
   速度单位 km/h⇄mph、实时曲线窗口与线条开关、G 力量程，偏好存本浏览器并可导出/导入
-- **公开 API**：`/api/v1/*` 共 **37 个端点**（实时 / 场次 / 逐帧与分析 / 赛道 /
-  回收站 / 设置 / 文档），返回解密后的结构化数据（带 CORS），第三方程序直接消费
+- **公开 API**：`/api/v1/*` 共 **38 个端点**（实时 / 场次 / 逐帧与分析 / 赛道 /
+  参考数据 / 回收站 / 设置 / 文档），返回解密后的结构化数据（带 CORS），第三方程序直接消费
 - **数据本地化**：Salsa20 在本地解密，无云端、无第三方依赖
 
 ## 🚀 快速开始
@@ -83,7 +96,7 @@ docker compose up -d
 
 ## 🔌 数据 API
 
-解密后的结构化数据通过 HTTP 公开（带 CORS），全部 **37 个端点**分组如下：
+解密后的结构化数据通过 HTTP 公开（带 CORS），全部 **38 个端点**分组如下：
 
 | 分组 | 端点 |
 |---|---|
@@ -91,6 +104,7 @@ docker compose up -d
 | 场次 | `/sessions`、`/sessions/<文件名>`、`/download`、`/favorite`、`/rename`、`/archive`、`/delete` |
 | 逐帧与分析 | `/series`、`/frames`、`/csv`、`/raceline`、`/sectors`、`/slip`、`/deviation`、`/profile`、`/compare`、`/events`、`/pitstops`、`/highlights`、`/video` |
 | 赛道 | `/tracks`、`/sessions/<文件名>/track`、`/tracks/<id>/rename`、`/tracks/<id>/confirm`、`/tracks/register` |
+| 参考数据 | `/tyres` |
 | 回收站与设置 | `/trash/purge`、`/trash/<文件名>/{restore,delete}`、`/settings`、`/settings/{trash-retention,name-template,archive-after}` |
 | 文档 | `/docs` |
 
@@ -241,14 +255,21 @@ GT7 的遥测包里**没有**这个字段（我们逐字段核对过偏移表，
 
 ## 🙏 致谢
 
-- [ddm999/gt7info](https://github.com/ddm999/gt7info) — **车型与赛道数据**。
-  本项目用到它的两张表：
+- [ddm999/gt7info](https://github.com/ddm999/gt7info) — **车型 / 赛道 / 轮胎参考数据**。
+  本项目用到它多张表：
   - `_data/db/cars.csv`（车辆 ID → 车名）：由 `helper/download_cars_csv.py`
     下载到 `data/cars.csv`，用来把遥测里的 `carCode` 显示成车名。
     自动更新地址：<https://ddm999.github.io/gt7info/data/db/cars.csv>
   - `_data/db/course.csv`（赛道 ID / 名称 / 长度 / 弯道数）：共 122 条，
     已内置进 `gt7analysis.py`，用于按圈长候选赛道名（内置而非运行时下载，
     是为了纯内网也能认赛道）。
+  - `_data/db/maker.csv`（厂商 ID → 品牌 + 国别）、`_data/db/cargrp.csv`
+    （车辆 ID → 赛事组别 `Gr.1`~`Gr.4`/`Gr.B`/`Gr.X`）：均已**内置**进
+    `gt7analysis.py`，驱动车型名片里的品牌与组别徽章。
+  - 赛道 BoP 档位（`course-bop` 社区标注）与官方赛道 logo（`img/track/*.png`，
+    游戏素材、**不随仓库分发**，需 `helper/download_track_logos.py` 按需拉取）。
+  - 轮胎寿命与湿地特性（`tyre-wear` / `wet-tyres` 社区实测），汇总进
+    `GET /api/v1/tyres` 作为**参考值**（非遥测）。
 - [InvoGT](https://github.com/InvolveDanny/InvoGT) — 字段偏移的权威参考
 - [go-gt7-telemetry](https://github.com/snipem/go-gt7-telemetry) — 解密参数
 - [Nenkai/gt7-udp](https://github.com/Nenkai) — 早期协议逆向

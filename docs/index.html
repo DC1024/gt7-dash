@@ -89,7 +89,7 @@
     <div><b>60Hz</b>实时帧率</div>
     <div><b>0</b>第三方依赖</div>
     <div><b>296B</b>逐包解密</div>
-    <div><b>37</b>公开API端点</div>
+    <div><b>38</b>公开API端点</div>
   </div>
 </div></section>
 
@@ -107,6 +107,10 @@
   <div class="feat"><div class="ic">🚗</div><h3>行车轨迹双着色</h3>
     <p>整车轨迹可在「按踏板着色」与「按 G 力着色」之间切换，圈号就地切不用
        刷新页面——刹车粉→红、油门青→绿，G 力按合成值铺蓝→绿→橙→红。</p></div>
+  <div class="feat"><div class="ic">🏷️</div><h3>车型名片 · 品牌与组别</h3>
+    <p>历史场次与实时界面显示「品牌 + 车名 + 赛事组别徽章」，如
+       <code>Porsche</code> 918 Spyder '13 <code>Gr.X</code>、Suzuki Escudo
+       <code>Gr.X</code>。品牌与组别来自内置的社区车型表，街车自动不显示徽章。</p></div>
   <div class="feat"><div class="ic">📊</div><h3>G-G 图（抓地力圆）</h3>
     <p>整场横向/纵向 G 散点铺开，外边界就是轮胎极限——
        看看你到底用了几成抓地力。</p></div>
@@ -129,7 +133,7 @@
   <div class="feat"><div class="ic">🎨</div><h3>10 套主题 · 布局自定义</h3>
     <p>含新「座舱」主题（近黑底＋电光蓝，副屏仪表向）。卡片可拖拽排序、
        隐藏、半宽整行，多套布局保存切换。</p></div>
-  <div class="feat"><div class="ic">🔌</div><h3>37 个公开 API 端点</h3>
+  <div class="feat"><div class="ic">🔌</div><h3>38 个公开 API 端点</h3>
     <p>实时 / 场次 / 逐帧与分析 / 赛道 / 回收站 / 设置全覆盖，
        带 CORS、字段与单位全部写进文档，版本化承诺只加不改。</p></div>
 </div>
@@ -157,7 +161,9 @@ docker compose up -d<br><br>
 <span class="k">GET</span> /api/v1/sessions/&lt;file&gt;<br><br>
 <span class="c"># 赛道库（自动识别出来的赛道）</span><br>
 <span class="k">GET</span> /api/v1/tracks<br>
-<span class="k">POST</span> /api/v1/tracks/register
+<span class="k">POST</span> /api/v1/tracks/register<br><br>
+<span class="c"># 轮胎参考数据（社区实测寿命 + 湿地特性）</span><br>
+<span class="k">GET</span> /api/v1/tyres
 </div>
 <div class="code">
 <span class="c"># 单场分析（任选）</span><br>
@@ -181,7 +187,7 @@ docker compose up -d<br><br>
 }
 </div>
 </div>
-<p class="sub" style="margin-top:24px">共 <b>37 个端点</b>，完整字段与单位说明见
+<p class="sub" style="margin-top:24px">共 <b>38 个端点</b>，完整字段与单位说明见
   <a href="https://github.com/DC1024/gt7-dash/blob/main/API文档.md" target="_blank"
      style="color:var(--accent)">API文档.md</a>，
   或直接访问运行中的 <code>/api/v1/docs</code>。</p>
@@ -211,7 +217,7 @@ python -m gt7coach serve --dash http://&lt;本机IP&gt;:8787
 </div><!-- /.wrap —— 这个闭合标签原本就漏了，导致 footer 被包进内容区 -->
 
 <footer><div class="wrap">
-  GT7 Dash v1.1.0 · MIT License · 数据本地处理，不上传任何云端<br><br>
+  GT7 Dash v1.2.0 · MIT License · 数据本地处理，不上传任何云端<br><br>
   <a href="https://github.com/DC1024/gt7-dash" target="_blank">GitHub 仓库</a> ·
   <a href="https://github.com/DC1024/gt7-dash/blob/main/API文档.md" target="_blank">API 文档</a> ·
   <a href="https://github.com/DC1024/gt7-coach" target="_blank">gt7-coach 赛道工程师</a> ·

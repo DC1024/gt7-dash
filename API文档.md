@@ -55,7 +55,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named） |
+| GET | `/api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named / `bop` / `logo`） |
 | GET | `/api/v1/sessions/<文件名>/track` | 识别该场，返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | POST | `/api/v1/tracks/<id>/rename` | body `{"value": "名"}`：赛道改名，同赛道所有场次一起生效 |
 | POST | `/api/v1/tracks/<id>/confirm` | body `{}`：确认该赛道名正确，清掉「自动识别」标记 |
@@ -72,6 +72,12 @@
 | POST | `/api/v1/settings/trash-retention` | 回收站保留天数，body `{"value": 30}`（0=永不清理） |
 | POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
 | POST | `/api/v1/settings/archive-after` | 自动归档保留天数，body `{"value": 30}`（0=不自动归档） |
+
+### 参考资料
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/tyres` | 轮胎参考数据：社区实测的各胎种寿命圈数 + 湿地胎特性（**非遥测量**，见下） |
 
 ### 文档
 
@@ -120,6 +126,8 @@
 | `lap_started_at` | float | 当前圈起点的墙上时刻（秒，time.time()）。接收器每次冲线更新；仪表盘用它反推上一圈用时，作为 GT7 不报 last_lap 时的兜底圈速来源 |
 | `car_code` | int | 车型码（全场非 0 众数；读不到为 0） |
 | `car_name` | string | 车型短名，`cars.csv` 查 ShortName（`cars_extra.csv` 补充表优先），查不到为 `CAR-ID-<码>` |
+| `car_maker` | string | 品牌名（内置厂商表）；查不到为空串 |
+| `car_group` | string | 赛事组别 `Gr.1`~`Gr.4` / `Gr.B` / `Gr.X`；街车为空串 |
 | `laps` | array | 逐圈详情，见下表 |
 | `best_lap` | object 或 null | 最快圈 `{lap, time}`；无完整圈为 null |
 
@@ -139,6 +147,10 @@
 |---|---|---|
 | `speed_kph` | km/h | 车速 |
 | `rpm` | rpm | 发动机转速 |
+| `car_code` | int | 车型码（数字，不依赖车名表；0 = 未知） |
+| `car_name` | string | 车型短名，`cars.csv` 查 ShortName（`cars_extra.csv` 补充表优先），查不到为 `CAR-ID-<码>` |
+| `car_maker` | string | 品牌名（内置厂商表，如 `Porsche`）；查不到为空串 |
+| `car_group` | string | 赛事组别：`Gr.1` / `Gr.2` / `Gr.3` / `Gr.4` / `Gr.B` / `Gr.X`（VGT、方程式、经典赛车）；**街车为空串** |
 | `gear` / `suggested_gear` | int | 当前档 / 建议档，0 = 空挡 |
 | `throttle` / `brake` | 0~1 | 踏板开度（乘 100 即百分比） |
 | `position_m` | 米 | 车辆世界坐标 x/y/z（y 为高度） |
@@ -385,7 +397,7 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named） |
+| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named / `bop` / `logo`） |
 | `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
 | `POST /api/v1/tracks/<id>/confirm` `{}` | 用户确认该赛道名正确：清掉 auto_named 标记，UI 不再提示待确认 |
@@ -400,6 +412,48 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 - 场次→赛道映射也在这个文件里：**详情页首次打开时识别并落库**，
   列表页只读映射展示赛道名，绝不触发识别本身（那要解析整场 jsonl）。
 - 无有效圈的场次返回 `{error}`，不落库、不影响页面。
+
+### 赛道 BoP 与官方 logo（附加字段，可为空）
+
+`/api/v1/tracks` 每条赛道多给两个**参考字段**，来源同样是 ddm999/gt7info：
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `bop` | `""` / `"High"` / `"Mid"` / `"Low"` | 该赛道在 GT7 线上赛启用的性能平衡档位（高速/中速/低速）。**只有 91/122 条赛道有标注**，其余为空串。它是社区人工标注，且官方后来不再公布各档具体数值，所以仅供展示，不要参与计算 |
+| `logo` | 如 `"suzuka"` | 官方赛道 logo 的**文件名主干**。有图时图片地址是 `/tracklogos/<logo>.png`（例：`/tracklogos/suzuka.png`）。图是**可选素材**——要用就跑 `python helper/download_track_logos.py` 拉到 `data/tracklogos/`，没拉过该路径返回 404，页面自动退回只画形状 |
+
+🔴 logo 是游戏美术素材，**不随代码仓库分发**（版权），仓库里只有「赛道 ID → 文件名」的映射。
+
+## 轮胎参考数据
+
+`GET /api/v1/tyres` —— 社区实测的胎寿命与湿地胎特性。
+
+🔴 **这是参考资料，不是遥测量。** GT7 的 UDP 遥测**不下发**胎种、天气、
+赛道积水率，所以下面这些数字**不能**用来做实时判断（比如"你的胎还剩 37%"
+这种说法一定是编的）。返回体里 `note` 字段也写了这句话，它会跟着数据一起走。
+
+返回 `{life[], wet[], source, note}`：
+
+`life[]` —— 各胎种跑到失效的圈数（50 倍胎耗下的两组样本，左右前轮分开记）：
+
+| 字段 | 说明 |
+|---|---|
+| `compound` | 胎种：`RH`/`RM`/`RS`/`IM`/`W` |
+| `car` / `track` / `wear_rate` | 样本条件（车 / 赛道 / 胎耗倍率） |
+| `laps_front_right` / `laps_front_left` | 前轮寿命圈数；只记了一侧时另一个是 `null` |
+| `note` | 备注 |
+
+`wet[]` —— 湿地各胎种特性：
+
+| 字段 | 说明 |
+|---|---|
+| `compound` | 胎种 |
+| `ref_lap` | 同一条湿地赛道的参考圈速（`m:ss.mmm`），可横向比较 |
+| `aquaplaning_pct` | 开始打滑的**赛道积水率**（%） |
+| `note` | 定性描述 |
+
+> 实用结论：`Intermediate` 在积水 <50% 时与 Sports Soft 同速且能保持，
+> 是湿地最稳的选择；`Racing Hard` 只在积水 <30% 时才比 Sports Soft 快。
 
 ## 驾驶事件时间线
 

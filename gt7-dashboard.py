@@ -203,17 +203,24 @@ class TelemetryHub:
             with self._lock:
                 self._connected = False
 
-    def _car_name_of(self, latest: dict | None) -> str:
-        """carCode → 车名。表来自 helper/download_cars_csv.py 下载的社区 CSV。"""
+    def _car_info_of(self, latest: dict | None) -> dict:
+        """carCode → {name, maker, group, known}。
+
+        车名来自 helper/download_cars_csv.py 下载的社区 CSV；品牌/组别来自
+        gt7analysis 内置表（不联网）。缺任何一项都只是少显示，不会报错。
+        """
+        empty = {"name": "", "maker": "", "group": "", "known": False}
         if not latest:
-            return ""
+            return empty
         code = latest.get("car_code") or 0
         if code <= 0:
-            return ""
+            return empty
         import gt7analysis
-        return gt7analysis.car_name_of(
+        info = gt7analysis.car_info_of(
             code, str(self._status_path.parent / "cars.csv")
         )
+        return {"name": info["name"], "maker": info["maker"],
+                "group": info["group"], "known": info["known"]}
 
     def snapshot(self, max_frames: int = 300) -> dict[str, Any]:
         """仪表盘页面拉取。"""
@@ -238,6 +245,9 @@ class TelemetryHub:
                 # 用 lap_time_source 标出来，消费方自己决定信不信。
                 lap_time = max(0.0, latest["t"] - self._session_start)
 
+            # 车型名片（车名 + 品牌 + 组别）只查一次，别在字典里调三遍。
+            car = self._car_info_of(latest)
+
             return {
                 "connected": self._connected,
                 "grid_start": self._grid_start,
@@ -255,7 +265,10 @@ class TelemetryHub:
                 "lap_fuel": self._lap_fuel,
                 "powertrain": self._powertrain,
                 "max_energy_recovery": self._max_energy_recovery,
-                "car_name": self._car_name_of(latest),
+                "car_name": car["name"],
+                # 品牌 / 组别徽章（内置表，街车与未收录为空串）
+                "car_maker": car["maker"],
+                "car_group": car["group"],
                 "session_duration": round(time.time() - self._session_start, 1)
                 if self._session_start
                 else 0,
@@ -1373,7 +1386,9 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
             #    都是空串 → 过滤被跳过 → 静默跨车采用历史参考圈（拿慢车的
             #    最快圈去量快车，delta 会退化成一个恒定的 +8 秒）。
             car_code = _first_car_code(f)
-            car_name = gt7analysis.car_name_of(car_code, csv_path)
+            # 🔴 一次查全（车名 + 品牌 + 组别）：三张内置表 + cars.csv 只读一次。
+            car_info = gt7analysis.car_info_of(car_code, csv_path)
+            car_name = car_info["name"]
             # 文件名里的时间戳 → 短格式「10-08 00:27」
             ts = (parts[0] or "") if parts else ""
             tod = (parts[1] if len(parts) > 1 else "")[:6]
@@ -1397,6 +1412,9 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                     "%Y-%m-%d %H:%M:%S"
                 ),
                 "car_name": car_name,
+                # 品牌与组别（内置表查，街车/未收录为空串 —— 前端别渲染空徽章）
+                "car_maker": car_info["maker"],
+                "car_group": car_info["group"],
                 # 数字车型码：比车型名可靠（不经过 `cars.csv` 查表）。
                 # 0 = 未知（老场次 / 解析失败），消费方要做"未知"处理。
                 "car_code": car_code,
@@ -1467,9 +1485,14 @@ def analyze_session(path: Path) -> dict[str, Any]:
         # （不同车对圈速影响极大，场次里必须能看出开的是什么车）
         car_code = _dominant_car_code(frames)
         car_name = ""
+        car_maker = ""
+        car_group = ""
         if car_code:
             import gt7analysis
-            car_name = gt7analysis.car_name_of(car_code, str(path.parent / "cars.csv"))
+            info = gt7analysis.car_info_of(car_code,
+                                           str(path.parent / "cars.csv"))
+            car_name, car_maker, car_group = (info["name"], info["maker"],
+                                              info["group"])
 
         # —— 按圈分组（clean_laps 自动剔除前圈 / 完赛离场圈 / 菜单态）——
         # 🔴 走 _valid_laps 而不是直接调 clean_laps：分组只取决于文件内容，
@@ -1508,6 +1531,8 @@ def analyze_session(path: Path) -> dict[str, Any]:
             "has_coords": any(f.get("has_coords") for f in frames),
             "car_code": car_code,
             "car_name": car_name,
+            "car_maker": car_maker,
+            "car_group": car_group,
             "layouts": {
                 k: sum(1 for f in frames if f.get("layout") == k)
                 for k in ("A", "B", "C")
@@ -2717,6 +2742,9 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
             "rpm": L.get("rpm", 0.0),
             "car_code": L.get("car_code", 0),
             "car_name": snap.get("car_name", ""),
+            # 品牌名与赛事组别（内置表；街车/未收录为空串）
+            "car_maker": snap.get("car_maker", ""),
+            "car_group": snap.get("car_group", ""),
             "gear": L.get("gear", 0),
             "suggested_gear": L.get("suggested_gear", 0),
             "throttle": L.get("throttle", 0.0),          # 0~1
@@ -2848,7 +2876,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named） |
+| GET | `/api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named / `bop` / `logo`） |
 | GET | `/api/v1/sessions/<文件名>/track` | 识别该场，返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | POST | `/api/v1/tracks/<id>/rename` | body `{"value": "名"}`：赛道改名，同赛道所有场次一起生效 |
 | POST | `/api/v1/tracks/<id>/confirm` | body `{}`：确认该赛道名正确，清掉「自动识别」标记 |
@@ -2865,6 +2893,12 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | POST | `/api/v1/settings/trash-retention` | 回收站保留天数，body `{"value": 30}`（0=永不清理） |
 | POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
 | POST | `/api/v1/settings/archive-after` | 自动归档保留天数，body `{"value": 30}`（0=不自动归档） |
+
+### 参考资料
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/tyres` | 轮胎参考数据：社区实测的各胎种寿命圈数 + 湿地胎特性（**非遥测量**，见下） |
 
 ### 文档
 
@@ -2913,6 +2947,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `lap_started_at` | float | 当前圈起点的墙上时刻（秒，time.time()）。接收器每次冲线更新；仪表盘用它反推上一圈用时，作为 GT7 不报 last_lap 时的兜底圈速来源 |
 | `car_code` | int | 车型码（全场非 0 众数；读不到为 0） |
 | `car_name` | string | 车型短名，`cars.csv` 查 ShortName（`cars_extra.csv` 补充表优先），查不到为 `CAR-ID-<码>` |
+| `car_maker` | string | 品牌名（内置厂商表）；查不到为空串 |
+| `car_group` | string | 赛事组别 `Gr.1`~`Gr.4` / `Gr.B` / `Gr.X`；街车为空串 |
 | `laps` | array | 逐圈详情，见下表 |
 | `best_lap` | object 或 null | 最快圈 `{lap, time}`；无完整圈为 null |
 
@@ -2932,6 +2968,10 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 |---|---|---|
 | `speed_kph` | km/h | 车速 |
 | `rpm` | rpm | 发动机转速 |
+| `car_code` | int | 车型码（数字，不依赖车名表；0 = 未知） |
+| `car_name` | string | 车型短名，`cars.csv` 查 ShortName（`cars_extra.csv` 补充表优先），查不到为 `CAR-ID-<码>` |
+| `car_maker` | string | 品牌名（内置厂商表，如 `Porsche`）；查不到为空串 |
+| `car_group` | string | 赛事组别：`Gr.1` / `Gr.2` / `Gr.3` / `Gr.4` / `Gr.B` / `Gr.X`（VGT、方程式、经典赛车）；**街车为空串** |
 | `gear` / `suggested_gear` | int | 当前档 / 建议档，0 = 空挡 |
 | `throttle` / `brake` | 0~1 | 踏板开度（乘 100 即百分比） |
 | `position_m` | 米 | 车辆世界坐标 x/y/z（y 为高度） |
@@ -3178,7 +3218,7 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named） |
+| `GET /api/v1/tracks` | 赛道库清单（id / name / ref_len_m / turns_cw / sessions 数 / verified / auto_named / `bop` / `logo`） |
 | `GET /api/v1/sessions/<文件名>/track` | 识别该场：返回 `{track_id, name, matched, distance, ref_len_m}`；首次会算指纹并落库 |
 | `POST /api/v1/tracks/<id>/rename` `{"value": "名"}` | 赛道改名，同赛道所有场次一起生效 |
 | `POST /api/v1/tracks/<id>/confirm` `{}` | 用户确认该赛道名正确：清掉 auto_named 标记，UI 不再提示待确认 |
@@ -3193,6 +3233,48 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 - 场次→赛道映射也在这个文件里：**详情页首次打开时识别并落库**，
   列表页只读映射展示赛道名，绝不触发识别本身（那要解析整场 jsonl）。
 - 无有效圈的场次返回 `{error}`，不落库、不影响页面。
+
+### 赛道 BoP 与官方 logo（附加字段，可为空）
+
+`/api/v1/tracks` 每条赛道多给两个**参考字段**，来源同样是 ddm999/gt7info：
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `bop` | `""` / `"High"` / `"Mid"` / `"Low"` | 该赛道在 GT7 线上赛启用的性能平衡档位（高速/中速/低速）。**只有 91/122 条赛道有标注**，其余为空串。它是社区人工标注，且官方后来不再公布各档具体数值，所以仅供展示，不要参与计算 |
+| `logo` | 如 `"suzuka"` | 官方赛道 logo 的**文件名主干**。有图时图片地址是 `/tracklogos/<logo>.png`（例：`/tracklogos/suzuka.png`）。图是**可选素材**——要用就跑 `python helper/download_track_logos.py` 拉到 `data/tracklogos/`，没拉过该路径返回 404，页面自动退回只画形状 |
+
+🔴 logo 是游戏美术素材，**不随代码仓库分发**（版权），仓库里只有「赛道 ID → 文件名」的映射。
+
+## 轮胎参考数据
+
+`GET /api/v1/tyres` —— 社区实测的胎寿命与湿地胎特性。
+
+🔴 **这是参考资料，不是遥测量。** GT7 的 UDP 遥测**不下发**胎种、天气、
+赛道积水率，所以下面这些数字**不能**用来做实时判断（比如"你的胎还剩 37%"
+这种说法一定是编的）。返回体里 `note` 字段也写了这句话，它会跟着数据一起走。
+
+返回 `{life[], wet[], source, note}`：
+
+`life[]` —— 各胎种跑到失效的圈数（50 倍胎耗下的两组样本，左右前轮分开记）：
+
+| 字段 | 说明 |
+|---|---|
+| `compound` | 胎种：`RH`/`RM`/`RS`/`IM`/`W` |
+| `car` / `track` / `wear_rate` | 样本条件（车 / 赛道 / 胎耗倍率） |
+| `laps_front_right` / `laps_front_left` | 前轮寿命圈数；只记了一侧时另一个是 `null` |
+| `note` | 备注 |
+
+`wet[]` —— 湿地各胎种特性：
+
+| 字段 | 说明 |
+|---|---|
+| `compound` | 胎种 |
+| `ref_lap` | 同一条湿地赛道的参考圈速（`m:ss.mmm`），可横向比较 |
+| `aquaplaning_pct` | 开始打滑的**赛道积水率**（%） |
+| `note` | 定性描述 |
+
+> 实用结论：`Intermediate` 在积水 <50% 时与 Sports Soft 同速且能保持，
+> 是湿地最稳的选择；`Racing Hard` 只在积水 <30% 时才比 Sports Soft 快。
 
 ## 驾驶事件时间线
 
@@ -3459,7 +3541,7 @@ _GZIP_ENABLED = True        # --no-gzip 关掉（排障 / 抓包时看明文）
 # 命名习惯跟随 git tag：这里是 `1.1.0`，对应发行标识 `v1.1.0`。
 # 之所以单独设一个常量：此前 HTTP `Server:` 头里写死过 "GT7Dashboard/1.0"，
 # 发版时容易漏改（coach 那边已经踩过一次同样的坑）。
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 DEFAULT_PORT = 8787
 
@@ -3568,6 +3650,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _send_html(self, html: str, code: int = 200) -> None:
         self._send_body(html.encode("utf-8"),
                         "text/html; charset=utf-8", code)
+
+    def _serve_track_logo(self, rel: str) -> None:
+        """发一张赛道 logo（data/tracklogos/<x>.png）。
+
+        🔴 三道闸，缺一不可：
+          1. 只认 `[a-z0-9_-]+.png` —— 请求路径是用户输入，不能让它拼出
+             `../` 去读宿主机任意文件；
+          2. 必须在 `data/tracklogos/` 里（resolve 后前缀比对）；
+          3. 读不到就 404，绝不回 200 + 空体（浏览器会显示一个碎图图标）。
+        这些图是**可选素材**，没有是正常的，页面会走纯形状图分支。
+        """
+        import re as _re
+        if not _re.fullmatch(r"[a-z0-9_-]+\.png", rel or ""):
+            self._send_body(b"bad name", "text/plain; charset=utf-8", 400)
+            return
+        try:
+            base = (Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+                    / "tracklogos")
+            p = (base / rel).resolve()
+        except OSError:
+            self._send_body(b"not found", "text/plain; charset=utf-8", 404)
+            return
+        if not str(p).startswith(str(base)) or not p.is_file():
+            self._send_body(b"not found", "text/plain; charset=utf-8", 404)
+            return
+        try:
+            data = p.read_bytes()
+        except OSError:
+            self._send_body(b"not found", "text/plain; charset=utf-8", 404)
+            return
+        self._send_body(data, "image/png", 200)
 
     # -- 场次管理（收藏 / 改名 / 删除）------------------------------------
     # jsonl 是不可变原始数据：收藏与改名写进 sessions_meta.json 边车文件，
@@ -4040,6 +4153,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
                 self._send_html(build_sessions_page(hist))
 
+            elif path.startswith("/tracklogos/"):
+                # 官方赛道 logo（可选素材，用 helper/download_track_logos.py 拉取）。
+                # 没拉就是 404，页面走"只画形状"的分支 —— 不是错误。
+                self._serve_track_logo(path[len("/tracklogos/"):])
+
             elif path == "/tracks":
                 # 赛道库管理页（查看系统识别的赛道形状 + 名称，可改可固化）
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
@@ -4162,10 +4280,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "turns_cw": t.get("turns_cw"),
                     "created": t.get("created"),
                     "sessions": cnt.get(t["id"], 0),
+                    # 赛道 BoP 档位（社区标注，只有部分赛道有 → 大量为空串）
+                    "bop": _bop_for_track(t),
+                    # 官方 logo 的文件名主干（图是可选素材，可能根本没下载）；
+                    # 有图时的完整地址是 /tracklogos/<logo>.png
+                    "logo": _logo_for_track(t),
                 } for t in lib["tracks"]]
                 self._send_json({"meta": {"api_version": 1},
                                  "match_tol": _TRACK_MATCH_TOL,
                                  "tracks": tracks}, cors=True)
+
+            elif path == "/api/v1/tyres":
+                # 轮胎参考数据（社区实测的胎寿命 + 湿地特性）。
+                # 🔴 这是**参考资料**，不是遥测：GT7 不下发胎种/天气/积水率，
+                #    所以返回体里带 note 明说不能用于实时判断，别拿去算"胎还剩多少"。
+                import gt7analysis
+                self._send_json({"meta": {"api_version": 1},
+                                 **gt7analysis.tyre_reference()}, cors=True)
 
             elif path.startswith("/api/v1/sessions/") and path.endswith("/download"):
                 # /api/v1/sessions/<名>/download —— 流式下发原始 jsonl
@@ -4611,6 +4742,20 @@ THEME_CSS = r"""
     --cv-grid:rgba(255,255,255,.14);
   }
 }
+/* 赛事组别徽章（Gr.1~Gr.4 / Gr.B / Gr.X）与赛道 BoP 徽章。
+   🔴 街车、以及「社区表没标注 BoP」的赛道都**不给**徽章，所以这里只管
+      样式，渲染方负责判断空串 —— 别给空 span 留占位。 */
+.grp-badge, .bop-badge { display:inline-block; margin-left:5px; padding:0 6px;
+  border-radius:4px; font-size:10.5px; font-weight:700; letter-spacing:.02em;
+  vertical-align:middle; border:1px solid; }
+.grp-badge { background:rgba(var(--accent-rgb),.15); color:var(--accent);
+  border-color:rgba(var(--accent-rgb),.55); }
+.bop-badge { background:rgba(var(--accent-rgb),.08); color:var(--muted);
+  border-color:var(--line); }
+.bop-badge[data-bop="High"] { color:var(--bad); border-color:var(--bad);
+  background:rgba(220,53,69,.10); }
+.bop-badge[data-bop="Low"] { color:var(--ok); border-color:var(--ok);
+  background:rgba(25,135,84,.10); }
 """
 
 # 首屏防闪：在 <head> 里同步执行，先于 body 绘制把主题落到 <html> 上。
@@ -7467,11 +7612,20 @@ def build_sessions_page(hist: Path) -> str:
         star = ' <span style="color:#d4a017">★</span>' if s["favorite"] else ""
         anom = s.get("anomalous")
         badge = ' <span class="anom-badge">异常</span>' if anom else ""
+        # 车型单元格 = [品牌] 车名 [组别徽章]。品牌/组别都可能为空
+        # （街车、社区表未收录），空就什么都不加，别渲染空徽章。
+        car_cell = _html.escape(s.get('car_name') or '') or '<span class="dim">-</span>'
+        if s.get('car_maker'):
+            car_cell = ('<span class="dim">'
+                        + _html.escape(s['car_maker']) + '</span> ' + car_cell)
+        if s.get('car_group'):
+            car_cell += (' <span class="grp-badge">'
+                         + _html.escape(s['car_group']) + '</span>')
         rows.append(
             f"""<tr data-fav="{'1' if s['favorite'] else '0'}" data-anom="{'1' if anom else '0'}" data-file="{s['file']}">
       <td><b><a href="/session?file={s['file']}"
          style="color:var(--accent)">{disp}</a></b>{star}{badge}</td>
-      <td style="font-size:12.5px">{_html.escape(s.get('car_name') or '') or '<span class="dim">-</span>'
+      <td style="font-size:12.5px">{car_cell
           }{'<span class="dim"> · ' + _html.escape(s['track_name']) + '</span>' if s.get('track_name') else ''}</td>
       <td>{s['modified']}</td>
       <td class="num">{s['size_kb']} KB</td>
@@ -7576,6 +7730,9 @@ TRACKS_CSS = """<style>
 .tk-auto{color:var(--warn)}
 .tk-none{color:var(--muted)}
 .tk-meta{font-size:12px;color:var(--muted);margin:4px 0 8px}
+/* 官方赛道 logo（可选素材，没有这张图就不渲染这个 img）。
+   深色主题下 logo 是深底图，直接放会糊成一片——压一点透明度让边界可见。 */
+.tk-logo{height:22px;width:auto;flex:none;border-radius:3px;opacity:.9}
 .tk-acts{display:flex;gap:8px}
 .tv-wrap{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
 .tv-facts{border-collapse:collapse;font-size:13px}
@@ -7677,6 +7834,54 @@ def _session_trajectory(path: Path, max_points: int = 160) -> list[list[float]]:
     return [[round(float(x), 2), round(float(z), 2)] for x, z in pts]
 
 
+_BOPS_CN = {"High": "BoP 高速", "Mid": "BoP 中速", "Low": "BoP 低速"}
+
+
+def _bop_for_track(t: dict) -> str:
+    """赛道库条目 → BoP 档位（"High"/"Mid"/"Low"），查不到返回空串。
+
+    两条路，按顺序试：
+      1. 条目里存了 `course_id`（自动命名时一起落的）→ 直接查内置表；
+      2. 否则拿**名字**去内置赛道表精确比对（用户改过名、或老数据没有
+         course_id 的情况）。
+
+    🔴 只有 91/122 条赛道有 BoP 标注，查不到是常态，返回空串让前端不渲染。
+    """
+    import gt7analysis
+    cid = t.get("course_id")
+    if cid:
+        b = gt7analysis.bop_of(cid)
+        if b:
+            return b
+    name = (t.get("name") or "").strip()
+    if not name:
+        return ""
+    for c in gt7analysis.courses():
+        if c["name"] == name:
+            return c["bop"]
+    return ""
+
+
+def _logo_for_track(t: dict) -> str:
+    """赛道库条目 → 官方 logo 文件名主干（"suzuka"），查不到返回空串。
+
+    和 :func:`_bop_for_track` 同样的两条路：先 `course_id`，再用名字比对。
+    """
+    import gt7analysis
+    cid = t.get("course_id")
+    if cid:
+        lg = gt7analysis.logo_of(cid)
+        if lg:
+            return lg
+    name = (t.get("name") or "").strip()
+    if not name:
+        return ""
+    for c in gt7analysis.courses():
+        if c["name"] == name:
+            return gt7analysis.logo_of(c["id"])
+    return ""
+
+
 def build_tracks_page(hist: Path) -> str:
     """赛道库管理页：查看系统识别的赛道形状 + 名称，可修改保存、标记已记录。
 
@@ -7691,6 +7896,9 @@ def build_tracks_page(hist: Path) -> str:
         if tid is not None:
             cnt[tid] = cnt.get(tid, 0) + 1
     frozen = bool(lib.get("frozen"))
+    # 官方赛道 logo 是可选素材（helper/download_track_logos.py 拉取）。
+    # 目录不存在 = 用户没拉过，走"只画形状"的分支，不是错误。
+    logo_dir = hist / "tracklogos"
     cards = []
     for t in lib["tracks"]:
         tid = t["id"]
@@ -7709,6 +7917,17 @@ def build_tracks_page(hist: Path) -> str:
                      '改对名字后点保存/已记录">自动识别·待确认</span>')
         else:
             badge = '<span class="tk-none" title="尚未命名">未命名</span>'
+        # BoP 强度（社区标注，只有部分赛道有；没有就不渲染徽章）
+        bop = _bop_for_track(t)
+        bop_html = (f'<span class="bop-badge" data-bop="{bop}" title="GT7 线上赛'
+                    f'在该赛道启用的性能平衡档位（社区标注，仅供参考）">'
+                    f'{_BOPS_CN.get(bop, bop)}</span>') if bop else ""
+        logo_html = ""
+        lg = _logo_for_track(t)
+        if lg and (logo_dir / f"{lg}.png").is_file():
+                logo_html = (f'<img class="tk-logo" src="/tracklogos/{lg}.png" '
+                             f'alt="" loading="lazy" '
+                             f'title="{_html.escape(name or "赛道 logo")}">')
         desc_attr = _html.escape(json.dumps(desc, ensure_ascii=False))
         cards.append(f"""
     <div class="tk-card" data-id="{tid}">
@@ -7716,11 +7935,12 @@ def build_tracks_page(hist: Path) -> str:
         style="background:rgba(128,128,128,.06);border-radius:8px"></canvas>
       <div class="tk-info">
         <div class="tk-row">
+          {logo_html}
           <input class="tk-name" value="{_html.escape(name)}" placeholder="未命名赛道"
             maxlength="60" style="font-size:15px;font-weight:600">
           <span class="tk-badge">{badge}</span>
         </div>
-        <div class="tk-meta">圈长 {(ref or 0):.0f} m · {turns} · {sessions} 场</div>
+        <div class="tk-meta">圈长 {(ref or 0):.0f} m · {turns} · {sessions} 场{bop_html}</div>
         <div class="tk-acts">
           <button class="sbtn" onclick="trackSave(this)">保存</button>
           <button class="sbtn" onclick="trackConfirm(this)">✓ 已记录</button>
@@ -8611,6 +8831,13 @@ th { color:var(--muted); font-weight:500; }
               <span class="dim">确认名字正确：body {}，清掉「自动识别」标记</span></li>
           <li><b>POST /api/v1/tracks/register</b><br>
               <span class="dim">一键标注：body {"file": "...", "name": "真实赛道名"}</span></li>
+        </ul>
+      </section>
+      <section>
+        <h4>参考数据</h4>
+        <ul class="apilist">
+          <li><b>GET /api/v1/tyres</b><br>
+              <span class="dim">社区实测胎寿命（各胎种圈数）+ 湿地胎特性；非遥测，仅供调参参考</span></li>
         </ul>
       </section>
       <section>

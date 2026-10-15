@@ -13,11 +13,11 @@ from pathlib import Path
 
 # —— 车型解析 ——————————————————————————————
 
-_CAR_CSV_CACHE: dict[str, dict[str, str]] = {}
+_CAR_CSV_CACHE: dict[str, dict[str, tuple[str, str]]] = {}
 
 
-def _load_car_csv(path: str) -> dict[str, str]:
-    """读一张 `ID,ShortName,Maker` 表 → {ID: 车名}。读不到就是空表，不抛。
+def _load_car_csv(path: str) -> dict[str, tuple[str, str]]:
+    """读一张 `ID,ShortName,Maker` 表 → {ID: (车名, 厂商ID)}。读不到就是空表，不抛。
 
     🔴 车名里可能带逗号吗？社区表的 ShortName 实测不含逗号，所以直接
        split(',') 是安全的；真出现也只会截短，不会污染别的行。
@@ -25,14 +25,20 @@ def _load_car_csv(path: str) -> dict[str, str]:
     🔴 用 utf-8-sig 而不是 utf-8：补充表多半是玩家用 Excel 填的，Excel 存
        UTF-8 会带 BOM。用 utf-8 读的话首行 ID 变成 "\ufeffID"，isdigit()
        判不过 —— 症状是「明明填了却查不到」，很难往编码上想。
+
+    第三列是**厂商 ID**（数字），不是厂商名：社区表只给 ID，名字要再查
+    :data:`_MAKER_CSV`（见 :func:`car_info_of`）。
     """
-    table: dict[str, str] = {}
+    table: dict[str, tuple[str, str]] = {}
     try:
         with open(path, encoding="utf-8-sig", errors="replace") as fh:
             for line in fh.read().splitlines()[1:]:
                 seg = line.split(",")
                 if len(seg) >= 2 and seg[0].strip().isdigit():
-                    table[seg[0].strip()] = seg[1].strip()
+                    table[seg[0].strip()] = (
+                        seg[1].strip(),
+                        seg[2].strip() if len(seg) > 2 else "",
+                    )
     except OSError:
         pass
     return table
@@ -43,6 +49,39 @@ def _extra_path_for(csv_path: str | None) -> str | None:
     if not csv_path:
         return None
     return str(Path(csv_path).with_name("cars_extra.csv"))
+
+
+def _car_table(csv_path: str | None, extra_path: str | None
+               ) -> dict[str, tuple[str, str]]:
+    """社区表 + 补充表合并后的 {ID: (车名, 厂商ID)}，按路径缓存只读一次。
+
+    🔴 合并是**逐列**的，不是整行覆盖：玩家在 `cars_extra.csv` 里往往只填
+       车名、厂商列留空，整行覆盖会把社区表查到的厂商信息抹成空。
+    """
+    key = f"{csv_path or ''}|{extra_path or ''}"
+    if key not in _CAR_CSV_CACHE:
+        table: dict[str, tuple[str, str]] = {}
+        if csv_path:
+            table.update(_load_car_csv(csv_path))
+        if extra_path:
+            for cid, row in _load_car_csv(extra_path).items():
+                base = table.get(cid, ("", ""))
+                table[cid] = (row[0] or base[0], row[1] or base[1])
+        _CAR_CSV_CACHE[key] = table
+    return _CAR_CSV_CACHE[key]
+
+
+def _code_key(code: object) -> str:
+    """carCode → 查表用的键。
+
+    🔴 记录器早期把 car_code 写成浮点（2181.0），`str()` 出来是 "2181.0"，
+       查任何表都查不到 —— 症状是「车明明在表里却显示 CAR-ID-2181」。
+       统一过一次 int 就不会再踩。
+    """
+    try:
+        return str(int(code))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(code)
 
 
 def car_name_of(code: int, csv_path: str | None = None,
@@ -59,15 +98,736 @@ def car_name_of(code: int, csv_path: str | None = None,
     if not code or code <= 0:
         return ""
     ex = extra_path if extra_path is not None else _extra_path_for(csv_path)
-    key = f"{csv_path or ''}|{ex or ''}"
-    if key not in _CAR_CSV_CACHE:
-        table: dict[str, str] = {}
-        if csv_path:
-            table.update(_load_car_csv(csv_path))
-        if ex:
-            table.update(_load_car_csv(ex))     # 手工标注覆盖社区表
-        _CAR_CSV_CACHE[key] = table
-    return _CAR_CSV_CACHE[key].get(str(code), f"CAR-ID-{code}")
+    row = _car_table(csv_path, ex).get(_code_key(code))
+    return row[0] if row and row[0] else f"CAR-ID-{_code_key(code)}"
+
+
+# ===========================================================================
+# 车型增强表（内置，来自 ddm999/gt7info）
+# ===========================================================================
+#
+# 三张小表，都是**内置**而不是运行时下载（跟 `_COURSE_CSV` 一个道理：跑在
+# 纯内网也要能出结果，而且加起来才几 KB）：
+#   * `_MAKER_CSV`    —— 厂商 ID → 品牌名 + 国别 ID
+#   * `_COUNTRY_CSV`  —— 国别 ID → 国家名 + 国旗码
+#   * `_CAR_GROUP_CSV`—— 车 ID → 赛事组别（Gr.1~Gr.4 / Gr.B / Gr.X / N 街车）
+#
+# 🔴 车 → 厂商的**对应关系**在 `cars.csv`（运行时下载的社区表）里，那里的
+#    Maker 列是**数字 ID**，必须再过一遍 `_MAKER_CSV` 才是人能看的品牌名。
+#    两张表缺任何一张都只会少显示品牌，不会让车名消失。
+#
+# 🔴 组别里 `N` = 街车（没有 Gr. 前缀），`X` = GT7 的 **Gr.X**（VGT 概念车、
+#    方程式、经典赛车、安全车等）。`N` 刻意翻译成空串：给一台 86 打上
+#    「Gr.N」的徽章是错的，游戏里没这个组别。
+_MAKER_CSV = """\
+ID,Name,Country
+3,Alfa Romeo,7
+4,Aston Martin,4
+5,Audi,5
+6,BMW,5
+7,Chevrolet,3
+9,Citroen,6
+10,Daihatsu,2
+11,Dodge,3
+12,Fiat,7
+13,Ford,3
+15,Honda,2
+16,Hyundai,9
+17,Jaguar,4
+18,Lancia,7
+21,Mazda,2
+22,Mercedes-Benz,5
+25,Mitsubishi,2
+28,Nissan,2
+30,Pagani,7
+32,Peugeot,6
+33,Gran Turismo,0
+34,Renault,6
+35,RUF,5
+36,Shelby,3
+38,Subaru,2
+39,Suzuki,2
+43,Toyota,2
+44,TVR,4
+46,Volkswagen,5
+49,Infiniti,3
+50,Lexus,2
+51,MINI,5
+52,Pontiac,3
+55,Plymouth,3
+57,Autobianchi,7
+59,Amuse,2
+65,DMC,3
+69,Volvo,12
+80,Caterham,4
+86,Alpine,6
+87,RE Amemiya,2
+93,Chaparral,3
+110,Ferrari,7
+112,Lamborghini,7
+113,Bugatti,5
+114,Renault Sport,6
+116,Maserati,7
+117,McLaren,4
+119,Tesla,3
+121,KTM,15
+125,Abarth,7
+127,SRT,3
+134,Zagato,7
+135,Italdesign,7
+136,Porsche,5
+138,Fittipaldi Motors,7
+139,GT Awards (SEMA),0
+140,De Tomaso,7
+141,Radical,4
+143,Super Formula (Dallara),2
+144,BAC,4
+145,Willys,3
+146,Jeep,3
+147,Chris Holstrom Concepts,3
+148,Eckert's Rod & Custom,3
+149,Greddy,2
+150,Wicked Fabrication,3
+151,Roadster Shop,3
+152,Genesis,9
+153,AMG,5
+154,DS AUTOMOBILES,6
+155,NISMO,2
+156,Greening Auto Company,3
+157,Garage RCR,3
+158,BVLGARI,7
+159,Skoda,19
+160,AFEELA,2
+161,Opel,5
+162,Mine's,2
+163,Polestar,12
+164,Xiaomi,20
+165,Yangwang,20
+"""
+
+_COUNTRY_CSV = """\
+ID,Name,Code
+0,Others,pdi
+2,Japan,jp
+3,United States,us
+4,United Kingdom,gb
+5,Germany,de
+6,France,fr
+7,Italy,it
+8,Australia,au
+9,Korea,kr
+10,Belgium,be
+12,Sweden,se
+13,Spain,es
+14,Canada,ca
+15,Austria,at
+16,Switzerland,ch
+17,Brazil,br
+18,Croatia,hr
+19,Czech Republic,cz
+20,China,cn
+21,UAE,ae
+"""
+
+_CAR_GROUP_CSV = """\
+ID,Group
+24,N
+31,N
+36,N
+37,N
+41,N
+48,N
+63,N
+78,N
+82,N
+102,N
+104,N
+105,B
+135,N
+137,N
+140,3
+145,N
+173,N
+187,N
+201,N
+203,N
+204,N
+205,N
+207,N
+210,N
+211,N
+216,2
+293,N
+296,1
+301,N
+315,N
+334,N
+345,N
+365,4
+374,N
+379,N
+387,N
+396,N
+451,N
+485,3
+489,N
+514,N
+533,N
+543,N
+575,N
+604,N
+665,N
+688,N
+709,N
+773,N
+779,N
+781,B
+808,X
+810,N
+818,N
+821,N
+829,N
+836,N
+837,N
+843,N
+919,N
+931,N
+942,N
+954,1
+959,N
+998,1
+1027,N
+1040,3
+1044,N
+1067,1
+1069,X
+1365,N
+1370,N
+1373,N
+1378,N
+1384,N
+1385,N
+1399,N
+1402,N
+1409,N
+1410,N
+1425,3
+1426,N
+1431,N
+1433,N
+1448,N
+1458,N
+1461,N
+1466,2
+1470,3
+1474,N
+1480,N
+1481,N
+1484,N
+1504,N
+1507,N
+1508,N
+1510,2
+1516,2
+1523,N
+1527,N
+1528,N
+1536,X
+1537,N
+1539,N
+1540,N
+1541,N
+1542,N
+1543,N
+1545,N
+1549,N
+1551,X
+1553,X
+1562,N
+1563,4
+1565,X
+1578,N
+1581,N
+1582,N
+1645,X
+1646,1
+1671,N
+1689,N
+1722,N
+1729,N
+1746,N
+1770,N
+1773,N
+1778,N
+1796,N
+1797,3
+1893,N
+1895,N
+1896,X
+1898,N
+1900,N
+1902,3
+1904,3
+1905,3
+1907,N
+1916,N
+1925,N
+1926,X
+1927,B
+1931,N
+1932,N
+1933,N
+1935,N
+1956,N
+1965,1
+1973,N
+1975,N
+1984,3
+1985,N
+1986,X
+1987,N
+1990,N
+2010,X
+2011,N
+2017,N
+2018,N
+2026,N
+2049,N
+2050,N
+2051,N
+2055,X
+2059,X
+2060,X
+2074,N
+2076,X
+2077,X
+2078,X
+2080,X
+2087,X
+2095,X
+2098,X
+2099,X
+2101,1
+2103,X
+2106,X
+2107,X
+2108,X
+2109,X
+2110,X
+2111,X
+2112,X
+2113,X
+2116,X
+2117,X
+2118,X
+2119,X
+2120,X
+2121,X
+2122,X
+2123,X
+2124,X
+2127,1
+2131,3
+2134,X
+2135,X
+2136,N
+2138,N
+2139,N
+2141,N
+2142,X
+2143,3
+2144,N
+2145,N
+2146,N
+2147,N
+2148,N
+2149,N
+2150,N
+2152,N
+2153,N
+2154,N
+2155,N
+2156,X
+2157,4
+2158,3
+2159,3
+2160,3
+2161,4
+2162,N
+2163,4
+2164,4
+2166,4
+2167,N
+2169,N
+2170,N
+2171,N
+2172,N
+2173,N
+2174,N
+2175,N
+2176,N
+2177,3
+2178,N
+2179,1
+2180,1
+2181,1
+2182,3
+2183,3
+2184,3
+2185,3
+2186,3
+2187,3
+2188,3
+2190,3
+2192,3
+3183,3
+3185,3
+3187,1
+3188,1
+3192,4
+3209,X
+3210,X
+3214,N
+3215,N
+3216,X
+3217,N
+3218,3
+3219,N
+3220,N
+3221,3
+3222,N
+3223,3
+3224,3
+3225,X
+3227,N
+3228,3
+3229,B
+3230,B
+3231,4
+3232,B
+3234,B
+3235,3
+3237,3
+3238,3
+3239,B
+3241,B
+3242,B
+3245,4
+3246,4
+3247,4
+3248,4
+3249,4
+3251,4
+3252,4
+3253,4
+3254,4
+3256,4
+3257,4
+3258,4
+3259,4
+3260,4
+3261,4
+3262,4
+3263,4
+3264,B
+3265,B
+3266,X
+3267,N
+3268,N
+3295,N
+3296,N
+3297,X
+3298,4
+3299,N
+3300,N
+3301,N
+3303,N
+3304,N
+3305,3
+3306,N
+3309,N
+3310,4
+3311,3
+3312,1
+3313,1
+3314,1
+3315,X
+3316,X
+3332,X
+3333,1
+3334,1
+3335,1
+3336,N
+3337,N
+3338,N
+3339,X
+3340,3
+3341,N
+3342,X
+3343,N
+3344,N
+3345,N
+3346,N
+3348,2
+3349,2
+3350,2
+3351,X
+3352,3
+3353,N
+3354,N
+3356,N
+3357,N
+3358,N
+3359,N
+3360,N
+3361,N
+3362,N
+3363,X
+3364,N
+3365,N
+3367,N
+3368,N
+3369,N
+3370,N
+3371,X
+3372,X
+3373,1
+3374,X
+3375,N
+3376,X
+3377,N
+3383,N
+3384,N
+3385,N
+3387,N
+3388,X
+3389,N
+3390,X
+3391,N
+3392,N
+3393,N
+3394,3
+3396,X
+3397,2
+3398,N
+3399,4
+3400,N
+3401,N
+3402,N
+3403,N
+3404,N
+3405,3
+3406,X
+3407,X
+3408,X
+3409,N
+3410,X
+3411,N
+3412,N
+3413,N
+3414,X
+3415,N
+3416,N
+3417,X
+3418,N
+3419,3
+3420,N
+3421,N
+3422,N
+3423,N
+3424,N
+3426,N
+3427,N
+3428,N
+3429,N
+3430,N
+3431,N
+3432,N
+3433,N
+3434,N
+3436,3
+3437,N
+3438,N
+3439,N
+3441,X
+3442,N
+3443,N
+3444,N
+3445,N
+3446,X
+3449,N
+3450,3
+3451,N
+3452,X
+3453,N
+3454,N
+3456,N
+3457,X
+3458,N
+3459,N
+3462,N
+3464,N
+3466,N
+3467,N
+3469,N
+3471,N
+3473,N
+3474,3
+3475,X
+3476,X
+3477,4
+3478,X
+3479,X
+3480,4
+3481,N
+3482,N
+3483,N
+3485,N
+3486,N
+3487,N
+3488,N
+3489,X
+3490,N
+3493,3
+3494,N
+3495,N
+3499,1
+3500,N
+3501,4
+3502,3
+3503,3
+3504,N
+3505,N
+3506,N
+3507,X
+3508,3
+3509,N
+3510,X
+3511,X
+3512,N
+3513,N
+3514,N
+3515,1
+3517,X
+3518,N
+3519,N
+3520,N
+3521,N
+3522,N
+3523,2
+3524,N
+3525,X
+3526,X
+3528,X
+3529,X
+3530,N
+3531,3
+3532,N
+3533,N
+3534,X
+3535,N
+3536,N
+3538,N
+3539,N
+3540,X
+3541,X
+3542,X
+3543,X
+3545,N
+3546,X
+3547,N
+3548,N
+3549,N
+"""
+
+#: 组别代号 → 显示文本。`N`（街车）不在里面，返回空串。
+_GROUP_LABEL = {"1": "Gr.1", "2": "Gr.2", "3": "Gr.3", "4": "Gr.4",
+                "B": "Gr.B", "X": "Gr.X"}
+
+_MAKER_CACHE: dict[str, tuple[str, str]] | None = None
+_COUNTRY_CACHE: dict[str, tuple[str, str]] | None = None
+_GROUP_CACHE: dict[str, str] | None = None
+
+
+def _parse_id_name(txt: str) -> dict[str, tuple[str, str]]:
+    """解析 `ID,Name[,Extra]` 形式的内置表 → {ID: (Name, Extra)}。"""
+    out: dict[str, tuple[str, str]] = {}
+    for ln in txt.strip().splitlines()[1:]:
+        p = ln.split(",")
+        if len(p) >= 2 and p[0].strip():
+            out[p[0].strip()] = (p[1].strip(),
+                                 p[2].strip() if len(p) > 2 else "")
+    return out
+
+
+def makers() -> dict[str, tuple[str, str]]:
+    """厂商 ID → (品牌名, 国别ID)。"""
+    global _MAKER_CACHE
+    if _MAKER_CACHE is None:
+        _MAKER_CACHE = _parse_id_name(_MAKER_CSV)
+    return _MAKER_CACHE
+
+
+def countries() -> dict[str, tuple[str, str]]:
+    """国别 ID → (国家名, 国旗码)。"""
+    global _COUNTRY_CACHE
+    if _COUNTRY_CACHE is None:
+        _COUNTRY_CACHE = _parse_id_name(_COUNTRY_CSV)
+    return _COUNTRY_CACHE
+
+
+def car_groups() -> dict[str, str]:
+    """车 ID → 组别代号（"1".."4" / "B" / "X" / "N"）。"""
+    global _GROUP_CACHE
+    if _GROUP_CACHE is None:
+        _GROUP_CACHE = {k: v[0] for k, v in _parse_id_name(_CAR_GROUP_CSV).items()}
+    return _GROUP_CACHE
+
+
+def car_group_of(code: int) -> str:
+    """carCode → 组别徽章文本（"Gr.3" / "Gr.X" …）。
+
+    街车（`N`）与未收录的车返回 **空串** —— 调用方拿到空串就不要渲染徽章，
+    别自己补一个 "Gr.N" 上去（游戏里没这个组别）。
+    """
+    if not code or code <= 0:
+        return ""
+    return _GROUP_LABEL.get(car_groups().get(_code_key(code), ""), "")
+
+
+def car_info_of(code: int, csv_path: str | None = None,
+                extra_path: str | None = None) -> dict:
+    """carCode 的"名片"：车名 + 品牌 + 国别 + 组别，一次查全。
+
+    返回 ::
+
+        {"code": 3459, "name": "918 Spyder '13", "maker": "Porsche",
+         "country": "Germany", "country_code": "de", "group": "Gr.3",
+         "known": True}
+
+    * `known` = 车名是不是查表查到的（`False` 时 name 形如 `CAR-ID-3656`）。
+      前端想对"未识别车"单独提示就看它，别去字符串匹配 "CAR-ID-"。
+    * 厂商/国别/组别都可能为空（社区表缺列、街车、未收录），**不是错误**。
+    """
+    if not code or code <= 0:
+        return {"code": 0, "name": "", "maker": "", "country": "",
+                "country_code": "", "group": "", "known": False}
+    ex = extra_path if extra_path is not None else _extra_path_for(csv_path)
+    row = _car_table(csv_path, ex).get(_code_key(code))
+    name = row[0] if row and row[0] else ""
+    maker_id = row[1] if row else ""
+    maker_name, country_id = makers().get(maker_id, ("", ""))
+    cname, ccode = countries().get(country_id, ("", ""))
+    return {
+        "code": int(code),
+        "name": name or f"CAR-ID-{_code_key(code)}",
+        "maker": maker_name,
+        "country": cname,
+        "country_code": ccode,
+        "group": car_group_of(code),
+        "known": bool(name),
+    }
+
 
 
 # —— 基础：分组与采样 ——————————————————————————————
@@ -1785,6 +2545,99 @@ ID,Name,Length,NumCorners,IsReverse,Category
 
 _COURSE_CACHE: list[dict] | None = None
 
+# 赛道 BoP 强度（`course-bop` 页面的人工标注，91 条，按 course.csv 的 ID 键）。
+# 🔴 BoP = Balance of Performance，GT7 线上赛对某些赛道做的性能平衡，分
+#    高速/中速/低速三档。它**不是**赛道属性而是赛事属性，且官方后来不再区分
+#    各档具体数值（gt7info 原话："may be missing newer tracks"），所以这里
+#    只当参考标签展示，不参与任何计算。
+# 🔴 只有 91/122 条：没标的赛道 `bop` 为空，前端拿到空就不渲染徽章。
+_TRACK_BOP = (
+    "4:High,10:Mid,11:High,16:Mid,41:Low,51:High,95:Mid,116:High,119:Mid,"
+    "122:Mid,123:Low,125:Low,152:Mid,154:Mid,346:Low,348:Mid,349:Mid,351:Mid,"
+    "354:High,356:High,357:High,358:Low,361:High,362:High,363:Mid,365:Mid,"
+    "376:Mid,439:Low,440:Mid,442:Mid,444:High,449:High,450:Mid,451:High,"
+    "454:High,462:Mid,469:High,470:Mid,471:Low,601:Mid,602:Mid,613:Mid,"
+    "742:High,747:High,776:Mid,777:Mid,790:Mid,791:Low,792:Mid,793:Low,"
+    "794:Mid,795:Mid,819:High,820:Mid,822:Mid,823:High,825:Mid,826:Mid,"
+    "827:Mid,828:Mid,829:High,830:High,837:Mid,838:Low,839:Low,841:Low,"
+    "843:Low,846:Mid,847:Mid,853:Mid,854:High,874:Mid,896:Mid,898:Mid,"
+    "915:High,921:Mid,922:Mid,1024:Mid,1034:Mid,1069:High,1163:High,"
+    "1224:Mid,1225:Mid,1226:Low,1231:Low,1232:Mid,1233:Mid,1240:High,"
+    "1260:High,1264:High,1269:Mid"
+)
+
+_TRACK_LOGO = (
+    # 赛道 ID → 官方 logo 文件名主干（多个布局共用同一个 logo）。
+    # 生成：拿 gt7info crsbase.csv 的 Name 当前缀匹配 course 名，少数对不上的
+    # （Mount Panorama / Road Atlanta / BB Raceway / Daytona / Spa 24h /
+    # Willow Springs）手工补。41 个名字里有 4 个（cgv/eiger/ll/yas）官方站点
+    # 还没上图，拉不到就不显示，不影响其它功能。
+    "4:daytona,10:suzuka,11:hsr,16:fuji,41:seca,51:deepforest,95:nurb,"
+    "116:mtpanorama,119:brands,122:willow,123:willow,125:willow,"
+    "152:interlagos,154:goodwood,346:brands,347:nurb,348:nurb,349:nurb,"
+    "351:tokyo,353:fishermans,354:northernisle,356:bluemoon,357:bb,358:alsace,"
+    "361:tokyo,362:tokyo,363:dragon,365:maggiore,372:colorado,376:kyoto,"
+    "439:alsace,440:kyoto,442:suzuka,443:fishermans,444:bb,449:bluemoon,"
+    "450:tokyo,451:tokyo,452:willow,453:sardwindmills,454:sarthe,462:spa,"
+    "469:monza,470:rbr,471:tsukuba,598:willow,599:sardwindmills,600:colorado,"
+    "601:dragon,602:maggiore,613:kyoto,742:monza,747:deepforest,776:kyoto,"
+    "777:kyoto,790:maggiore,791:maggiore,792:maggiore,793:maggiore,"
+    "794:maggiore,795:maggiore,819:bluemoon,820:bluemoon,822:bluemoon,"
+    "823:bluemoon,825:croix,826:croix,827:croix,828:croix,829:croix,830:croix,"
+    "837:fuji,838:sardroad,839:sardroad,841:sardroad,843:sardroad,846:rbr,"
+    "847:dragon,853:dragon,854:sarthe,874:catalunya,896:autopolis,"
+    "898:autopolis,915:tokyo,921:sardroad,922:sardroad,1007:ra,1024:trialmt,"
+    "1034:trialmt,1069:hsr,1163:daytona,1224:alsace,1225:alsace,1226:maggiore,"
+    "1231:maggiore,1232:maggiore,1233:maggiore,1240:glen,1247:nurb,1248:nurb,"
+    "1249:catalunya,1250:catalunya,1260:routex,1261:routex,1262:routex,"
+    "1264:glen,1265:catalunya,1269:spa,1273:ll,1292:gv,1293:gv,1299:gv,"
+    "1300:gv,1308:ll,1309:ll,1316:ll,1317:ll,1318:ll,2001:eiger,2002:eiger,"
+    "2003:yas,2004:cgv"
+)
+
+_BOP_CACHE: dict[str, str] | None = None
+
+
+def bop_map() -> dict[str, str]:
+    """赛道 ID → BoP 档位（"High"/"Mid"/"Low"），没标注的键不存在。"""
+    global _BOP_CACHE
+    if _BOP_CACHE is None:
+        out: dict[str, str] = {}
+        for seg in _TRACK_BOP.split(","):
+            kv = seg.split(":")
+            if len(kv) == 2 and kv[0].strip():
+                out[kv[0].strip()] = kv[1].strip()
+        _BOP_CACHE = out
+    return _BOP_CACHE
+
+
+def bop_of(course_id: int | str) -> str:
+    """赛道 ID → BoP 档位，未标注返回空串。"""
+    return bop_map().get(str(course_id).strip(), "")
+
+
+_LOGO_CACHE: dict[str, str] | None = None
+
+
+def logo_of(course_id: int | str) -> str:
+    """赛道 ID → 官方赛道 logo 的**文件名主干**（如 "suzuka" → suzuka.png）。
+
+    122 条赛道全部有映射（同一条赛道的不同布局共用一个 logo）。
+
+    🔴 这里只给名字，**图不随包分发**：logo 是游戏素材，直接进公开仓库有
+       版权风险。想要图就用 `helper/download_track_logos.py` 拉到
+       `data/tracklogos/`，仪表盘检测到文件存在才渲染；没有就当它不存在。
+    """
+    global _LOGO_CACHE
+    if _LOGO_CACHE is None:
+        out: dict[str, str] = {}
+        for seg in _TRACK_LOGO.replace("\n", "").split(","):
+            kv = seg.split(":")
+            if len(kv) == 2 and kv[0].strip():
+                out[kv[0].strip()] = kv[1].strip()
+        _LOGO_CACHE = out
+    return _LOGO_CACHE.get(str(course_id).strip(), "")
+
 
 def courses() -> list[dict]:
     """内置赛道表（首次调用时解析一次，之后走缓存）。"""
@@ -1810,6 +2663,7 @@ def courses() -> list[dict]:
             "corners": int(p[3]) if len(p) > 3 and p[3].strip().isdigit() else 0,
             "reverse": p[4].strip() == "1" if len(p) > 4 else False,
             "category": p[5].strip() if len(p) > 5 else "",
+            "bop": bop_of(p[0].strip()),
         })
     _COURSE_CACHE = out
     return out
@@ -1832,6 +2686,100 @@ def course_candidates(ref_len_m: float, tol: float = 0.03) -> list[dict]:
             cand.append({"id": c["id"], "name": c["name"],
                          "length_m": c["length_m"], "corners": c["corners"],
                          "reverse": c["reverse"], "category": c["category"],
+                         "bop": c["bop"],
                          "len_err": round(d, 4)})
     cand.sort(key=lambda x: x["len_err"])
     return cand
+
+
+# ===========================================================================
+# 轮胎参考数据（内置，来自 ddm999/gt7info 的社区实测）
+# ===========================================================================
+#
+# 🔴 这是**参考值**，不是遥测量：GT7 的 UDP 遥测**不下发**胎种、天气、
+#    赛道积水率，所以下面两组数据都没法用来做实时判断，只能：
+#      * 给人看（跑长距离赛前估算进站窗口）
+#      * 给教练的定性规则背书（"雨地别用光头胎"这类）
+#    谁要是拿它算出"你现在胎还剩 37%"，那一定是编的 —— 遥测里没有这个量。
+#
+# 数据来源：
+#   * `_TYRE_LIFE_CSV` —— gt7info `tyre-wear.md`：把胎跑到失效，记录圈数。
+#     两组样本（X2019 800PP @ Blue Moon Bay、原厂 Ford GT3 @ 东京东环），
+#     都是 50 倍胎耗。左右前轮分开记：车不同、赛道不同，磨损快的那侧也不同。
+#   * `_WET_TYRE_CSV` —— gt7info `wet-tyres.txt`：同一条湿地赛道各胎种的
+#     单圈与"开始打滑的积水率"。
+_TYRE_LIFE_CSV = """\
+Compound,Car,Track,WearRate,LapsFrontRight,LapsFrontLeft,Note
+RH,Red Bull X2019 Competition (800PP),Blue Moon Bay Speedway,50x,70,,右前 70 圈后出 T2 失效
+RM,Red Bull X2019 Competition (800PP),Blue Moon Bay Speedway,50x,16,22,右前 16 圈、左前 22 圈
+RS,Red Bull X2019 Competition (800PP),Blue Moon Bay Speedway,50x,8,11,右前 8 圈、左前 11 圈
+IM,Red Bull X2019 Competition (800PP),Blue Moon Bay Speedway,50x,5,6,雨战用胎，寿命极短
+W,Red Bull X2019 Competition (800PP),Blue Moon Bay Speedway,50x,4,5,全雨胎寿命最短
+IM,Ford GT3 (原厂),Tokyo Expressway - East Clockwise,50x,3,2,重车 + 多弯，比 X2019 更费胎
+W,Ford GT3 (原厂),Tokyo Expressway - East Clockwise,50x,2,1,同上
+"""
+
+_WET_TYRE_CSV = """\
+Compound,RefLap,AquaplaningPct,Note
+Comfort Soft,,50,与 Sports Hard 同：积水超过一半就开始打滑
+Sports Hard,,50,与 Comfort Soft 同
+Sports Soft,2:15.267,50,干地基准圈速
+Racing Hard,2:24.114,45,积水 <30% 比 SS 快，>45% 打滑
+Intermediate,2:10.917,60,积水 <30% 与 SS 持平并能保持到 50%，>60% 打滑
+Heavy Wet,2:12.709,60,积水 <50% 略慢于 SS，但打滑更轻
+"""
+
+_TYRE_REF_CACHE: dict | None = None
+
+
+def tyre_reference() -> dict:
+    """轮胎参考数据（寿命 + 湿地特性），结构 ::
+
+        {"life": [{"compound","car","track","wear_rate",
+                   "laps_front_right","laps_front_left","note"}, ...],
+         "wet":  [{"compound","ref_lap","aquaplaning_pct","note"}, ...],
+         "source": "ddm999/gt7info ..."}
+
+    圈数字段可能是 `None`（该样本只记了一侧）。
+    """
+    global _TYRE_REF_CACHE
+    if _TYRE_REF_CACHE is not None:
+        return _TYRE_REF_CACHE
+
+    def _int(s: str) -> int | None:
+        s = s.strip()
+        return int(s) if s.isdigit() else None
+
+    life = []
+    for ln in _TYRE_LIFE_CSV.strip().splitlines()[1:]:
+        p = ln.split(",")
+        if len(p) < 6 or not p[0].strip():
+            continue
+        life.append({
+            "compound": p[0].strip(),
+            "car": p[1].strip(),
+            "track": p[2].strip(),
+            "wear_rate": p[3].strip(),
+            "laps_front_right": _int(p[4]),
+            "laps_front_left": _int(p[5]),
+            "note": p[6].strip() if len(p) > 6 else "",
+        })
+    wet = []
+    for ln in _WET_TYRE_CSV.strip().splitlines()[1:]:
+        p = ln.split(",")
+        if len(p) < 4 or not p[0].strip():
+            continue
+        wet.append({
+            "compound": p[0].strip(),
+            "ref_lap": p[1].strip(),
+            "aquaplaning_pct": _int(p[2]),
+            "note": p[3].strip(),
+        })
+    _TYRE_REF_CACHE = {
+        "life": life,
+        "wet": wet,
+        "source": "ddm999/gt7info（tyre-wear.md / wet-tyres.txt，社区实测）",
+        # 🔴 这行警告要跟着数据一起走：单独看数字很容易被当成实时量使用。
+        "note": "参考值，非遥测量 —— GT7 不下发胎种/天气/积水率，不能用于实时判断",
+    }
+    return _TYRE_REF_CACHE
