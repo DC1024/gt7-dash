@@ -63,9 +63,27 @@
   .video { max-width:880px; margin:0 auto; }
   .video .frame { position:relative; aspect-ratio:16/9; border-radius:14px;
     border:1px solid var(--line); overflow:hidden; background:#000;
-    box-shadow:0 10px 40px rgba(0,0,0,.45); }
+    box-shadow:0 10px 40px rgba(0,0,0,.45); cursor:pointer; }
+  .video .frame img.poster { position:absolute; inset:0; width:100%; height:100%;
+    object-fit:cover; display:block; pointer-events:none; }
+  .video .frame .poster-mask { position:absolute; inset:0; pointer-events:none;
+    background:linear-gradient(180deg, rgba(10,14,23,.10) 0%,
+      rgba(10,14,23,.10) 48%, rgba(10,14,23,.82) 100%); }
+  .video .frame .poster-meta { position:absolute; left:24px; right:24px;
+    bottom:22px; z-index:2; pointer-events:none; color:#fff; }
+  .video .frame .ptitle { display:block; font-size:20px; font-weight:700;
+    text-shadow:0 2px 10px rgba(0,0,0,.6); }
+  .video .frame .psub { display:block; font-size:13px; margin-top:5px;
+    color:rgba(229,234,243,.82); text-shadow:0 1px 6px rgba(0,0,0,.6); }
+  .video .frame .playbtn { position:absolute; top:50%; left:50%;
+    transform:translate(-50%,-50%); width:74px; height:74px; border-radius:50%;
+    border:0; cursor:pointer; z-index:3; padding-left:5px;
+    background:rgba(59,130,246,.92); box-shadow:0 8px 30px rgba(59,130,246,.5);
+    display:flex; align-items:center; justify-content:center; transition:.15s; }
+  .video .frame:hover .playbtn { transform:translate(-50%,-50%) scale(1.09);
+    background:var(--accent); }
   .video .frame iframe { position:absolute; inset:0; width:100%; height:100%;
-    border:0; }
+    border:0; display:block; }
   @media(max-width:760px){ .grid2{grid-template-columns:1fr}
     .hero h1{font-size:32px} }
   footer { border-top:1px solid var(--line); margin-top:80px; padding:30px 0 40px;
@@ -80,7 +98,7 @@
   <a href="#deploy">部署</a>
   <a href="#api">API</a>
   <a href="#coach">副驾</a>
-  <a href="#demo">演示</a>
+  <a href="#promo">宣传视频</a>
   <a class="gh" href="https://github.com/DC1024/gt7-dash" target="_blank">GitHub →</a>
 </div></header>
 
@@ -101,6 +119,26 @@
 </div></section>
 
 <div class="wrap">
+
+<h2 class="sec" id="promo">宣传视频</h2>
+<p class="sub">AI 旁白、零人工剪辑——仪表盘与副驾实际跑起来是什么样。</p>
+<div class="video">
+  <div class="frame" id="biliFrame" onclick="playBili()" role="button" tabindex="0"
+       aria-label="播放宣传视频：你的圈速，差在哪">
+    <img class="poster" src="https://i1.hdslb.com/bfs/archive/39490cb9d0adadd447db061f100402980ae46316.jpg"
+         alt="宣传视频封面：你的圈速，差在哪" referrerpolicy="no-referrer" loading="lazy">
+    <div class="poster-mask"></div>
+    <div class="poster-meta">
+      <span class="ptitle">你的圈速，差在哪</span>
+      <span class="psub">GT7 Dash + gt7-coach 实战演示 · 62 秒</span>
+    </div>
+    <button class="playbtn" type="button" aria-label="播放视频">
+      <svg viewBox="0 0 24 24" width="32" height="32" aria-hidden="true"><path d="M8 5v14l11-7z" fill="#fff"/></svg>
+    </button>
+  </div>
+</div>
+<p class="sub" style="margin-top:14px"><a href="https://www.bilibili.com/video/BV1FKnA6bEi6/" target="_blank" style="color:var(--accent)">在 B 站观看原片 →</a></p>
+
 <h2 class="sec" id="features">仪表盘有什么</h2>
 <p class="sub">全部卡片可拖拽排序、隐藏、多套布局保存——按你的屏幕定制。</p>
 <div class="feats">
@@ -221,15 +259,6 @@ git clone https://github.com/DC1024/gt7-coach <span class="k">&&</span> cd gt7-c
 python -m gt7coach serve --dash http://&lt;本机IP&gt;:8787
 </div>
 
-<h2 class="sec" id="demo">实战演示</h2>
-<p class="sub">AI 旁白、零人工剪辑——仪表盘与副驾实际跑起来是什么样。</p>
-<div class="video">
-  <div class="frame">
-    <iframe src="https://player.bilibili.com/player.html?bvid=BV1FKnA6bEi6&amp;page=1&amp;high_quality=1&amp;danmaku=0" allowfullscreen></iframe>
-  </div>
-</div>
-<p class="sub" style="margin-top:14px"><a href="https://www.bilibili.com/video/BV1FKnA6bEi6/" target="_blank" style="color:var(--accent)">在 B 站观看原片 →</a></p>
-
 </div><!-- /.wrap —— 这个闭合标签原本就漏了，导致 footer 被包进内容区 -->
 
 <footer><div class="wrap">
@@ -239,5 +268,16 @@ python -m gt7coach serve --dash http://&lt;本机IP&gt;:8787
   <a href="https://github.com/DC1024/gt7-coach" target="_blank">gt7-coach 赛道工程师</a> ·
   <a href="https://www.gran-turismo.com/" target="_blank">Gran Turismo 7</a>
 </div></footer>
+
+<script>
+function playBili(){
+  var f = document.getElementById('biliFrame');
+  if(!f || f.dataset.played) return;
+  f.dataset.played = '1';
+  // 点击前只显示封面；点击后才加载播放器，并 autoplay=1 立即播放（非自动播放）
+  f.innerHTML = '<iframe src="https://player.bilibili.com/player.html?bvid=BV1FKnA6bEi6'
+    + '&page=1&high_quality=1&danmaku=0&autoplay=1" allowfullscreen></iframe>';
+}
+</script>
 </body>
 </html>
