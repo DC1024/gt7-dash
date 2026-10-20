@@ -60,6 +60,12 @@
   .code .c { color:#5a6b84; }
   .code .k { color:#7dd3fc; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .video { max-width:880px; margin:0 auto; }
+  .video .frame { position:relative; aspect-ratio:16/9; border-radius:14px;
+    border:1px solid var(--line); overflow:hidden; background:#000;
+    box-shadow:0 10px 40px rgba(0,0,0,.45); }
+  .video .frame iframe { position:absolute; inset:0; width:100%; height:100%;
+    border:0; }
   @media(max-width:760px){ .grid2{grid-template-columns:1fr}
     .hero h1{font-size:32px} }
   footer { border-top:1px solid var(--line); margin-top:80px; padding:30px 0 40px;
@@ -74,6 +80,7 @@
   <a href="#deploy">部署</a>
   <a href="#api">API</a>
   <a href="#coach">副驾</a>
+  <a href="#demo">演示</a>
   <a class="gh" href="https://github.com/DC1024/gt7-dash" target="_blank">GitHub →</a>
 </div></header>
 
@@ -213,6 +220,15 @@ docker compose up -d<br><br>
 git clone https://github.com/DC1024/gt7-coach <span class="k">&&</span> cd gt7-coach<br>
 python -m gt7coach serve --dash http://&lt;本机IP&gt;:8787
 </div>
+
+<h2 class="sec" id="demo">实战演示</h2>
+<p class="sub">AI 旁白、零人工剪辑——仪表盘与副驾实际跑起来是什么样。</p>
+<div class="video">
+  <div class="frame">
+    <iframe src="https://player.bilibili.com/player.html?bvid=BV1FKnA6bEi6&amp;page=1&amp;high_quality=1&amp;danmaku=0" allowfullscreen></iframe>
+  </div>
+</div>
+<p class="sub" style="margin-top:14px"><a href="https://www.bilibili.com/video/BV1FKnA6bEi6/" target="_blank" style="color:var(--accent)">在 B 站观看原片 →</a></p>
 
 </div><!-- /.wrap —— 这个闭合标签原本就漏了，导致 footer 被包进内容区 -->
 
