@@ -8,6 +8,7 @@
   4. 检测器文件缺失 → available=False，不是 500。
 """
 import json
+import sys
 import math
 
 from pathlib import Path
@@ -129,13 +130,93 @@ def test_single_lap_falls_back_to_slip(dash, tmp_path):
 
 
 def test_detector_file_missing_degrades(dash, tmp_path, monkeypatch):
+    """检测器文件不存在 → available=False + 明确原因，而不是 500。
+
+    🔴 这里原来用 `_DETECTOR_TRIED = True` 去"制造缺失状态"，但那个变量在
+       P0-2 修复里已删除——它正是 bug 本身：一次性失败被永久缓存，
+       事件卡降级到进程重启。现在改为把 `_detector_path()` 指向一个
+       真实不存在的路径，走的是**和线上完全一样**的分支。
+    """
     f = tmp_path / "20260101_120000_unknown.jsonl"
     _write_session(f, _two_lap_frames())
     monkeypatch.setattr(dash, "_DETECTOR_MOD", None)
-    monkeypatch.setattr(dash, "_DETECTOR_TRIED", True)
+    monkeypatch.setattr(dash, "_DETECTOR_ERR", "")
+    missing = tmp_path / "nope" / "gt7-event-detector.py"
+    monkeypatch.setattr(dash, "_detector_path", lambda: missing)
     out = dash.session_events(f)
     assert out["available"] is False
     assert "gt7-event-detector.py" in out["reason"]
+
+
+def test_detector_error_is_not_permanently_cached(dash, tmp_path, monkeypatch):
+    """一次加载失败**不能**被永久记住（P0-2 的核心回归）。
+
+    旧实现 `_DETECTOR_TRIED = True` 在 try 之前就置位且永不复位：
+    瞬时的文件缺失 / 并发首请求 / 磁盘抖动，会让事件卡降级到**进程重启**。
+    这里模拟"先失败一次、文件随后出现"，第二次必须能正常加载。
+    """
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames())
+
+    real = Path(dash.__file__).with_name("gt7-event-detector.py")
+    staged = tmp_path / "gt7-event-detector.py"
+    # 第一次：指向不存在的路径 → 失败
+    monkeypatch.setattr(dash, "_DETECTOR_MOD", None)
+    monkeypatch.setattr(dash, "_DETECTOR_ERR", "")
+    monkeypatch.setattr(dash, "_detector_path", lambda: tmp_path / "missing.py")
+    first = dash.session_events(f)
+    assert first["available"] is False
+    assert dash._DETECTOR_MOD is None
+
+    # 第二次：文件就位 → 必须能恢复，而不是继续返回上一次的失败。
+    # 🔴 这条断言就是 bug 本身：旧实现把"已尝试"永久置位，这里会一直 False。
+    staged.write_bytes(real.read_bytes())
+    monkeypatch.setattr(dash, "_detector_path", lambda: staged)
+    second = dash.session_events(f)
+    assert second.get("available") is not False, \
+        f"失败被永久缓存了（旧 bug），reason={second.get('reason')!r}"
+    assert dash._DETECTOR_ERR == ""
+
+
+def test_detector_broken_module_removed_from_sys_modules(dash, tmp_path, monkeypatch):
+    """加载失败时不能把半成品模块留在 sys.modules。
+
+    旧实现先 `sys.modules[name] = mod` 再 `exec_module`，exec 抛错后
+    except 只清 `_DETECTOR_MOD`，坏模块留在 sys.modules —— 后续任何
+    `import gt7_event_detector` 拿到的是残缺对象，报出与真实原因无关的怪错。
+    """
+    import sys
+    f = tmp_path / "20260101_120000_unknown.jsonl"
+    _write_session(f, _two_lap_frames())
+    bad = tmp_path / "gt7-event-detector.py"
+    bad.write_text("this is not python !!!\n", encoding="utf-8")
+    monkeypatch.setattr(dash, "_DETECTOR_MOD", None)
+    monkeypatch.setattr(dash, "_DETECTOR_ERR", "")
+    monkeypatch.setattr(dash, "_detector_path", lambda: bad)
+    sys.modules.pop("gt7_event_detector", None)
+
+    out = dash.session_events(f)
+    assert out["available"] is False
+    assert "gt7_event_detector" not in sys.modules, "坏模块留在了 sys.modules"
+
+
+def test_detector_found_via_meipass(dash, tmp_path, monkeypatch):
+    """PyInstaller onefile：文件在 `sys._MEIPASS` 下也必须找得到。
+
+    这是 exe 版一直丢事件集锦的根因——`Path(__file__).with_name(...)`
+    在 `--add-data` 之后能否命中取决于 PyInstaller 版本，不能赌。
+    """
+    meipass = tmp_path / "_MEI12345"
+    meipass.mkdir()
+    real = Path(dash.__file__).with_name("gt7-event-detector.py")
+    (meipass / "gt7-event-detector.py").write_bytes(real.read_bytes())
+
+    monkeypatch.setattr(sys, "_MEIPASS", str(meipass), raising=False)
+    monkeypatch.setattr(dash, "_DETECTOR_MOD", None)
+    monkeypatch.setattr(dash, "_DETECTOR_ERR", "")
+    # 故意让 __file__ 那条路走不通：把它指向一个不存在的目录
+    monkeypatch.setattr(dash, "__file__", str(tmp_path / "frozen" / "main.py"))
+    assert dash._detector_path() == meipass / "gt7-event-detector.py"
 
 
 def test_single_lap_scope(dash, tmp_path):

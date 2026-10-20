@@ -49,6 +49,7 @@ import math
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -2330,13 +2331,30 @@ def _guess_track_name(ref_len_m: float) -> dict | None:
 # ---------------------------------------------------------------------------
 
 _DETECTOR_MOD: Any = None
-_DETECTOR_TRIED = False
+_DETECTOR_ERR: str = ""          # 最近一次加载失败的原因（透出到 /events 的 reason）
+_DETECTOR_LOCK = threading.Lock()
 
 _EVENT_TYPE_NAMES: dict[str, str] = {
     "hard_braking": "极限刹车", "collision": "碰撞", "spin": "打滑/失控",
     "tyre_abuse": "轮胎滥用", "heavy_throttle": "大油门出弯",
     "off_track": "出界",
 }
+
+
+def _detector_path() -> Path:
+    """定位 gt7-event-detector.py。
+
+    🔴 PyInstaller onefile 下 `__file__` 指向临时解包目录（`sys._MEIPASS`），
+       而代码实际所在目录是 `sys._MEIPASS` 本身；`--add-data` 放进来的文件
+       也在那里。直接 `Path(__file__).with_name(...)` 在冻结态能不能命中，
+       取决于 PyInstaller 版本，不能赌——显式给一条 `_MEIPASS` 分支。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        cand = Path(base) / "gt7-event-detector.py"
+        if cand.exists():
+            return cand
+    return Path(__file__).with_name("gt7-event-detector.py")
 
 
 def _load_detector():
@@ -2346,25 +2364,41 @@ def _load_detector():
        dataclass 处理 `X | None` 注解时会回头查 sys.modules，不注册直接
        AttributeError。文件缺失/加载失败返回 None（部署目录可裁剪该文件），
        事件卡显示「不可用」而不是 500。
+
+    🔴 三条曾经吃掉整个功能的坑（P0-2 修复）：
+       ① **不再有「已尝试」负缓存**：原来 `_DETECTOR_TRIED = True` 在 try 之前
+          就置位且永不复位，一次瞬时失败（并发首请求 / 文件正在写 / 磁盘抖动）
+          会让事件卡**降级到进程重启**，Docker 部署也不能幸免。
+       ② **失败要把坏模块从 sys.modules 摘掉**：先注册再 exec，exec 抛错时
+          半成品模块会留在 sys.modules，后续 `import gt7_event_detector`
+          拿到的是残缺对象，报出与真实原因无关的怪错。
+       ③ **加载要串行**：ThreadingHTTPServer 下两个请求可能同时进这里，
+          各自 exec 一遍，且互相覆盖 sys.modules。加锁后第二个线程直接复用。
     """
-    global _DETECTOR_MOD, _DETECTOR_TRIED
-    if _DETECTOR_TRIED:
+    global _DETECTOR_MOD, _DETECTOR_ERR
+    if _DETECTOR_MOD is not None:
         return _DETECTOR_MOD
-    _DETECTOR_TRIED = True
-    p = Path(__file__).with_name("gt7-event-detector.py")
-    if not p.exists():
-        return None
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "gt7_event_detector", p)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["gt7_event_detector"] = mod
-        spec.loader.exec_module(mod)
+    with _DETECTOR_LOCK:
+        if _DETECTOR_MOD is not None:      # 锁内二次检查（首个线程刚加载完）
+            return _DETECTOR_MOD
+        p = _detector_path()
+        if not p.exists():
+            _DETECTOR_ERR = f"找不到 {p.name}（期望位置：{p}）"
+            return None
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "gt7_event_detector", p)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["gt7_event_detector"] = mod
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            sys.modules.pop("gt7_event_detector", None)   # 别留半成品
+            _DETECTOR_ERR = f"{type(e).__name__}: {e}"
+            return None
         _DETECTOR_MOD = mod
-    except Exception:
-        _DETECTOR_MOD = None
-    return _DETECTOR_MOD
+        _DETECTOR_ERR = ""
+        return mod
 
 
 def _frame_to_sample(det, f, i: int):
@@ -2535,7 +2569,7 @@ def session_events(path: Path, lap_no: int | None = None) -> dict[str, Any]:
     det = _load_detector()
     if det is None:
         return {"available": False,
-                "reason": "gt7-event-detector.py 不在部署目录"}
+                "reason": _DETECTOR_ERR or "gt7-event-detector.py 加载失败"}
     try:
         laps_list, grouped, _ = _valid_laps(path)
     except Exception as e:
@@ -3694,6 +3728,155 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # -- 工具 -------------------------------------------------------------
 
+    # —— 跨站防护（P0-3） ——
+    # 设计前提：**局域网内其它设备必须能直接打开页面**（平板/手机/另一台电脑），
+    # 所以不引入登录、不改默认绑定地址。要挡的是另一类东西：
+    # 用户浏览器里打开的**任意网页**可以跨域请求到 192.168.x.x:8787 ——
+    # 它无法读响应（CORS 挡着），但**能发出写请求**（表单/POST 是"简单请求"，
+    # 不触发预检），这就是 CSRF。三道闸：
+    #   ① Host 白名单（防 DNS rebinding：evil.com 解析到内网 IP）
+    #   ② 写操作同站校验（Origin / Sec-Fetch-Site）
+    #   ③ 写响应不给通配 CORS（见 do_OPTIONS 与 cors 参数）
+    #
+    # 🔴 允许的 Host：IP 字面量、localhost、`--allow-host` 显式列出的名字。
+    #    之所以默认只认 IP/localhost，是因为网关把 evil.com 指到内网 IP 时，
+    #    请求里的 Host 会是 evil.com —— 名字类白名单必须由用户显式声明。
+
+    def _host_allowed(self) -> bool:
+        """Host 头是否可信（防 DNS rebinding）。"""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            return True                       # HTTP/1.0 无 Host，本地工具常见
+        # 去掉端口（IPv6 是 [::1]:8787 形式，先处理方括号）
+        if host.startswith("["):
+            name = host[1:host.find("]")] if "]" in host else host
+        else:
+            name = host.rsplit(":", 1)[0]
+        if name in ("localhost", "127.0.0.1", "::1"):
+            return True
+        extra = getattr(self.server, "allow_hosts", ()) or ()
+        if name in {h.lower() for h in extra}:
+            return True
+        # IP 字面量一律放行：攻击者无法用一个 IP 字面量去借 DNS 解析
+        import ipaddress
+        try:
+            ipaddress.ip_address(name)
+            return True
+        except ValueError:
+            return False
+
+    def _same_site(self) -> bool:
+        """写操作是否来自"同站"（挡 CSRF）。
+
+        放行三类：
+          · 没有 Origin —— curl / Python 脚本 / 老浏览器，不是浏览器跨站场景
+          · Origin 的 netloc 等于 Host —— 页面自己发的（正常点击收藏/删除）
+          · Sec-Fetch-Site 为 same-origin / none
+
+        🔴 Sec-Fetch-Site **有才判、没有就靠 Origin**：旧版 Safari 与部分
+           Android WebView 不发这个头，写成"缺失即拒绝"会让平板莫名 403。
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and origin != "null":
+            host = (self.headers.get("Host") or "").strip().lower()
+            if urlparse(origin).netloc.lower() != host:
+                return False
+        sfs = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sfs and sfs not in ("same-origin", "none"):
+            return False
+        return True
+
+    def _reject_cross_site(self) -> None:
+        # body 的收尾不在这里做，统一交给 _send_body（唯一响应出口）——
+        # 这样 40 多处提前 return 不用逐个记得排空，见 _ensure_body_drained()。
+        self._send_json(
+            {"error": "跨站写入被拒绝",
+             "hint": "浏览器里直接打开仪表盘即可正常操作；"
+                     "脚本调用请用 curl 或去掉 Origin 头"}, 403)
+
+    # 请求体是否已被读过。POST 提前 return 时若为 False，说明 body 还留在
+    # socket 里——必须在响应前排空，否则污染同一条长连接（详见 _send_body）。
+    #
+    # 🔴 必须每个请求重置：keep-alive 下**同一个 handler 实例**会连着处理
+    #    多条请求（只有连接断了才新建），写成类属性而不重置，第二条请求的
+    #    body 就永远不会被排空 —— 症状比原 bug 更隐蔽。
+    _body_consumed = False
+
+    def handle_one_request(self) -> None:
+        """每条请求开始时重置 body 状态（super 之外唯一必须做的事）。"""
+        self._body_consumed = False
+        super().handle_one_request()
+
+    # 排空 body 的上限：正常浏览器的 JSON / 表单远小于这个数。
+    # 声称更大的直接关连接，别被逼着读一个 1GB 的 body。
+    _MAX_DRAIN_BYTES = 64 * 1024
+
+    def _read_json_body(self) -> dict:
+        """读并解析 JSON 请求体（解析失败一律当空对象，调用方按缺字段处理）。
+
+        🔴 凡是读 body 都必须走这里（而不是直接 `self.rfile.read`），
+           因为它会把 `_body_consumed` 置位，`_send_body` 才知道无需再排空。
+        """
+        self._body_consumed = True
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return {}
+        if n <= 0:
+            return {}
+        try:
+            raw = self.rfile.read(n)
+        except Exception:
+            self.close_connection = True
+            return {}
+        try:
+            obj = json.loads(raw or b"{}")
+        except Exception:
+            return {}
+        return obj if isinstance(obj, dict) else {}
+
+    def _ensure_body_drained(self) -> None:
+        """响应发出前的最后一道闸：请求体没读过就排空（或关连接）。"""
+        if self._body_consumed:
+            return
+        self._body_consumed = True
+        self._drain_body_or_close()
+
+    def _drain_body_or_close(self) -> None:
+        """把本请求的 body 读掉，读不动就关连接。
+
+        🔴 HTTP/1.1 长连接不会因为回了 403/400 就重置。`self.rfile` 里那条
+           请求的 body 如果**一个字节都没读**，就会留在 socket 里，被
+           BaseHTTPRequestHandler 当成**下一条请求行**解析：
+
+               [..] "{"value": 30}GET /api/v1/laps HTTP/1.1" 400 -
+
+           用户看到的现象是"这个站点随机 400"，很难联想到是提前 return 引起的。
+
+        两条出路满足任一即可：
+          · 小 body → 读完丢弃，连接继续可用（不打扰局域网设备）；
+          · 没长度 / 声称过大 / 读失败 → `close_connection = True`，
+            由 `_send_body` 回一个 `Connection: close` 让对端重连。
+        """
+        te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+        if te:                          # chunked：要解帧才能读，不值得，关连接
+            self.close_connection = True
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return
+        if n < 0 or n > self._MAX_DRAIN_BYTES:
+            self.close_connection = True
+            return
+        if n == 0:
+            return
+        try:
+            self.rfile.read(n)
+        except Exception:
+            self.close_connection = True
+
     def _accepts_gzip(self) -> bool:
         """客户端是否接受 gzip（`Accept-Encoding: gzip`，含 q=0 的拒绝）。
 
@@ -3740,6 +3923,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hdrs.append(("Vary", "Accept-Encoding"))
         if extra:
             hdrs.extend(extra)
+        # 🔴 先排空请求体，再决定 Connection 头 —— 顺序不能反：
+        #    _ensure_body_drained() 可能把 close_connection 置 True，
+        #    早算 Connection 就会漏发 close，残留 body 又污染下一条请求。
+        self._ensure_body_drained()
         # 客户端要求关闭（或本来就是 HTTP/1.0）时回一个 Connection: close，
         # 别让对端傻等——长连接下"什么时候结束"只能靠 Content-Length 或这一条。
         if self.close_connection:
@@ -3766,10 +3953,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "text/markdown; charset=utf-8", code, cors)
 
     def do_OPTIONS(self) -> None:
-        """CORS 预检。"""
+        """CORS 预检。
+
+        🔴 只对**读**接口放行 `*`：写接口（POST）不再给通配 CORS，
+           否则任意网页都能诱导浏览器发跨站写请求（收藏/删除/改配置）。
+           浏览器对"非简单请求"会先发 OPTIONS，这里按方法区分：
+           `Access-Control-Request-Method: POST` ⇒ 拒绝（回 403）。
+        """
+        req_method = (self.headers.get("Access-Control-Request-Method") or "").upper()
+        if req_method and req_method != "GET":
+            self._send_json({"error": "跨站写入被拒绝"}, 403)
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
@@ -3814,6 +4011,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # 删除则把 jsonl 移入 data/_trash/（可人工找回，不是真删）。
 
     def do_POST(self) -> None:
+        # 🔴 先过跨站闸：Host 校验（防 DNS rebinding）→ 同站校验（防 CSRF）。
+        #    放在 try 之外、唯一入口处，任何写接口都绕不过去。
+        #    注意顺序：Host 必须先判，否则用域名访问时 Origin/Host 其实一致，
+        #    但会被后面的白名单逻辑白拒。
+        #    body 不用在这里管：_send_body 出口统一兜底排空，见 _ensure_body_drained。
+        if not self._host_allowed():
+            self._send_json(
+                {"error": "Host 不被允许",
+                 "hint": "如通过域名访问，请启动时加 --allow-host 你的域名"}, 400)
+            return
+        if not self._same_site():
+            self._reject_cross_site()
+            return
         # 🔴 整个方法必须兜异常：未捕获的异常发生在响应发送前，
         #    客户端会收到空响应（HTTP 000），且看不出任何错误信息。
         try:
@@ -3830,61 +4040,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # —— 全局设置：POST /api/v1/settings/trash-retention {"value": 天数} ——
         if parsed.path == "/api/v1/settings/trash-retention":
             hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-            except Exception:
-                body = {}
+            body = self._read_json_body()
             try:
                 v = float(body.get("value"))
             except (TypeError, ValueError):
                 self._send_json({"error": "value 必须是数字（天数，0=永不清理）"},
-                                400, cors=True)
+                                400, cors=False)
                 return
             if not (0 <= v <= 3650):
-                self._send_json({"error": "天数需在 0~3650 之间"}, 400, cors=True)
+                self._send_json({"error": "天数需在 0~3650 之间"}, 400, cors=False)
                 return
             s = load_settings(hist)
             s["trash_retention_days"] = v
             save_settings(hist, s)
             self._send_json({"ok": True, "trash_retention_days": v,
                              "hint": "已生效，下次清理（每小时检查一次）按新保留期执行"},
-                            cors=True)
+                            cors=False)
             return
 
         # —— 归档保留期：POST /api/v1/settings/archive-after {"value": 天数} ——
         if parsed.path == "/api/v1/settings/archive-after":
             hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-            except Exception:
-                body = {}
+            body = self._read_json_body()
             try:
                 v = float(body.get("value"))
             except (TypeError, ValueError):
                 self._send_json({"error": "value 必须是数字（天数，0=不自动归档）"},
-                                400, cors=True)
+                                400, cors=False)
                 return
             if not (0 <= v <= 3650):
-                self._send_json({"error": "天数需在 0~3650 之间"}, 400, cors=True)
+                self._send_json({"error": "天数需在 0~3650 之间"}, 400, cors=False)
                 return
             s = load_settings(hist)
             s["archive_after_days"] = v
             save_settings(hist, s)
             self._send_json({"ok": True, "archive_after_days": v,
                              "hint": "已生效；归档是无损压缩（.jsonl → .jsonl.gz）"},
-                            cors=True)
+                            cors=False)
             return
 
         # —— 默认名称模板：POST /api/v1/settings/name-template {"value": "..."} ——
         if parsed.path == "/api/v1/settings/name-template":
             hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-            except Exception:
-                body = {}
+            body = self._read_json_body()
             v = str(body.get("value") or "").strip()[:120]
             if not v:
                 v = DEFAULT_NAME_TEMPLATE      # 存空 = 回到默认模板
@@ -3892,7 +4090,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             s["session_name_template"] = v
             save_settings(hist, s)
             self._send_json({"ok": True, "session_name_template": v,
-                             "hint": "已保存，列表页刷新后生效"}, cors=True)
+                             "hint": "已保存，列表页刷新后生效"}, cors=False)
             return
 
         # —— 回收站操作：POST /api/v1/trash/purge | /api/v1/trash/<name>/<action> ——
@@ -3902,7 +4100,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             trash = hist / "_trash"
             if len(tseg) == 5 and tseg[4] == "purge":
                 if not trash.is_dir():
-                    self._send_json({"ok": True, "purged": 0}, cors=True)
+                    self._send_json({"ok": True, "purged": 0}, cors=False)
                     return
                 cnt = 0
                 for tf in list(trash.glob("*.jsonl")) + list(trash.glob("*.jsonl.gz")):
@@ -3912,10 +4110,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     except OSError:
                         continue
                 self._send_json({"ok": True, "purged": cnt,
-                                 "hint": f"已彻底删除 {cnt} 个文件"}, cors=True)
+                                 "hint": f"已彻底删除 {cnt} 个文件"}, cors=False)
                 return
             if len(tseg) != 6 or not tseg[5]:
-                self._send_json({"error": "not found"}, 404, cors=True)
+                self._send_json({"error": "not found"}, 404, cors=False)
                 return
             name, action = Path(tseg[4]).name, tseg[5]
             target = (trash / name).resolve()
@@ -3923,21 +4121,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if (not str(target).startswith(str(trash)) or not target.exists()
                     or not is_session_file(target)):
                 self._send_json({"error": "回收站里没有这个文件", "file": name},
-                                404, cors=True)
+                                404, cors=False)
                 return
             if action == "restore":
                 dest = hist / name
                 if dest.exists():
                     self._send_json({"error": "同名场次已存在，无法恢复"},
-                                    409, cors=True)
+                                    409, cors=False)
                     return
                 target.rename(dest)
-                self._send_json({"ok": True, "hint": "已恢复到场次列表"}, cors=True)
+                self._send_json({"ok": True, "hint": "已恢复到场次列表"}, cors=False)
             elif action == "delete":
                 target.unlink()
-                self._send_json({"ok": True, "hint": "已彻底删除"}, cors=True)
+                self._send_json({"ok": True, "hint": "已彻底删除"}, cors=False)
             else:
-                self._send_json({"error": "unknown action"}, 404, cors=True)
+                self._send_json({"error": "unknown action"}, 404, cors=False)
             return
 
         seg = parsed.path.split("/")
@@ -3945,25 +4143,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if (len(seg) == 6 and seg[1:4] == ["api", "v1", "tracks"]
                 and seg[5] == "rename"):
             hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-            except Exception:
-                body = {}
+            body = self._read_json_body()
             try:
                 tid = int(seg[4])
             except ValueError:
-                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                self._send_json({"error": "track id 非法"}, 400, cors=False)
                 return
             new = str(body.get("value") or "").strip()[:60]
             if not new:
-                self._send_json({"error": "名称不能为空"}, 400, cors=True)
+                self._send_json({"error": "名称不能为空"}, 400, cors=False)
                 return
             lib = load_tracks(hist)
             tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
             if not tr:
                 self._send_json({"error": "track not found", "id": tid},
-                                404, cors=True)
+                                404, cors=False)
                 return
             tr["name"] = new
             tr["verified"] = True
@@ -3972,7 +4166,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             save_tracks(hist, lib)
             self._send_json({"ok": True, "id": tid, "name": new,
                              "hint": "已保存，同赛道所有场次一起生效"},
-                            cors=True)
+                            cors=False)
             return
 
         # /api/v1/tracks/register —— 一键标注：把某场次标注为指定赛道名，
@@ -3984,35 +4178,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if (len(seg) == 5 and seg[1:4] == ["api", "v1", "tracks"]
                 and seg[4] == "register"):
             hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-            except Exception:
-                body = {}
+            body = self._read_json_body()
             fname = str(body.get("file") or "").strip()
             new = str(body.get("name") or "").strip()[:60]
             if not fname or not new:
                 self._send_json({"error": "file 与 name 都不能为空"}, 400,
-                                cors=True)
+                                cors=False)
                 return
             target = (hist / Path(fname).name).resolve()
             target = resolve_session(target)
             if (not str(target).startswith(str(hist)) or not target.exists()
                     or not is_session_file(target)):
                 self._send_json({"error": "session not found", "file": fname},
-                                404, cors=True)
+                                404, cors=False)
                 return
             info = session_track(target)
             if "error" in info:
                 self._send_json({"error": "无法识别该场次赛道（可能无有效圈）",
-                                 "detail": info.get("error")}, 422, cors=True)
+                                 "detail": info.get("error")}, 422, cors=False)
                 return
             tid = info["track_id"]
             lib = load_tracks(hist)
             tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
             if not tr:
                 self._send_json({"error": "track not found", "id": tid},
-                                404, cors=True)
+                                404, cors=False)
                 return
             tr["name"] = new
             tr["verified"] = True
@@ -4023,7 +4213,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "track_id": tid, "name": new,
                              "matched": bool(info.get("matched")),
                              "hint": "已写入赛道库，同赛道所有场次一起生效"},
-                            cors=True)
+                            cors=False)
             return
 
         # /api/v1/tracks/<id>/confirm —— 用户确认某赛道名正确：清掉「自动识别」
@@ -4034,19 +4224,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 tid = int(seg[4])
             except ValueError:
-                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                self._send_json({"error": "track id 非法"}, 400, cors=False)
                 return
             lib = load_tracks(hist)
             tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
             if not tr:
                 self._send_json({"error": "track not found", "id": tid},
-                                404, cors=True)
+                                404, cors=False)
                 return
             tr["verified"] = True
             tr["auto_named"] = False
             save_tracks(hist, lib)
             self._send_json({"ok": True, "id": tid, "verified": True},
-                            cors=True)
+                            cors=False)
             return
 
         # /api/v1/tracks/<id>/restore —— 把「已归档」的赛道恢复（去掉归档标记）。
@@ -4057,20 +4247,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 tid = int(seg[4])
             except ValueError:
-                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                self._send_json({"error": "track id 非法"}, 400, cors=False)
                 return
             lib = load_tracks(hist)
             tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
             if not tr:
                 self._send_json({"error": "track not found", "id": tid},
-                                404, cors=True)
+                                404, cors=False)
                 return
             tr.pop("archived", None)
             tr.pop("archived_at", None)
             tr.pop("archived_reason", None)
             save_tracks(hist, lib)
             self._send_json({"ok": True, "id": tid, "archived": False},
-                            cors=True)
+                            cors=False)
             return
 
         # /api/v1/tracks/<id>/delete —— 从赛道库里**彻底删除**一条赛道
@@ -4082,24 +4272,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 tid = int(seg[4])
             except ValueError:
-                self._send_json({"error": "track id 非法"}, 400, cors=True)
+                self._send_json({"error": "track id 非法"}, 400, cors=False)
                 return
             lib = load_tracks(hist)
             tr = next((t for t in lib["tracks"] if t["id"] == tid), None)
             if not tr:
                 self._send_json({"error": "track not found", "id": tid},
-                                404, cors=True)
+                                404, cors=False)
                 return
             used = any(s.get("track_id") == tid
                        for s in lib["sessions"].values())
             if used:
                 self._send_json({"error": "该赛道还挂着场次，不能删除",
-                                 "id": tid}, 409, cors=True)
+                                 "id": tid}, 409, cors=False)
                 return
             lib["tracks"] = [t for t in lib["tracks"] if t["id"] != tid]
             save_tracks(hist, lib)
             self._send_json({"ok": True, "id": tid, "deleted": True},
-                            cors=True)
+                            cors=False)
             return
 
         # —— 录像 ↔ 遥测 锚点：POST /api/v1/sessions/<name>/video ——
@@ -4113,14 +4303,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # /api/v1/sessions/<name>/<action>
         if (len(seg) != 6 or seg[1:4] != ["api", "v1", "sessions"]
                 or not seg[5]):
-            self._send_json({"error": "not found"}, 404, cors=True)
+            self._send_json({"error": "not found"}, 404, cors=False)
             return
         name, action = Path(seg[4]).name, seg[5]
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-        except Exception:
-            body = {}
+        body = self._read_json_body()
 
         hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
         target = (hist / name).resolve()
@@ -4129,7 +4315,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if (not str(target).startswith(str(hist)) or not target.exists()
                 or not is_session_file(target)):
             self._send_json({"error": "session not found", "file": name},
-                            404, cors=True)
+                            404, cors=False)
             return
 
         meta = load_session_meta(hist)
@@ -4141,7 +4327,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if action == "rename":
             new = str(body.get("value") or "").strip()[:60]
             if not new:
-                self._send_json({"error": "名称不能为空"}, 400, cors=True)
+                self._send_json({"error": "名称不能为空"}, 400, cors=False)
                 return
             entry["custom_name"] = new
         elif action == "favorite":
@@ -4152,17 +4338,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if target.name.endswith(".gz"):
                 self._send_json({"ok": True, "action": action, "file": name,
                                  "already": True, "hint": "这一场已经归档过了"},
-                                cors=True)
+                                cors=False)
                 return
             if _recording_active(hist) and \
                     (time.time() - target.stat().st_mtime) < 20.0:
                 self._send_json({"error": "这一场正在录制，结束后再归档"},
-                                400, cors=True)
+                                400, cors=False)
                 return
             ok = archive_session(target)
             self._send_json({"ok": ok, "action": action, "file": name,
                              "hint": "已压缩为 .jsonl.gz" if ok
-                                     else "归档失败（见服务端日志）"}, cors=True)
+                                     else "归档失败（见服务端日志）"}, cors=False)
             return
         elif action == "delete":
             trash = hist / "_trash"
@@ -4174,15 +4360,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             save_session_meta(hist, meta)
             self._send_json({"ok": True, "deleted": name,
                              "hint": "文件已移入 data/_trash/，可人工找回"},
-                            cors=True)
+                            cors=False)
             return
         else:
             self._send_json({"error": "unknown action", "action": action},
-                            400, cors=True)
+                            400, cors=False)
             return
 
         save_session_meta(hist, meta)
-        self._send_json({"ok": True, "action": action, "file": name}, cors=True)
+        self._send_json({"ok": True, "action": action, "file": name}, cors=False)
 
     def _handle_video_bind(self, name: str) -> None:
         """录像锚点的写入端。
@@ -4200,13 +4386,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if (not str(target).startswith(str(hist)) or not target.exists()
                 or not is_session_file(target)):
             self._send_json({"error": "session not found", "file": name},
-                            404, cors=True)
+                            404, cors=False)
             return
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-        except Exception:
-            body = {}
+        body = self._read_json_body()
 
         canon = session_stem(name) + ".jsonl"
         meta = load_session_meta(hist)
@@ -4217,18 +4399,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 ent.pop("video", None)
                 save_session_meta(hist, meta)
             self._send_json({"ok": True, "bound": False,
-                             "hint": "已解绑录像"}, cors=True)
+                             "hint": "已解绑录像"}, cors=False)
             return
 
         vfile = str(body.get("file") or "").strip()
         if not vfile:
-            self._send_json({"error": "缺少 file（录像文件路径）"}, 400, cors=True)
+            self._send_json({"error": "缺少 file（录像文件路径）"}, 400, cors=False)
             return
 
         start = session_start_epoch(target)
         if start is None:
             self._send_json({"error": "这一场没有有效圈，定不了时间轴零点"},
-                            400, cors=True)
+                            400, cors=False)
             return
 
         src = "manual"
@@ -4236,13 +4418,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 off = float(body["offset_s"])
             except (TypeError, ValueError):
-                self._send_json({"error": "offset_s 必须是数字"}, 400, cors=True)
+                self._send_json({"error": "offset_s 必须是数字"}, 400, cors=False)
                 return
         elif "video_lead_s" in body:
             try:
                 off = -float(body["video_lead_s"])
             except (TypeError, ValueError):
-                self._send_json({"error": "video_lead_s 必须是数字"}, 400, cors=True)
+                self._send_json({"error": "video_lead_s 必须是数字"}, 400, cors=False)
                 return
         else:
             vs = None
@@ -4253,20 +4435,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._send_json(
                         {"error": "video_start_iso 格式不对，例："
-                                  "2026-10-08T19:50:30"}, 400, cors=True)
+                                  "2026-10-08T19:50:30"}, 400, cors=False)
                     return
             elif "video_start_epoch" in body:
                 try:
                     vs = float(body["video_start_epoch"])
                 except (TypeError, ValueError):
                     self._send_json({"error": "video_start_epoch 必须是数字"},
-                                    400, cors=True)
+                                    400, cors=False)
                     return
             elif body.get("probe"):
                 pr = probe_video_start(vfile)
                 if not pr.get("ok"):
                     self._send_json({"error": pr.get("reason"), "probed": False},
-                                    400, cors=True)
+                                    400, cors=False)
                     return
                 vs = float(pr["start_epoch"])
                 src = pr.get("source") or "probe"
@@ -4278,7 +4460,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                               "video_start_iso / video_start_epoch 之一，"
                               "或用 {\"probe\": true} 让服务端探测（前提是"
                               "录像文件在跑 dashboard 的这台机器上）"},
-                    400, cors=True)
+                    400, cors=False)
                 return
             off = vs - start
 
@@ -4296,16 +4478,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
         info["ok"] = True
         info["hint"] = (f"已绑定：遥测 0s ↔ 录像 {(-off):.1f}s"
                         f"（t_video = t_session - offset_s）")
-        self._send_json(info, cors=True)
+        self._send_json(info, cors=False)
 
-    # -- 关闭默认日志（每100ms 一次请求会刷屏）----------------------------
+    # -- 日志：只留"值得查"的行 -------------------------------------------
+    # 🔴 原实现是 `pass`（全关）。问题是 log_error 内部也走这里，于是
+    #    所有 500 / traceback / 客户端异常**一条不剩**——线上出事后只能靠猜。
+    #    但全开也不行：主页面 10Hz 轮询，一天就是 86 万行。
+    #    折中：2xx 丢弃，4xx/5xx 全部保留（含客户端异常，由 log_error 走这里）。
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        pass
+        try:
+            msg = fmt % args
+        except Exception:
+            return
+        # 形如 `"GET /api/state HTTP/1.1" 200 -`
+        # 只看 HTTP 状态码，2xx/3xx 静默
+        code = ""
+        for tok in msg.split():
+            if len(tok) == 3 and tok.isdigit():
+                code = tok
+        if code.startswith(("2", "3")):
+            return
+        try:
+            who = self.client_address[0]
+        except Exception:
+            who = "-"
+        try:
+            sys.stderr.write(
+                f"[{self.log_date_time_string()}] {who} {msg}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     # -- 路由 -------------------------------------------------------------
 
     def do_GET(self) -> None:
+        # Host 校验对读也做：DNS rebinding 的目的正是"用恶意域名读内网数据"，
+        # 只在写接口拦是拦不住的。放行规则见 _host_allowed()。
+        if not self._host_allowed():
+            self._send_json(
+                {"error": "Host 不被允许",
+                 "hint": "如通过域名访问，请启动时加 --allow-host 你的域名"}, 400)
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -4599,6 +4813,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         st = float(query.get("step", ["5"])[0])
                     except ValueError:
                         st = 5.0
+                    # 🔴 必须夹紧：step<=0 会让 gt7analysis 的重采样循环
+                    #    `while d <= s_end: d += step` 永不推进 → 死循环占死一个
+                    #    线程并持着该 store 的 memo 锁。这是**未鉴权的远程 DoS**：
+                    #    一条 ?step=0 就能废掉一个 worker。
+                    #    与 /pitstops（step_m）、/profile（step_m）保持同一口径。
+                    if not (st > 0.0) or st != st:      # 0 / 负数 / NaN
+                        st = 5.0
+                    st = max(1.0, min(st, 50.0))
                     self._send_json(
                         session_deviation(target, ref_lap=rl, cmp_lap=cl,
                                           step=st), cors=True)
@@ -6833,8 +7055,11 @@ _EVENTS_TMPL = r"""
       .then(function (r) { return r.json(); })
       .then(function (d) {
         EV = d;
-        // 检测器文件缺失 / 无帧：整卡隐藏，不给空表
+        // 检测器文件缺失 / 加载失败 / 无帧：整卡隐藏，不给空表。
+        // 🔴 但**必须留一条 console 线索**：曾经这里是纯 return，卡片凭空消失，
+        //    用户以为"这版没有事件功能"，排查时也无从下手（P0-2）。
         if (!EV || EV.available === false) {
+          console.warn('[事件卡] 不可用：', (EV && EV.reason) || '未知原因');
           var card = el('cardEvents');
           if (card) card.style.display = 'none';
           return;
@@ -11701,6 +11926,41 @@ makeZoomable($('chart'), 'chart');
 # 服务
 # ---------------------------------------------------------------------------
 
+def _lan_ipv4_addresses() -> list[str]:
+    """本机可用于局域网访问的 IPv4 地址（已去重、已排除回环）。
+
+    为什么不用 socket.gethostbyname(gethostname())：在双网卡 / 装了虚拟网卡
+    （Docker、VMware、Tailscale）的机器上它只返回一个，而且经常返回的是
+    虚拟网卡那个，用户在平板上打不开还以为是服务没起。这里枚举全部网卡，
+    排序后全部打印，让用户挑能通的。
+
+    🔴 用 UDP connect 探测默认出口 IP（不真发包），是跨平台最稳的做法；
+       getaddrinfo 拿到的列表做补充。任何一步失败都只是少列一个地址，
+       绝不能让服务起不来。
+    """
+    ips: list[str] = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))       # 不真发数据，只让内核选路由
+            ips.append(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       socket.AF_INET):
+            ips.append(info[4][0])
+    except OSError:
+        pass
+    out: list[str] = []
+    for ip in ips:
+        if ip and ip not in out and not ip.startswith("127.") and ip != "0.0.0.0":
+            out.append(ip)
+    return out
+
+
 def main() -> int:
     global PAGE, HUB, _GZIP_ENABLED
 
@@ -11725,6 +11985,11 @@ def main() -> int:
     )
     p.add_argument("--no-gzip", action="store_true",
                    help="关闭响应 gzip（抓包/排障时看明文）")
+    p.add_argument(
+        "--allow-host", action="append", metavar="NAME",
+        help="额外允许的 Host 名（可重复）。默认只认 IP 字面量 / localhost；"
+             "用域名或 NAS 主机名访问时加这个参数，例：--allow-host nas.local",
+    )
     args = p.parse_args()
 
     _GZIP_ENABLED = not args.no_gzip
@@ -11746,14 +12011,23 @@ def main() -> int:
     #    挂在 Handler 类上是无效的（早期版本踩过，报
     #    "'ThreadingHTTPServer' object has no attribute 'history_dir'"）。
     srv.history_dir = str(hist)  # type: ignore[attr-defined]
+    srv.allow_hosts = tuple(args.allow_host or ())  # type: ignore[attr-defined]
 
     print("=" * 62, flush=True)
     print("GT7 遥测 Web 仪表盘", flush=True)
-    print(f"  访问地址: http://{args.bind}:{args.port}", flush=True)
+    print(f"  本机访问: http://127.0.0.1:{args.port}", flush=True)
     if args.bind == "0.0.0.0":
-        print(f"  局域网访问: http://<本机IP>:{args.port}", flush=True)
+        # 🔴 把真实 IP 全列出来：原来只打一句 `http://<本机IP>:8787` 占位符，
+        #    等于让用户在平板/手机上自己猜地址。局域网可达是核心用法，
+        #    这里就该给出可直接复制粘贴的 URL。
+        for ip in _lan_ipv4_addresses():
+            print(f"  局域网访问: http://{ip}:{args.port}", flush=True)
+        if not _lan_ipv4_addresses():
+            print("  ⚠ 未探测到局域网 IPv4 地址（单机/虚拟机环境？）", flush=True)
     print(f"  状态文件: {status_path}", flush=True)
     print(f"  历史场次: {hist}", flush=True)
+    if args.allow_host:
+        print(f"  额外允许的 Host: {', '.join(args.allow_host)}", flush=True)
     if not status_path.exists():
         print("  ⚠ 状态文件不存在——请确认接收器带 --status-file 参数启动", flush=True)
     print("=" * 62, flush=True)

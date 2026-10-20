@@ -1686,7 +1686,21 @@ def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
     （能映射回本圈时间），s 是参考线弧长（能定位在赛道哪里）。
     事件时间线的 OFF_TRACK 用它做几何判据——比「低速+高滑移」可靠：
     压草地未必滑移大，高速冲出弯也出界。最短 8 m 过滤噪声尖刺。
+
+    🔴 `step` 必须先归一化再进重采样循环：`while d <= s_end: d += step`
+       在 step<=0 时**永不推进**（负数还会反向远离），是一条能跑死整个进程的
+       死循环。HTTP 入口已夹紧，但这是模块级公开函数，测试/重放/未来新调用方
+       都会绕开那一层——所以守卫必须放在这里，不能只放在入口。
     """
+    # 归一化步长：0 / 负数 / NaN / inf 一律回落到默认值，再夹进合理区间。
+    try:
+        step = float(step)
+    except (TypeError, ValueError):
+        step = _DEV_STEP
+    if not math.isfinite(step) or step <= 0.0:
+        step = _DEV_STEP
+    step = max(0.5, min(step, 200.0))
+
     empty = {"step_m": step, "line": [], "grid_m": [], "segments": [],
              "reliable": False, "reason": "",
              "ref_len_m": 0.0, "cur_len_m": 0.0, "coverage": 0.0,

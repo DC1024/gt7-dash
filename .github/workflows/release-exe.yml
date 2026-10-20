@@ -29,7 +29,16 @@ jobs:
         run: pip install --upgrade pyinstaller
 
       - name: 打包仪表盘 exe
-        run: pyinstaller --noconfirm --clean --onefile --name gt7-dashboard --hidden-import gt7analysis gt7-dashboard.py
+        # 🔴 --add-data 必须带上 gt7-event-detector.py：
+        #    它在运行时用 importlib 按**文件路径**加载（文件名有连字符，不能 import），
+        #    而 onefile 下代码家在临时解包目录里，不打包进去就永远找不到 →
+        #    /events 与 /highlights 静默变"不可用"，而 README 把事件集锦当卖点。
+        #    --hidden-import 管不了这种情况：它不是 import 出来的。
+        run: >
+          pyinstaller --noconfirm --clean --onefile --name gt7-dashboard
+          --hidden-import gt7analysis
+          --add-data "gt7-event-detector.py;."
+          gt7-dashboard.py
 
       - name: 打包接收器 exe
         run: pyinstaller --noconfirm --clean --onefile --name gt7-recorder gt7-recorder.py
@@ -52,6 +61,20 @@ jobs:
           Copy-Item packaging/windows/*    bundle/
           Compress-Archive -Path bundle/* -DestinationPath gt7-dash-windows-x64.zip -Force
           Get-ChildItem bundle | Select-Object Name, Length
+
+      - name: 校验 exe 内确实带了事件检测器
+        # 🔴 门禁而不是提醒：这个文件漏打包过一次，后果是已发布的 exe 里
+        #    /events 与 /highlights 静默不可用，而且**没有任何报错**——
+        #    用户只会觉得"这版怎么没有事件集锦"。宁可让发布失败。
+        shell: pwsh
+        run: |
+          $out = pyi-archive_viewer -l -r -b dist/gt7-dashboard.exe 2>&1 | Out-String
+          if ($out -notmatch "gt7-event-detector\.py") {
+            Write-Host $out
+            Write-Error "exe 内缺少 gt7-event-detector.py —— /events 与 /highlights 会不可用"
+            exit 1
+          }
+          Write-Host "OK: exe 内已包含 gt7-event-detector.py"
 
       - name: 上传构建产物（手动触发时留档）
         uses: actions/upload-artifact@v4

@@ -140,3 +140,59 @@ def test_ref_self_cross_helper_runs():
     # 在数学意义上 ∞；允许返回 ∞ 或大值。
     val = _ref_self_cross(R, ref_len, min_sep=250.0)
     assert val > 100.0      # 任何小于 100m 的值都是 bug
+
+
+# ---------------------------------------------------------------------------
+# step 参数守卫（P0-1）
+# ---------------------------------------------------------------------------
+# 🔴 这组测试守的是一条**能跑死进程**的死循环：
+#    track_deviation 内部的重采样是 `while d <= s_end: d += step`，
+#    step=0 时 d 永不增长，负数时 d 反向远离 → 永不退出。
+#    同一次循环还持着调用方的 memo key 锁（gt7-dashboard 的 memo_compute），
+#    所以一条 HTTP 请求就能让该场次后续所有请求全部阻塞。
+#
+# 为什么必须测**分析层**而不是只测 HTTP 入口：
+#    session_deviation / track_deviation 都是模块级公开函数，
+#    测试、replay 工具、未来的重放路径都会绕过 HTTP 那一层夹紧。
+
+@pytest.mark.parametrize("bad", [0.0, -0.0, -1.0, -5.0, 1e-9,
+                                 float("nan"), float("inf"),
+                                 float("-inf"), None, "abc"])
+def test_step_guard_never_hangs(bad):
+    """任何非法 step 都必须快速返回，且落在合法区间内。"""
+    ref = _circle(samples=200)
+    cur = _circle(samples=200)
+    # 用超时兜底：真死了这一行会卡住 pytest（CI 会给出 timeout 而不是假绿）
+    out = track_deviation(ref, cur, step=bad)
+    assert out["step_m"] > 0.0
+    assert 0.5 <= out["step_m"] <= 200.0
+
+
+def test_step_guard_normalizes_zero_to_default():
+    """step=0 应回落到默认 5.0（而不是被夹到 0.5，那会让输出点数暴涨 10 倍）。"""
+    ref, cur = _circle(samples=200), _circle(samples=200)
+    out = track_deviation(ref, cur, step=0.0)
+    assert out["step_m"] == pytest.approx(5.0)
+
+
+def test_step_guard_clamps_tiny_positive():
+    """极小但合法的正数应被夹到下限 0.5，而不是生成几十万个点。"""
+    ref, cur = _circle(samples=200), _circle(samples=200)
+    out = track_deviation(ref, cur, step=1e-9)
+    assert out["step_m"] == pytest.approx(0.5)
+    # 圆周周长 2πR ≈ 628m，0.5m 步长约 1257 点；不夹紧会是天文数字
+    assert len(out["line"]) < 2000
+
+
+def test_step_guard_caps_huge_value():
+    """超大 step 应被夹到上限 200，避免退化成一两个点。"""
+    ref, cur = _circle(samples=200), _circle(samples=200)
+    out = track_deviation(ref, cur, step=1e6)
+    assert out["step_m"] == pytest.approx(200.0)
+
+
+def test_step_guard_keeps_legal_value_exact():
+    """合法值不该被改动（防止夹紧逻辑误伤正常调用）。"""
+    ref, cur = _circle(samples=200), _circle(samples=200)
+    for v in (1.0, 5.0, 12.5, 50.0):
+        assert track_deviation(ref, cur, step=v)["step_m"] == pytest.approx(v)
