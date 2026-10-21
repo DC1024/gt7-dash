@@ -42,6 +42,8 @@ COPY gt7-decrypt/gt7-decrypt-linux-amd64 /app/gt7-decrypt
 RUN chmod 755 /app/gt7-decrypt && /app/gt7-decrypt -selftest
 
 # 数据目录（用 volume 挂到宿主机，容器重建不丢数据）
+# ⚠️ 这行只在**不用 bind mount** 时有效：./data:/data 会把它整个遮住，
+#    容器看到的仍是宿主机目录的权限。README 要求部署前 chown 10001:10001。
 RUN mkdir -p /data && chmod 777 /data
 
 # 非 root 运行。用固定 UID/GID 便于宿主机上管理文件权限。

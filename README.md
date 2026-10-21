@@ -88,6 +88,10 @@ PS5 → 设置 → 网络 → 打开 GT7 遥测上传功能，然后：
 ```bash
 mkdir gt7-dash && cd gt7-dash
 curl -O https://raw.githubusercontent.com/DC1024/gt7-dash/main/docker-compose.yml
+# 🔴 先建 data 并交给容器用户（uid 10001）：
+#    镜像里的 chmod 会被 bind mount 遮住，不授权的话首次启动写不了文件
+#    （status.json 静默失败、录制器打不开 jsonl 直接退出）。
+mkdir -p data && sudo chown 10001:10001 data
 docker compose up -d
 # 打开 http://<本机IP>:8787
 ```
