@@ -3,7 +3,7 @@
 > 本文件由 `python tools/gen_changelog.py` 从 git 历史生成，**不要手改**。
 > 提交信息遵循 `type(scope): 描述`，脚本按 type 分组。
 
-## 未发布
+## v1.4.2
 
 ### 工程
 - 前端 ESLint / 发行说明自动化 / 镜像 digest / 日志轮转 / metrics（`v1.4.2`）
