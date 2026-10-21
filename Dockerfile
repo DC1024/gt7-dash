@@ -22,7 +22,18 @@
 #      --build-arg BASE_IMAGE=gt7-base:pre-w3   用一个已装好 tini 的基镜像
 #      --build-arg SKIP_APT=1                   跳过 apt（基镜像里已经有了）
 #    默认值保持"从官方 python 镜像全量构建"，联网环境下行为不变。
-ARG BASE_IMAGE=python:3.12-slim
+# 🔴 按 **digest** 固定，不用浮动 tag（G4）。
+#    浮动 tag 意味着今天构建和下周构建拿到的是不同的基础镜像 ——
+#    "同一个 commit 两次构建出不同产物"是排查线上问题时的噩梦。
+#    这里钉的是 multi-arch index 的 digest，amd64 / arm64 都能用。
+#
+#    升级基础镜像时（有意为之的动作）：
+#      1. 换掉下面的 sha256；
+#      2. 跑一遍 docker build 确认 tini 仍能装上、-selftest 仍通过；
+#      3. 在 CHANGELOG 里记一笔。
+#    查当前 digest：
+#      docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}'
+ARG BASE_IMAGE=python:3.12-slim@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="gt7-recorder" \

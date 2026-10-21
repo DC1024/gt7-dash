@@ -176,6 +176,55 @@ jobs:
           fi
           echo "旧 Release 已清干净 ✓"
 
+      - name: 生成发行说明（G2）
+        # 🔴 正文从 git 历史生成，不再手写。
+        #    手写正文一定落后：原来那段还在讲 v1.0.1 的功能，而版本已经到
+        #    v1.4.x —— Release 页上写着"本版新增 /api/v1/profile"，
+        #    其实那是十几个版本前的事。
+        #    静态的下载说明保留（它不随版本变），变更列表由
+        #    tools/gen_changelog.py 按 tag 区间生成。
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          PASSED: ${{ needs.test.outputs.passed }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "**PS5《Gran Turismo 7》官方 UDP 遥测 → 本地解密 → Web 实时仪表盘 + 公开数据 API。**"
+            echo
+            echo "## 📦 下载即用（Windows 免安装）"
+            echo
+            echo "附件 \`gt7-dash-windows-x64.zip\` 含三个 exe，绿色免安装："
+            echo
+            echo "| 文件 | 作用 |"
+            echo "|---|---|"
+            echo "| \`run-recorder.bat\` | 先双击它 —— 接收 PS5 发出的 UDP 遥测并解密 |"
+            echo "| \`run-dashboard.bat\` | 再双击它 —— 打开 http://127.0.0.1:8787 看仪表盘 |"
+            echo "| \`gt7-decrypt.exe\` | 解密器（被上面两个调用） |"
+            echo
+            echo "不装 Docker 也能用。想用 Docker 则见 README 的快速开始。"
+            echo
+            echo "## 📝 本版变更"
+            echo
+            python tools/gen_changelog.py --version "$TAG"
+            echo
+            echo "## 🧪 测试"
+            echo
+            echo "全量 **${PASSED} passed**（由 \`tests.yml\` 实时上报，不是手写常量）。"
+            echo
+            echo "本包版本：**v${VERSION}**"
+            echo
+            echo "---"
+            echo
+            echo "**许可**：MIT"
+            echo
+            echo "**完整变更**：https://github.com/DC1024/gt7-dash/compare/v1.0.0...${TAG}"
+          } > release-notes.md
+          echo "--- release-notes.md 预览 ---"
+          head -40 release-notes.md
+
       - name: 发布 Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -186,61 +235,5 @@ jobs:
           #    **自动生成的 notes 会把 body 整个盖掉**，Release 页上只剩
           #    一行 compare 链接（踩过两次）。想要自动 changelog 就自己
           #    在 body 末尾拼一个 compare 链接 —— 见下面「完整变更」那行。
-          body: |
-            **PS5《Gran Turismo 7》官方 UDP 遥测 → 本地解密 → Web 实时仪表盘 + 公开数据 API。**
-
-            本版是配合 [gt7-coach](https://github.com/DC1024/gt7-coach) `v1.0.0-beta.1`
-            的取数需求做的：把工程师要用的接口补齐，并把工程师卡片正面做进实时页。
-
-            ## 📦 下载即用（Windows 免安装）
-
-            附件 `gt7-dash-windows-x64.zip` 含三个 exe，绿色免安装：
-
-            | 文件 | 作用 |
-            |---|---|
-            | `run-recorder.bat` | 先双击它 —— 接收 PS5 发出的 UDP 遥测并解密 |
-            | `run-dashboard.bat` | 再双击它 —— 打开 http://127.0.0.1:8787 看仪表盘 |
-            | `gt7-decrypt.exe` | 解密器（被上面两个调用） |
-
-            不装 Docker 也能用。想用 Docker 则见 README 的快速开始。
-
-            ## ✨ 本版新增
-
-            ### 新增接口（第三方同样可用）
-
-            - **`/api/v1/profile`** —— 赛道圈剖面，按**绝对距离**（不是按时间）等分。
-              带 `meta.in_progress` 说明这一圈是否还在跑 —— 赛道工程师用它判断
-              参考圈「跑完了没有」。此前工程师那边要自己重复建图，现在直接取。
-            - **场次列表带 `car_code`** —— 数字车型码，供跨车型时判断「是不是同一台车」。
-              用数字码而不是车型名，是因为名字要过一次查表，两边都查不到时
-              空对空会被误判成同车。
-
-            ### 仪表盘实时页
-
-            - **「赛道工程师」卡片**：参考圈状态、本圈位置、与参考圈的瞬时时间差、
-              距下一个刹车点的距离/秒数、以及它刚说的话
-            - **播报内容面板**：最近说过的话逐条列出，带优先级
-            - **语音开关 + P0 语音抢占**：P0 硬实时播报可以打断正在念的上一条
-            - **云措辞模型输入框**：在播报设置里直接填，不用改配置文件
-            - 卡片纳入布局系统（可拖拽排序 / 隐藏 / 半宽 / 整行）
-
-            ## 🔧 修复
-
-            - **「本圈已用时」口径** —— 参考圈此前会把「进行中那一圈」也算进去，
-              导致时间基准偏移
-            - **HTTP `Server:` 头**改为从 `APP_VERSION` 派生（此前写死 `1.0`，
-              发版时容易漏改）
-
-            ## 🧪 测试
-
-            全量 **${{ needs.test.outputs.passed }} passed**（由 `tests.yml` 实时上报，
-            不再手写 —— 之前正文里那个 `373` 就是手写常量，用例涨到 400+ 后一直没改）。
-
-            本包版本：**v${{ steps.ver.outputs.version }}**
-
-            ---
-
-            **许可**：MIT
-
-            **完整变更**：https://github.com/DC1024/gt7-dash/compare/v1.0.0...${{ github.ref_name }}
+          body_path: release-notes.md
           fail_on_unmatched_files: true

@@ -1,0 +1,12 @@
+{
+  "name": "gt7-dash-js-lint",
+  "private": true,
+  "//": "这个 package.json 只为前端 lint 服务（C2）。项目本身是纯 Python、零运行时依赖，不要往里加 dependencies。",
+  "scripts": {
+    "lint:js": "python tools/lint_inline_js.py _lint_js && eslint _lint_js"
+  },
+  "devDependencies": {
+    "eslint": "^10.13.0",
+    "globals": "^16.5.0"
+  }
+}

@@ -433,6 +433,10 @@ _FRAME_CACHE_MAX_FRAMES = 2_500_000
 # 让「能缓存几场」由内存预算决定，而不是帧数。
 _FRAME_BYTES_EST = 240
 _FRAME_CACHE_MAX_BYTES = 320 * 1024 * 1024
+
+# 进程启动时刻（单调钟）。/metrics 的 gt7_uptime_seconds 用它 ——
+# 用 monotonic 而不是 time()：系统对时会让 time() 跳变，uptime 会突然变负。
+_STARTED_AT = time.monotonic()
 _CACHED_FRAMES_TOTAL = 0
 _CACHED_BYTES_TOTAL = 0
 
@@ -1118,18 +1122,68 @@ def race_line_session(path: Path, lap_no: int, decimate: int = 6) -> dict[str, A
 # 场次元数据（收藏 / 自定义名称）存 data/sessions_meta.json：
 # jsonl 是不可变的原始数据，用户的标注必须放在边车文件里，
 # 删除/改名都只动这个文件（删除例外：jsonl 移入 _trash 可找回）。
+def _read_json(path: Path, default: Any = None) -> Any:
+    """读一个 JSON 文件，容忍 Windows 上的**瞬时**占用。
+
+    🔴 为什么需要重试：Windows 上另一个进程/线程正在写同一个文件时，
+       读会抛 PermissionError（共享冲突），而这类冲突通常几十毫秒就消失。
+       不重试的后果不是"报错"，而是**静默返回空字典** —— 用户刚在设置页
+       存的值看起来"没生效"，或者赛道库突然变空。Linux 上几乎不会遇到，
+       所以只在 Windows 开发时偶发（实测：连续跑测试时约 1/10 命中）。
+    """
+    import time as _t
+    last: Exception | None = None
+    for i in range(4):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return default if default is not None else {}
+        except PermissionError as e:      # Windows 共享冲突：等一下再试
+            last = e
+            _t.sleep(0.03 * (i + 1))
+        except Exception:
+            return default if default is not None else {}
+    if last:
+        return default if default is not None else {}
+    return default if default is not None else {}
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """原子写 JSON，并对 Windows 的瞬时共享冲突重试。
+
+    🔴 直接 write_text 有两个问题：
+      ① 写到一半崩溃会留下半截 JSON，下次读出来是空库
+         （用户的赛道标注/设置全没了）；
+      ② Windows 上目标文件被别的线程短暂打开时，创建/替换会抛
+         PermissionError（共享冲突）—— 这类冲突几十毫秒就消失。
+    os.replace 在同一文件系统内是原子的，配合重试就能两头兼顾。
+    """
+    import time as _t
+    tmp = path.with_name(path.name + ".tmp")
+    payload = json.dumps(data, ensure_ascii=False, indent=1)
+    last: Exception | None = None
+    for i in range(4):
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:
+            last = e
+            _t.sleep(0.03 * (i + 1))
+        except OSError as e:
+            last = e
+            _t.sleep(0.03 * (i + 1))
+    if last:
+        raise last
+
+
 def load_settings(history_dir: Path) -> dict[str, Any]:
     """全局设置（data/settings.json）。"""
-    fp = history_dir / "settings.json"
-    try:
-        return json.loads(fp.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return _read_json(history_dir / "settings.json")
 
 
 def save_settings(history_dir: Path, settings: dict[str, Any]) -> None:
-    fp = history_dir / "settings.json"
-    fp.write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
+    _atomic_write_json(history_dir / "settings.json", settings)
 
 
 # —— B3：事件阈值（运行时可调，不用改源码重启）——
@@ -1203,16 +1257,11 @@ def _threshold_fingerprint(history_dir: Path) -> str:
 
 
 def load_session_meta(history_dir: Path) -> dict[str, Any]:
-    fp = history_dir / "sessions_meta.json"
-    try:
-        return json.loads(fp.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return _read_json(history_dir / "sessions_meta.json")
 
 
 def save_session_meta(history_dir: Path, meta: dict[str, Any]) -> None:
-    fp = history_dir / "sessions_meta.json"
-    fp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    _atomic_write_json(history_dir / "sessions_meta.json", meta)
 
 
 # ---------------------------------------------------------------------------
@@ -1338,22 +1387,24 @@ _TRACK_MATCH_TOL = 0.05
 
 
 def load_tracks(history_dir: Path) -> dict[str, Any]:
-    fp = history_dir / "tracks.json"
-    try:
-        data = json.loads(fp.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return {"next_id": 1, "tracks": [], "sessions": {}}
-        data.setdefault("next_id", 1)
-        data.setdefault("tracks", [])
-        data.setdefault("sessions", {})
-        return data
-    except Exception:
-        return {"next_id": 1, "tracks": [], "sessions": {}}
+    empty = {"next_id": 1, "tracks": [], "sessions": {}}
+    data = _read_json(history_dir / "tracks.json", empty)
+    if not isinstance(data, dict):
+        return empty
+    data.setdefault("next_id", 1)
+    data.setdefault("tracks", [])
+    data.setdefault("sessions", {})
+    return data
 
 
 def save_tracks(history_dir: Path, data: dict[str, Any]) -> None:
-    fp = history_dir / "tracks.json"
-    fp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    """原子写：先写 .tmp 再 os.replace。
+
+    🔴 直接 write_text 有两个问题：① 写到一半崩溃会留下半截 JSON，
+       下次读出来是空库（用户的赛道标注全没了）；② 并发读可能读到
+       半截内容。os.replace 在同一文件系统内是原子的。
+    """
+    _atomic_write_json(history_dir / "tracks.json", data)
 
 
 def _file_sig(stat: "os.stat_result") -> list:
@@ -4403,6 +4454,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self._send_body(data, "image/png", 200)
 
+    def _metrics_text(self) -> str:
+        """Prometheus 文本格式（G9）。
+
+        只暴露**已经算出来、且能解释**的量。不为了"指标齐全"去造数字——
+        一个说不清含义的 gauge 比没有更糟。
+
+        🔴 这里刻意**不加** `gt7_connected`：PS5 关机是正常状态，
+           不是故障。用 `gt7_last_packet_age_seconds` 让告警方自己定阈值，
+           和 /api/health 的处理保持一致（别把"进程活着"和"游戏在跑"揉一起）。
+        """
+        s = HUB.stats()
+        now = time.time()
+        mono = time.monotonic()
+        lines: list[str] = []
+
+        def g(name: str, help_: str, value: float, typ: str = "gauge") -> None:
+            lines.append(f"# HELP {name} {help_}")
+            lines.append(f"# TYPE {name} {typ}")
+            lines.append(f"{name} {value}")
+
+        g("gt7_up", "仪表盘进程存活", 1)
+        g("gt7_uptime_seconds", "进程已运行秒数",
+          round(mono - _STARTED_AT, 1), "counter")
+        g("gt7_frames", "当前环形缓冲里的帧数", float(s.get("frames") or 0))
+        g("gt7_layouts_total", "累计收到的包格式种类数",
+          float(len(s.get("layouts") or {})))
+        lp = s.get("last_packet_t")
+        g("gt7_last_packet_age_seconds", "距最后一次收到遥测的秒数（-1=从未收到）",
+          round(now - lp, 1) if lp else -1)
+        rx = s.get("last_rx_t")
+        g("gt7_last_rx_age_seconds", "距最后一次收到任何 UDP 包的秒数（-1=从未）",
+          round(now - rx, 1) if rx else -1)
+        g("gt7_frame_cache_bytes", "帧缓存当前占用字节", float(_CACHED_BYTES_TOTAL))
+        g("gt7_frame_cache_entries", "帧缓存条目数", float(len(_FRAMES_CACHE)))
+        try:
+            hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
+            n = len([f for f in hist.glob("*.jsonl*") if f.is_file()])
+        except OSError:
+            n = 0
+        g("gt7_sessions_total", "历史场次文件数", float(n))
+        g("gt7_version_info", "版本号（值恒为 1，版本在 label 里）", 1)
+        lines[-1] = (f'gt7_version_info{{version="{APP_VERSION}"}} 1')
+        return "\n".join(lines) + "\n"
+
     # -- 场次管理（收藏 / 改名 / 删除）------------------------------------
     # jsonl 是不可变原始数据：收藏与改名写进 sessions_meta.json 边车文件，
     # 删除则把 jsonl 移入 data/_trash/（可人工找回，不是真删）。
@@ -5454,6 +5549,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         for k, lb, u in _TH_UI_KEYS],
                 }, cors=True)
 
+            elif path == "/metrics":
+                # Prometheus 抓取端点。用 _send_body 而不是 _send_text ——
+                # 后者固定 text/markdown（给 /api/v1/docs 用的），
+                # 而抓取端按 Content-Type 判断格式。
+                self._send_body(self._metrics_text().encode("utf-8"),
+                                "text/plain; version=0.0.4; charset=utf-8",
+                                200, False)
+
             elif path == "/api/v1/docs":
                 self._send_text(API_DOCS_MD, cors=True)
 
@@ -5948,6 +6051,15 @@ function sessRen(file) {
   if (n === null) return;
   if (!n.trim()) { alert('名称不能为空'); return; }
   sessPost(file, 'rename', n.trim());
+}
+// HTML 转义。🔴 这个页面的回收站列表用到了 esc()，但**本页从未定义它**
+// （其它页面各自在 IIFE 里定义了自己的 esc）。结果：回收站非空时这里抛
+// ReferenceError，整张表渲染不出来。C2 的 ESLint no-undef 抓到的就是这条。
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 function loadTrashSettings() {
   fetch('/api/v1/settings').then(r => r.json()).then(function (d) {

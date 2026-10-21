@@ -73,3 +73,31 @@ jobs:
       #   现在没有可信的基线，随手写个 60 会让第一次 PR 就红；
       #   等这份报告跑过几轮、看清哪些模块是真低，再把阈值按模块定下来。
       #   在那之前它至少让「这版比上版覆盖掉了多少」可见。
+
+
+  # ---------------------------------------------------------------- C2
+  # 内联 JS 的静态检查。
+  #
+  # 为什么单独一个 job、还要装 node：
+  #   页面脚本是模板拼出来的，必须**渲染后**才合法（见 tools/lint_inline_js.py）。
+  #   而 `node --check` 只查语法 —— 历史上出过 `render()` 里 `avg 未定义`
+  #   导致整页冻结，那种错只有 no-undef 能拦。
+  #
+  # 这条门禁第一次跑就抓到一个真 bug：/sessions 页的回收站列表用了
+  # 从未定义的 esc()，回收站非空时整张表渲染不出来。
+  js-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 安装前端 lint 依赖
+        run: npm ci
+      - name: 抽取渲染后的内联脚本
+        run: python tools/lint_inline_js.py _lint_js
+      - name: eslint（no-undef 等）
+        run: npx eslint _lint_js

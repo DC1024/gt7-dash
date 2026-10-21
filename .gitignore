@@ -32,3 +32,7 @@ R4预设问题*.md
 .coverage.*
 coverage.xml
 htmlcov/
+
+# 前端 lint（C2）：依赖与抽取产物都不入库
+node_modules/
+_lint_js/

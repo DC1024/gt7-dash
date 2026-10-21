@@ -18,6 +18,15 @@ services:
     container_name: gt7-recorder
     network_mode: host
     restart: unless-stopped
+    # 🔴 日志轮转（G7）：不设上限的话，json-file 驱动会把 stdout 一直写到
+    #    磁盘满 —— recorder 是 7×24 常驻、还带 --verbose，一天几 MB，
+    #    几个月就能吃掉几十 GB（服务器实测有过 78% 占用）。
+    #    10MB × 3 = 单个容器最多 30MB，够查最近的问题。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       # 🔴 bind mount 会遮住镜像里的 chown/chmod：宿主机目录必须让 uid 10001
       #    可写，否则首次启动写不了文件。见 README「快速开始」。
@@ -42,6 +51,15 @@ services:
     container_name: gt7-dashboard
     network_mode: host
     restart: unless-stopped
+    # 🔴 日志轮转（G7）：不设上限的话，json-file 驱动会把 stdout 一直写到
+    #    磁盘满 —— recorder 是 7×24 常驻、还带 --verbose，一天几 MB，
+    #    几个月就能吃掉几十 GB（服务器实测有过 78% 占用）。
+    #    10MB × 3 = 单个容器最多 30MB，够查最近的问题。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # 🔴 这里**故意没有 depends_on**。
     #    depends_on 只影响启动顺序，代价却是：只要动 dashboard，
     #    `docker compose up --force-recreate gt7-dashboard` 会**连带重建
