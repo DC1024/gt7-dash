@@ -482,6 +482,9 @@ _FRAME_COL_KIND: dict[str, str] = {
     #    时间线卡（/pitstops）的唯一名次来源。此前全库无人读所以没存；
     #    加入后老场次照样能读出（recorder 落盘就有该字段）。
     "quali_pos": "n",
+    # 参赛车数：超车事件用它校验名次是否合法（名次 > 车数 = 脏数据）。
+    # 与 quali_pos 同源（0x86），都是 u16。
+    "num_cars": "n",
     # GT7 官方的「上一圈用时」（毫秒）。圈速表优先用它：帧跨度会把暂停/进站
     # 的墙上时间算进去（实测第 11 圈 182s vs 官方 127s）。
     # 🔴 值出现在**下一圈的首帧**（冲线后 lap 才 +1），见
@@ -2589,6 +2592,8 @@ _EVENT_TYPE_NAMES: dict[str, str] = {
     "hard_braking": "极限刹车", "collision": "碰撞", "spin": "打滑/失控",
     "tyre_abuse": "轮胎滥用", "heavy_throttle": "大油门出弯",
     "off_track": "出界",
+    # v1.4.0 补齐的三类
+    "overtake": "超车 / 被超", "pit_like": "进站", "lap_record": "最快圈",
 }
 
 
@@ -2683,6 +2688,13 @@ def _frame_to_sample(det, f, i: int):
         tyre_temp=list(f.get("tyre_temp") or (0.0, 0.0, 0.0, 0.0)),
         susp_height=list(f.get("susp_height") or (0.0, 0.0, 0.0, 0.0)),
         curvature=curv,
+        # 比赛语义：名次变化（超车）与油量（进站）的数据源。
+        # quali_pos 在比赛中是**实时名次**，非比赛时是 0 / 65535 哨兵，
+        # 检测器内部会过滤，这里原样传。
+        quali_pos=int(f.get("quali_pos") or 0),
+        num_cars=int(f.get("num_cars") or 0),
+        gas_level=f.get("gas_level") or 0.0,
+        gas_capacity=f.get("gas_capacity") or 0.0,
     )
 
 
@@ -2724,6 +2736,28 @@ def _events_compute(det, path: Path, grouped: dict, store: "FrameStore",
     if best.get("lap") in grouped:
         best_lap = int(best["lap"])
 
+    # —— LAP_RECORD：官方圈速创下个人最好成绩（B4a）——
+    # 🔴 只用 time_source == "official" 的圈。帧跨度会把暂停/进站期间
+    #    的墙上时间算进去（实测第 11 圈 182s vs 官方 127s），用它判纪录
+    #    会造出根本不存在的"进步"。
+    # 第一圈不报：没有可比对象，"最快圈"在只跑过一圈时没有意义。
+    # laps_list 由调用方算过一次（_valid_laps 按场次记忆化，这里取缓存不花钱）
+    laps_list, _, _ = _valid_laps(path)
+    record_laps: dict[int, dict[str, Any]] = {}
+    _best: dict[str, Any] | None = None
+    for lp in sorted(laps_list, key=lambda x: x["lap"]):
+        if lp.get("time_source") != "official":
+            continue
+        if _best is None:
+            _best = lp
+            continue
+        if lp["dur"] < _best["dur"]:
+            record_laps[int(lp["lap"])] = {
+                "now": float(lp["dur"]), "prev": float(_best["dur"]),
+                "prev_lap": int(_best["lap"]),
+            }
+            _best = lp
+
     lap_nos = sorted(grouped.keys()) if lap_no is None else (
         [lap_no] if lap_no in grouped else [])
     events: list[dict[str, Any]] = []
@@ -2733,14 +2767,40 @@ def _events_compute(det, path: Path, grouped: dict, store: "FrameStore",
             continue
         samples = [_frame_to_sample(det, f, i) for i, f in enumerate(fs)]
         t0 = samples[0].t
+        # 最快圈事件钉在冲线处（用帧跨度定位，时间轴是按帧时间画的）
+        rec = record_laps.get(int(ln))
+        if rec:
+            span = max(0.001, samples[-1].t - t0)
+            events.append({
+                "lap": int(ln),
+                "t_rel": round(max(0.0, span - 0.5), 3),
+                "t_end_rel": round(span, 3),
+                "type": "lap_record",
+                "confidence": 0.99,
+                "evidence": {
+                    "本圈用时_s": round(rec["now"], 3),
+                    "此前最好_s": round(rec["prev"], 3),
+                    "提升_s": round(rec["prev"] - rec["now"], 3),
+                    "超越圈号": rec["prev_lap"],
+                    "时间来源": "GT7 官方 last_lap_ms",
+                },
+                "hint": "刷新个人最快圈",
+                "src": "lap_time",
+            })
         # 滑移 / 碰撞 / 刹车 / 大油门类。不走 detect_offtrack：
         # OFF_TRACK 由走线偏差主导（见下），检测器自带的「低速+高滑移」
         # 判据只在偏差不可信时兜底。
+        # 先算进站：它的时间窗要用来排除"进站期间掉的名次"。
+        pit_evs = detector.detect_pit_like(samples)
         evs = (detector.detect_impact(samples)
                + detector.detect_spin(samples)
                + detector.detect_hard_braking(samples)
                + detector.detect_tyre_abuse(samples)
-               + detector.detect_heavy_throttle(samples))
+               + detector.detect_heavy_throttle(samples)
+               + pit_evs
+               + detector.detect_position_changes(
+                   samples,
+                   exclude_windows=[(e.t_start, e.t_end) for e in pit_evs]))
         for e in evs:
             events.append({
                 "lap": ln, "t_rel": round(e.t_start - t0, 3),
@@ -2844,6 +2904,8 @@ def session_events(path: Path, lap_no: int | None = None) -> dict[str, Any]:
 _HIGHLIGHT_WEIGHT: dict[str, float] = {
     "collision": 10.0, "spin": 8.0, "off_track": 7.0,
     "tyre_abuse": 5.0, "heavy_throttle": 4.0, "hard_braking": 3.0,
+    # v1.4.0 新增：超车是比赛里最值得回看的事；进站偏"过程"而非"高光"。
+    "overtake": 6.0, "pit_like": 2.0, "lap_record": 6.5,
 }
 _DEFAULT_WEIGHT = 1.0
 
@@ -3701,9 +3763,9 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 | `available` | 检测器文件缺失 / 无帧时为 `false`，`reason` 写明原因 |
 | `calibration` | 前后轴标定半径（与 `/slip` 共用同一次标定）；`available=false` 时滑移用兜底半径 |
 | `events[]` | `{lap, t_rel, t_end_rel, type, confidence, evidence, hint, src}`，按 (圈, 圈内秒) 排序 |
-| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界） |
+| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界）/ `overtake`（超车·被超）/ `pit_like`（进站）/ `lap_record`（最快圈） |
 | `t_rel` / `t_end_rel` | 事件起止相对**该圈起点**的秒数（与 `/series?lap=N` 同一时间基准） |
-| `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底） |
+| `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底）/ `lap_time`（官方圈速，用于 `lap_record`） |
 | `laps` / `lap_scope` | 本次覆盖的圈号清单 / `?lap=N` 的筛选值（0 = 全场） |
 | `thresholds` | 本次检测用的全部阈值（透明化，别猜） |
 

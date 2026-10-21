@@ -27,9 +27,11 @@ import pytest
 NEVER_READ = ["tyre_press", "tyre_wear", "wheel_revs",
               "velocity", "seq", "position", "lap_count",
               "oil_pressure", "water_temp", "oil_temp", "hand_brake", "in_gear",
-              "time_of_day", "turbo_boost", "num_cars"]
+              "time_of_day", "turbo_boost"]
 # 🔴 quali_pos 已被读（进站与名次卡 /pitstops：比赛中 0x84 = 当前名次），
 #    2026-10-08 起存进 _FRAME_COL_KIND——别再挪回 NEVER_READ。
+# 🔴 num_cars 同理：v1.4.0 起超车事件用它校验名次合法性
+#    （名次 > 车数 = 脏数据），也存进 _FRAME_COL_KIND 了。
 
 HEADER = {"session_id": "abcdef01", "circuit": "test", "car": 1302,
           "powertrain": "fuel", "started_at": 1000.0}

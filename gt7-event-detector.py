@@ -75,6 +75,20 @@ class Sample:
     susp_height: list[float] = field(default_factory=lambda: [0.0] * 4)  # mm
     g_force: list[float] = field(default_factory=lambda: [0.0] * 3)      # [纵向, 横向, 垂直] g
 
+    # 比赛名次与油量 —— 超车 / 进站事件的数据源。
+    #
+    # 🔴 `quali_pos`（协议 0x84）在**比赛中就是当前名次**，逐帧实时变化。
+    #    社区文档曾把它写作 "RaceStartPosition"，实测 14 场真实数据里它在
+    #    12→2→8→11→14→4 循环，显然是实时值。
+    #    非比赛场景（计时赛 / 菜单 / 加载）取 0 或 65535（u16 哨兵），
+    #    必须过滤，否则会算出"从 P0 超到 P3"这种不存在的名次。
+    quali_pos: int = 0
+    num_cars: int = 0
+    # 油量：gas_level 单位随动力类型变化（燃油车=升，电车=剩余 kWh）。
+    # 进站检测只关心"短时间内明显上升"这个**相对变化**，与单位无关。
+    gas_level: float = 0.0
+    gas_capacity: float = 0.0
+
     # 元信息（解码得到，可能为 None）
     circuit: str | None = None
     car_name: str | None = None
@@ -90,9 +104,9 @@ class EventType(str, Enum):
     COLLISION = "collision"             # 碰撞
     SPIN = "spin"                       # 打滑/失控
     TYRE_ABUSE = "tyre_abuse"           # 轮胎滥用（单轮滑移显著异于其他）
-    OVERTAKE = "overtake"               # 超车（未实现，见 README）
-    LAP_RECORD = "lap_record"           # 个人最快圈（未实现）
-    PIT_LIKE = "pit_like"               # 进站（未实现）
+    OVERTAKE = "overtake"               # 超车 / 被超（遥测名次变化，B6）
+    LAP_RECORD = "lap_record"           # 个人最快圈（官方圈速，B4a）
+    PIT_LIKE = "pit_like"               # 进站（行为推断，B4b）
     HEAVY_THROTTLE = "heavy_throttle"   # 大油门出弯
     OFF_TRACK = "off_track"             # 出界
     TANK_SLAP = "tank_slap"             # 压路肩石/草地（未实现）
@@ -143,6 +157,29 @@ class Thresholds:
     # 超车判定：与参考圈的赛道坐标差（归一化）
     # 车头（car_z）和车尾（car_x）同时落后参考 → 说明在被超
     overtake_margin: float = 0.0022
+
+    # —— 进站（B4b）——
+    # GT7 不广播"是否在维修区"，只能从行为推断。两条独立证据：
+    #   ① 加油：gas_level 短时间明显上升 —— 强证据，只有进站才可能
+    #   ② 长时间低速：速度持续低于 pit_speed_max —— 弱证据
+    #      （也可能是事故、堵车、打滑后重新起步）
+    # 维修区限速 60 km/h，取 70 留一点余量；4 秒才能滤掉慢弯。
+    pit_speed_max: float = 70.0
+    pit_min_duration: float = 4.0
+    # 加油判据：上升量超过 max(绝对值, 容量的这个比例)。
+    # 电车没有"加油"，但进站充电同样会让 gas_level（剩余 kWh）上升。
+    pit_refuel_abs: float = 1.0
+    pit_refuel_ratio: float = 0.02
+    # 🔴 「整段平均速度」下限：用来把**暂停/停车**和**维修区通行**分开。
+    #    实测一场真实比赛里有 19.7s 平均 6.4km/h、101.3s 平均 1.1km/h 的段，
+    #    那是玩家按了暂停（速度 0，帧照发），不是进站。
+    #    维修区通行是"以 60km/h 匀速开过去"，平均速度必然明显大于 0。
+    #    只在没有加油证据时才看这一条（加油本身已经足够定性）。
+    pit_min_avg_speed: float = 15.0
+
+    # —— 名次变化（B6）——
+    # 名次必须稳定这么久才算真的变了，滤掉单帧跳变（掉帧/瞬时哨兵）。
+    position_hold_s: float = 0.5
 
     # 大油门出弯：出弯速度区间的全油门
     heavy_throttle_min_speed: float = 60.0    # km/h
@@ -643,6 +680,170 @@ class EventDetector:
             )
         return out
 
+    # -- 比赛语义（B6 / B4b）----------------------------------------------
+
+    def detect_position_changes(
+        self,
+        samples: list[Sample],
+        exclude_windows: list[tuple[float, float]] | None = None,
+    ) -> list[Event]:
+        """名次变化 → 超车 / 被超事件。
+
+        🔴 数据源是**遥测里的 `quali_pos`（0x84）**，不是 HUD 截图 OCR。
+           社区文档把它写作 "RaceStartPosition"（发车位），但实测 14 场
+           真实数据里它在 12→2→8→11→14→4 循环 —— 比赛中它就是**当前名次**。
+           历史上为此写过一个 718 行的 OCR 版检测器，因为项目里没有 OCR
+           管线，从未跑起来过，已删除。
+
+        两个必须做的过滤，否则会产出不存在的名次：
+          1. `0` 和 `65535` 是「没有名次」（计时赛 / 菜单 / 加载），
+             以及 `> num_cars` 的值，一律丢弃；
+          2. 名次必须**稳定** `position_hold_s` 才算变了 —— 掉帧、瞬时哨兵
+             会让名次闪一下，不防抖就会把一次掉帧记成两次超车。
+
+        `exclude_windows` 用来排除进站期间的掉位：进站时名次通常掉一大截，
+        那不是被超，是别人在跑。
+        """
+        th = self.th
+        if not samples:
+            return []
+
+        # —— 1. 过滤出有效名次序列 ——
+        series: list[tuple[int, float, int]] = []
+        for i, s in enumerate(samples):
+            pos = int(s.quali_pos or 0)
+            cap = int(s.num_cars or 0)
+            if pos <= 0 or pos == 65535:
+                continue
+            if cap and pos > cap:
+                continue
+            series.append((i, s.t, pos))
+        if len(series) < 3:
+            return []
+
+        # —— 2. 按「连续同值」分组，只保留够长的组（防抖）——
+        groups: list[list] = []          # [pos, t_start, t_end, first_idx]
+        for idx, t, pos in series:
+            if groups and groups[-1][0] == pos:
+                groups[-1][2] = t
+            else:
+                groups.append([pos, t, t, idx])
+        stable = [g for g in groups if g[2] - g[1] >= th.position_hold_s]
+        if len(stable) < 2:
+            return []
+
+        # —— 3. 相邻稳定组之间就是一次名次变化 ——
+        out: list[Event] = []
+        for prev, cur in zip(stable, stable[1:]):
+            t_chg = cur[1]
+            if exclude_windows and any(
+                    a <= t_chg <= b for a, b in exclude_windows):
+                continue
+            delta = prev[0] - cur[0]          # 正 = 名次提升（数字变小）
+            if delta == 0:
+                continue
+            mag = abs(delta)
+            # 一次跨多位几乎都是进站 / 发车混乱 / 大批同时进站，
+            # 单次干净的超车只会 ±1。
+            conf = 0.9 if mag == 1 else (0.7 if mag == 2 else 0.5)
+            gained = delta > 0
+            out.append(Event(
+                t_start=t_chg - th.position_hold_s / 2,
+                t_end=t_chg + th.position_hold_s / 2,
+                type=EventType.OVERTAKE,
+                confidence=conf,
+                lap=samples[cur[3]].lap_count,
+                evidence={
+                    "名次": f"P{prev[0]} → P{cur[0]}",
+                    "变化": f"{'+' if gained else ''}{delta}",
+                    "方向": "提升（超车）" if gained else "下降（被超）",
+                    "参赛车数": int(samples[cur[3]].num_cars or 0),
+                    "名次来源": "遥测 quali_pos（0x84，实时名次）",
+                },
+                comment_hint=("完成一次超越，名次上升"
+                              if gained else
+                              "被对手超越，名次下降"),
+            ))
+        return out
+
+    def detect_pit_like(self, samples: list[Sample]) -> list[Event]:
+        """进站（含加油 / 充电）。
+
+        GT7 **不广播**"是否在维修区"，只能从行为推断。两条独立证据：
+
+          ① **加油**：`gas_level` 在几秒内明显上升。
+             这是强证据 —— 比赛中只有进站才可能补充燃料/电量。
+          ② **长时间低速**：速度持续低于 `pit_speed_max`（维修区限速 60）。
+             这是弱证据 —— 慢弯、事故、堵车、打滑后重新起步都会命中。
+
+        所以只有 ① 给高置信度；单独 ② 必须同时满足「持续够久 + 几乎不给油」
+        才以低置信度报出来，并在证据里写明"也可能是事故/堵车"。
+
+        ⚠️ 电车没有"加油"，但进站充电同样让 `gas_level`（剩余 kWh）上升，
+           判据只比较**相对变化**，与单位无关。
+
+        ⚠️ 协议层限制：**油箱已满的进站无法与暂停区分**。
+           真实案例——一场比赛里玩家进站但油量恒为 100.0，车在维修区静止
+           100 秒，与"按暂停"在遥测上完全一样。这种情况本函数不报事件，
+           这是**有意为之**：宁可漏报，也不要把暂停说成进站。
+        """
+        th = self.th
+        if len(samples) < 2:
+            return []
+
+        # —— 1. 找加油点 ——
+        refuel_t: list[float] = []
+        for i in range(1, len(samples)):
+            a, b = samples[i - 1], samples[i]
+            dt = b.t - a.t
+            if not (0.0 < dt <= 5.0):
+                continue
+            cap = max(a.gas_capacity, b.gas_capacity)
+            need = max(th.pit_refuel_abs, cap * th.pit_refuel_ratio)
+            if b.gas_level - a.gas_level >= need:
+                refuel_t.append(b.t)
+
+        # —— 2. 低速段 ——
+        runs = filter_sustained(
+            samples, lambda s: s.speed_kph < th.pit_speed_max,
+            min_duration=th.pit_min_duration, sample_hz=th.sample_hz)
+
+        out: list[Event] = []
+        for a_i, b_i in runs:
+            seg = samples[a_i:b_i + 1]
+            t0, t1 = seg[0].t, seg[-1].t
+            avg_thr = sum(s.throttle for s in seg) / len(seg)
+            # 加油点落在低速段附近（前后各留 3 秒容差：加油在停车前后都可能）
+            hit = [t for t in refuel_t if t0 - 3.0 <= t <= t1 + 3.0]
+            avg_spd = sum(s.speed_kph for s in seg) / len(seg)
+            if hit:
+                conf, why = 0.95, "低速段内检测到油量上升（加油/充电）"
+            elif avg_spd < th.pit_min_avg_speed:
+                # 整段几乎静止 = 暂停 / 停车，不是维修区通行。
+                # 这一段以前会被误报成进站（实测一场比赛 2 次误报）。
+                continue
+            elif (t1 - t0) >= th.pit_min_duration * 2 and avg_thr < 0.25:
+                conf, why = 0.5, "长时间低速且几乎不给油（也可能是事故/堵车）"
+            else:
+                continue
+            out.append(Event(
+                t_start=t0,
+                t_end=t1,
+                type=EventType.PIT_LIKE,
+                confidence=conf,
+                lap=seg[0].lap_count,
+                evidence={
+                    "持续秒数": round(t1 - t0, 2),
+                    "最低速度_kph": round(min(s.speed_kph for s in seg), 1),
+                    "平均速度_kph": round(avg_spd, 1),
+                    "平均油门": round(avg_thr, 3),
+                    "油量变化": round(seg[-1].gas_level - seg[0].gas_level, 2),
+                    "判据": why,
+                },
+                comment_hint="车辆进入维修区（低速通行 / 补能），这一段不是正常驾驶节奏",
+            ))
+        return out
+
     # -- 全局分析 ---------------------------------------------------------
 
     def run_all(self, samples: list[Sample]) -> list[Event]:
@@ -654,6 +855,11 @@ class EventDetector:
         events += self.detect_offtrack(samples)
         events += self.detect_tyre_abuse(samples)
         events += self.detect_heavy_throttle(samples)
+        pits = self.detect_pit_like(samples)
+        events += pits
+        # 进站窗口内掉的名次不是"被超"，是别人在跑 —— 排除掉再判超车。
+        events += self.detect_position_changes(
+            samples, exclude_windows=[(e.t_start, e.t_end) for e in pits])
 
         # 去重：时间重叠度高且类型相同的，只留置信度最高的
         events = self._dedup(events, overlap_thresh=0.5)
@@ -664,6 +870,8 @@ class EventDetector:
             EventType.SPIN: 8,
             EventType.OFF_TRACK: 7,
             EventType.TYRE_ABUSE: 5,
+            EventType.OVERTAKE: 6,
+            EventType.PIT_LIKE: 6,
             EventType.HEAVY_THROTTLE: 4,
             EventType.HARD_BRAKING: 3,
         }

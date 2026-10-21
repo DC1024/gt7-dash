@@ -478,9 +478,9 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 | `available` | 检测器文件缺失 / 无帧时为 `false`，`reason` 写明原因 |
 | `calibration` | 前后轴标定半径（与 `/slip` 共用同一次标定）；`available=false` 时滑移用兜底半径 |
 | `events[]` | `{lap, t_rel, t_end_rel, type, confidence, evidence, hint, src}`，按 (圈, 圈内秒) 排序 |
-| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界） |
+| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界）/ `overtake`（超车·被超）/ `pit_like`（进站）/ `lap_record`（最快圈） |
 | `t_rel` / `t_end_rel` | 事件起止相对**该圈起点**的秒数（与 `/series?lap=N` 同一时间基准） |
-| `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底） |
+| `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底）/ `lap_time`（官方圈速，用于 `lap_record`） |
 | `laps` / `lap_scope` | 本次覆盖的圈号清单 / `?lap=N` 的筛选值（0 = 全场） |
 | `thresholds` | 本次检测用的全部阈值（透明化，别猜） |
 
