@@ -2220,26 +2220,31 @@ def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = N
     # 帧数完全够，时长也够，于是被当成最快圈。med==0（圈数 <3）时
     # lap_is_complete 返回 True，保持旧行为。
     dists, med_d = lap_distances(laps)
-    samples = {n: lap_samples(fs) for n, fs in laps.items()
-               if len(fs) >= 30
-               and lap_is_complete(dists.get(n, 0.0), med_d)}
-    if not samples:
+    # 🔴 只保留「有效圈」的帧，而且**只为最终选中的两圈**建采样点。
+    #    旧实现给每一圈都调 lap_samples（每帧一个 10 键 dict），
+    #    20 圈 10 万帧实测 1.75s / 73MB，而结果里只用到 ref/cur 两圈。
+    valid = {n: fs for n, fs in laps.items()
+             if len(fs) >= 30
+             and lap_is_complete(dists.get(n, 0.0), med_d)}
+    if not valid:
         return {"laps_analyzed": 0, "lap_summary": [], "ref_lap": None,
                 "cur_lap": None, "time_diff": {"step": step, "grid": [],
                                                "diff_ms": []},
                 "peaks_ref": [], "peaks_cur": [], "pv_pairs": [],
                 "race_line": {"segments": []}}
+
+    # 摘要只需要 4 个标量，逐帧流式算即可，不必先建 10 键的采样点。
     summary = []
-    for n, pts in samples.items():
-        fs = laps.get(n) or []
+    for n, fs in valid.items():
         # 🔴 duration 必须用原始帧跨度（和 analyze_session 的圈速表同一口径）。
         #    之前用重采样最后一点的 t_rel，终点被采样网格截断，
         #    会出现「表格标第 6 圈最快、选择器默认第 8 圈」的对不上。
-        raw_span = (fs[-1]["t"] - fs[0]["t"]) if len(fs) >= 2 else pts[-1]["t_rel"]
-        speeds = [p["speed_kph"] for p in pts]
+        dur = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+        speeds = [(f.get("speed_kph") or 0.0) for f in fs]
         summary.append({
-            "lap": n, "duration_s": round(raw_span, 3),
-            "distance_m": pts[-1]["dist"],
+            "lap": n, "duration_s": round(dur, 3),
+            # 与 lap_samples 末尾的 dist 同源（都是速度积分），round 后一致
+            "distance_m": round(dists.get(n, 0.0), 1),
             "max_speed_kph": max(speeds),
             "avg_speed_kph": round(sum(speeds) / len(speeds), 1),
         })
@@ -2247,25 +2252,27 @@ def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = N
     fastest = min(summary, key=lambda s: s["duration_s"])["lap"]
     # 指定的圈号必须真实有效（URL 可能被手改成任意值），
     # 否则回退到默认值，避免 KeyError 把整个详情页打挂。
-    if ref_lap_no is None or ref_lap_no not in samples:
+    if ref_lap_no is None or ref_lap_no not in valid:
         ref_lap_no = fastest
-    if cur_lap_no is None or cur_lap_no not in samples:
-        cur_lap_no = max(samples)
+    if cur_lap_no is None or cur_lap_no not in valid:
+        cur_lap_no = max(valid)
     # 参考圈与对比圈撞在一起时（用户手选了同一圈，或该场只有一圈被保留），
     # 退到「另一圈」；实在没有别的圈就保持原样（单圈场次时间差自然是全 0）。
-    if cur_lap_no == ref_lap_no and len(samples) > 1:
-        others = [n for n in sorted(samples) if n != ref_lap_no]
+    if cur_lap_no == ref_lap_no and len(valid) > 1:
+        others = [n for n in sorted(valid) if n != ref_lap_no]
         cur_lap_no = others[-1]
-    r = time_diff(samples.get(cur_lap_no, []), samples[ref_lap_no], step)
-    peaks_ref = find_peaks_valleys(samples[ref_lap_no])
-    peaks_cur = (find_peaks_valleys(samples[cur_lap_no])
-                 if cur_lap_no in samples else [])
+
+    ref_pts = lap_samples(valid[ref_lap_no])
+    cur_pts = (ref_pts if cur_lap_no == ref_lap_no
+               else lap_samples(valid[cur_lap_no]))
+    r = time_diff(cur_pts, ref_pts, step)
+    peaks_ref = find_peaks_valleys(ref_pts)
+    peaks_cur = find_peaks_valleys(cur_pts)
     # 圈长：采样点最后一帧的累计距离（m）
-    ref_total = samples[ref_lap_no][-1]["dist"]
-    cur_total = (samples[cur_lap_no][-1]["dist"]
-                 if cur_lap_no in samples else 0.0)
+    ref_total = ref_pts[-1]["dist"]
+    cur_total = cur_pts[-1]["dist"]
     return {
-        "laps_analyzed": len(samples),
+        "laps_analyzed": len(valid),
         "lap_summary": summary,
         "ref_lap": ref_lap_no,
         "cur_lap": cur_lap_no,
@@ -2273,7 +2280,7 @@ def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = N
         "peaks_ref": peaks_ref,
         "peaks_cur": peaks_cur,
         "pv_pairs": match_pv_pairs(peaks_ref, peaks_cur, ref_total, cur_total),
-        "race_line": race_line(samples[ref_lap_no]),
+        "race_line": race_line(ref_pts),
     }
 
 
