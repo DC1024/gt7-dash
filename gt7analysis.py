@@ -1405,7 +1405,8 @@ def _lap_sector_split(fs: list[dict], n_sectors: int):
 
 
 def sector_times(laps: dict[int, list[dict]], n_sectors: int = 4,
-                 tol: float = 0.05, dist_tol: float = 0.03) -> dict:
+                 tol: float = 0.05, dist_tol: float = 0.03,
+                 official: dict[int, float] | None = None) -> dict:
     """分段计时 + 理论最快圈。
 
     每圈按距离等分成 n_sectors 段、插值出各段用时；每段取所有**可信圈**里
@@ -1426,8 +1427,11 @@ def sector_times(laps: dict[int, list[dict]], n_sectors: int = 4,
        ⚠️ 这不只是显示难看：**圈长偏短的圈总时长也偏短，完全可能被选成
        actual_best**，那样"实际最快圈"和"潜在空间"一起就错了。所以筛选
        发生在选 actual_best **之前**，不只是从 counted 里剔掉。
-       判据用圈长中位数 ±dist_tol（而不是最大值）：出赛道多跑一截会让积分圈长
-       变长，取最大反而会以偏为准。
+       判据用基准圈长 ±dist_tol（`_reference_lap_dist`，最大同长簇；圈数 <3
+       时不按距离筛）：出赛道多跑一截会让圈长变长，取最大反而会以偏为准。
+
+    🔴 `actual_best_lap` 优先用官方 `last_lap`（与圈速表/圈间对比同一口径），
+       段用时按 官方/span 等比例缩放，保证各段之和等于展示的圈速。
 
     ⚠️ 理论最快圈 < 实际最快圈是**正常**的，不要把它"修"成相等。
     ⚠️ 残余偏差：即使同为完整圈，圈长仍有约 ±0.3% 的差（本次 5 个可信圈
@@ -1453,8 +1457,22 @@ def sector_times(laps: dict[int, list[dict]], n_sectors: int = 4,
         return out
 
     # —— 圈长一致性：只有跑满整圈的圈，段边界才落在同一段路上 ——
-    ds = sorted(v[1] for v in raw.values())
-    d_ref = ds[len(ds) // 2]
+    # 🔴 基准优先用 _reference_lap_dist（最大同长簇）。1~2 圈时它不可用
+    #    （返回 0），退回「上中位数」——与旧行为一致。
+    # 🔴 先排掉「时钟跳变/多场合并」的圈：它们的 span 远大于官方用时
+    #    （>1.5x），距离被放大到 3 倍，会把基准拉歪（实测 223244：2 圈，
+    #    中位数取到 21855m 的假圈，真实圈被判 partial、最快圈报错）。
+    if official is None:
+        official = official_lap_times(laps)
+    normal_dists = {n: v[1] for n, v in raw.items()
+                    if not (official.get(n) and v[2] > official[n] * 1.5)}
+    d_ref = _reference_lap_dist(normal_dists) if normal_dists else 0.0
+    if d_ref <= 0:
+        if normal_dists:
+            vals = sorted(normal_dists.values())
+            d_ref = vals[len(vals) // 2]       # 上中位数（1~2 圈）
+        else:
+            d_ref = min(v[1] for v in raw.values())   # 全被跳变排除 → 取最短
     out["ref_dist_m"] = round(d_ref, 1)
     usable = {n: v for n, v in raw.items()
               if abs(v[1] - d_ref) <= d_ref * dist_tol}
@@ -1462,16 +1480,34 @@ def sector_times(laps: dict[int, list[dict]], n_sectors: int = 4,
     if not usable:
         # 圈长全都对不上（数据异常），退回全量但明确标注不可信
         usable = dict(raw)
-        out["note"] = "所有圈的圈长都偏离中位数，分段不可比"
+        out["note"] = "所有圈的圈长都偏离基准，分段不可比"
 
-    actual_best_lap = min(usable, key=lambda n: usable[n][2])
-    actual_best = usable[actual_best_lap][2]
-    counted = {n: v for n, v in usable.items() if v[2] <= actual_best * (1 + tol)}
+    # 圈速优先用官方 last_lap：帧跨度会把暂停/进站算进去，选出的
+    # 「实际最快圈」会与圈速表/圈间对比不一致。
+    def _lap_total(n: int) -> float:
+        off = official.get(n)
+        return off if off is not None else raw[n][2]
+
+    actual_best_lap = min(usable, key=_lap_total)
+    actual_best = _lap_total(actual_best_lap)
+    counted = {n: v for n, v in usable.items()
+               if _lap_total(n) <= actual_best * (1 + tol)}
     out["actual_best_lap"] = actual_best_lap
     out["actual_best_s"] = round(actual_best, 3)
 
+    # 段用时按官方圈速等比例缩放：暂停/进站让 span 大于官方值，
+    # 不缩放的话「各段之和」与 total_s 对不上，理论最快圈会算出负数空间。
+    scaled: dict[int, list[float]] = {}
+    for ln, (times, _dist, span_s) in raw.items():
+        off = official.get(ln)
+        if off is not None and span_s > 0 and abs(off - span_s) > 1e-6:
+            k = off / span_s
+            scaled[ln] = [x * k for x in times]
+        else:
+            scaled[ln] = times
+
     if len(counted) >= 2:
-        best_each = [min(v[0][k] for v in counted.values())
+        best_each = [min(scaled[n][k] for n in counted)
                      for k in range(n_sectors)]
         theo = sum(best_each)
         out["reliable"] = True
@@ -1483,15 +1519,21 @@ def sector_times(laps: dict[int, list[dict]], n_sectors: int = 4,
     else:
         # 只统计了信息性的段最快（不作为结论呈现）
         out["best_each_s"] = [
-            round(min(v[0][k] for v in usable.values()), 3) for k in range(n_sectors)]
+            round(min(scaled[n][k] for n in usable), 3) for k in range(n_sectors)]
         out["note"] = (f"接近最快圈（≤{actual_best * (1 + tol):.3f}s）的圈只有 "
                        f"{len(counted)} 个，不足 2 个，理论最快圈不可信")
 
     for ln in sorted(raw):
-        times, dist, total_s = raw[ln]
+        _times, dist, span_s = raw[ln]
+        off = official.get(ln)
+        total_s = off if off is not None else span_s
+        times = scaled[ln]
         partial = ln not in usable
         row = {
-            "lap": ln, "total_s": round(total_s, 3), "dist_m": round(dist, 1),
+            "lap": ln, "total_s": round(total_s, 3),
+            "span_s": round(span_s, 3),
+            "time_source": "official" if off is not None else "span",
+            "dist_m": round(dist, 1),
             "sectors": [round(x, 3) for x in times],
             "counted": ln in counted, "is_best": ln == actual_best_lap,
             "partial": partial,

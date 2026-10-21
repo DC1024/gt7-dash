@@ -1373,6 +1373,10 @@ def _best_lap_of(path: Path) -> float | None:
     best: float | None = None
     cur: int | None = None
     t0 = t_prev = 0.0
+    # 官方圈速：lap 变成 N 的首帧带着 N-1 的 last_lap_ms。
+    # 列表页的 best_lap_s 必须与详情页/对比/分段同一口径（否则
+    # 列表显示 30.0、详情显示 22.0）。
+    official: dict[int, float] = {}
 
     def _close() -> None:
         nonlocal best
@@ -1393,12 +1397,19 @@ def _best_lap_of(path: Path) -> float | None:
                 if not isinstance(lap, int) or lap <= 0 or lap >= 65000:
                     continue
                 if lap != cur:                  # 换圈 = 上一圈结束
+                    if cur is not None:
+                        ms = f.get("last_lap_ms")
+                        if isinstance(ms, int) and 20_000 <= ms <= 3_600_000:
+                            official[cur] = ms / 1000.0
                     _close()
                     cur, t0 = lap, t
                 t_prev = t
         _close()
     except OSError:
         return None
+    if official:
+        # 有官方值就用官方值（帧跨度会把暂停/进站算进去）
+        best = round(min(official.values()), 3)
     with _CACHE_LOCK:
         _BEST_LAP_CACHE[key] = best
     return best
@@ -2332,7 +2343,8 @@ def session_sectors(path: Path, n_sectors: int = 4) -> dict[str, Any]:
         return {"error": "no frames", "laps": [], "reliable": False}
     def _compute():
         import gt7analysis
-        return gt7analysis.sector_times(grouped, n_sectors=n_sectors)
+        return gt7analysis.sector_times(
+            grouped, n_sectors=n_sectors, official=_official_laps(store))
     return store.memo_compute(("sectors", n_sectors), _compute)
 
 
