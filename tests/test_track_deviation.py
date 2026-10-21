@@ -125,6 +125,50 @@ def test_no_ref_or_cur_returns_empty():
     assert out["reason"]
 
 
+# ---------------------------------------------------------------------------
+# 内侧/外侧判定（P0-2）
+# ---------------------------------------------------------------------------
+# 🔴 这组守的是 `inside_pct` 与 `line[][3]` 的**符号**：
+#    法向 N = (−Tz, Tx)，而 T' = κN ⇒ cross(T, T') = κ。
+#    所以「点在弯心侧（内侧）」等价于 dlat 与 cross **同号**。
+#    若写成 c = −cross，内外侧会整体翻转，而数值仍在 0~100 的合法区间里、
+#    不会抛任何异常 —— 只能靠合成圆把方向钉死。
+
+def _toward_center(ref: list[dict], offset: float,
+                   radius: float = 100.0) -> list[dict]:
+    """每个点沿半径方向朝圆心平移 offset 米（顺/逆时针都成立）。
+
+    offset > 0 = 内移（切内线），offset < 0 = 外移（走宽）。
+    """
+    scale = (radius - offset) / radius
+    return [{"dist": p["dist"], "x": p["x"] * scale, "z": p["z"] * scale}
+            for p in ref]
+
+
+@pytest.mark.parametrize("ccw", [True, False])
+def test_inside_pct_inner_offset_is_100(ccw):
+    """本圈整体切内线 10m → inside_pct 必须是 100（不是 0）。"""
+    ref = _circle(ccw=ccw)
+    out = track_deviation(ref, _toward_center(ref, 10.0), step=5.0)
+    assert out["reliable"], f"应该 reliable，reason={out['reason']!r}"
+    assert out["inside_pct"] == pytest.approx(100.0, abs=0.5)
+    # 逐点标记也必须是 1（前端按它上色）。起点 dlat≈0 时是 -1（"在线上"），
+    # 既不算内侧也不算外侧，属正常，排除掉再断言。
+    marks = [p[3] for p in out["line"] if p[3] != -1]
+    assert marks and all(m == 1 for m in marks), marks[:10]
+
+
+@pytest.mark.parametrize("ccw", [True, False])
+def test_inside_pct_outer_offset_is_0(ccw):
+    """本圈整体走宽 10m → inside_pct 必须是 0（不是 100）。"""
+    ref = _circle(ccw=ccw)
+    out = track_deviation(ref, _toward_center(ref, -10.0), step=5.0)
+    assert out["reliable"], f"应该 reliable，reason={out['reason']!r}"
+    assert out["inside_pct"] == pytest.approx(0.0, abs=0.5)
+    marks = [p[3] for p in out["line"] if p[3] != -1]
+    assert marks and all(m == 0 for m in marks), marks[:10]
+
+
 def test_ref_self_cross_helper_runs():
     """_ref_self_cross 在简单圆环上不会卡死。
 

@@ -1759,15 +1759,15 @@ def track_deviation(ref_pts: list[dict], cur_pts: list[dict],
         nx, nz = -dz / L, dx / L
         fx, fz = R[k][1] + dx * t, R[k][2] + dz * t
         dlat = (x - fx) * nx + (z - fz) * nz
-        # 曲率方向：dT/ds 在 +N 上的分量 c = −cross(T, T')，
-        # 曲率中心就在 +N 一侧当且仅当 c > 0。所以点在**弯心侧**
-        # （=内侧）等价于 dlat 与 c 同号。用前后两点估 cross 就够。
+        # 曲率方向：T' = κN ⇒ cross(T, T') = κ(Tx² + Tz²) = κ，
+        # 所以曲率中心就在 +N 一侧当且仅当 cross > 0。点在**弯心侧**
+        # （=内侧）等价于 dlat 与 cross 同号。用前后两点估 cross 就够。
         k0 = max(0, k - 2)
         k1 = min(len(R) - 1, k + 2)
         t0x, t0z = R[k][1] - R[k0][1], R[k][2] - R[k0][2]
         t1x, t1z = R[k1][1] - R[k][1], R[k1][2] - R[k][2]
         cross = t0x * t1z - t0z * t1x
-        c = -cross
+        c = cross
         # 贴着参考线（|dlat| 极小）时点就在线上，既不算内侧也不算外侧，
         # 否则「自己跟自己比」会算出 inside_pct = 0% 这种假结论。
         inside = None if abs(dlat) < 0.05 else ((dlat * c) > 0.0 if c != 0.0 else None)
