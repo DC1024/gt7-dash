@@ -930,6 +930,33 @@ def _reference_lap_dist(dists: dict[int, float]) -> float:
     return min(non_frag) if non_frag else _median(vals)
 
 
+def official_lap_times(laps: dict[int, list[dict]]) -> dict[int, float]:
+    """从帧里的 `last_lap_ms` 还原每圈的**官方用时**（秒）。
+
+    🔴 语义：`lap` 变成 N 的**第一帧**，其 `last_lap_ms` 是第 N-1 圈的官方
+       用时（冲线后游戏才把圈号 +1）。所以第 N 圈的值要去第 N+1 圈的首帧找。
+
+    🔴 为什么需要它：帧跨度 = 圈首帧到圈末帧的**墙上时间**，会把暂停、进站
+       的等待算进圈速（实测第 11 圈 182s，官方 127s）。GT7 自己的计时不含
+       暂停，`last_lap_ms` 才是用户在游戏里看到的数字。
+
+    最后一圈没有「下一圈」可查（比赛结束/录制中断）→ 不返回，调用方回退
+    帧跨度。只接受 20s~1h 的值，0 / 0xFFFFFFFF / 菜单态垃圾值都跳过。
+    """
+    ordered = sorted(laps)
+    out: dict[int, float] = {}
+    for i in range(len(ordered) - 1):
+        n, nxt = ordered[i], ordered[i + 1]
+        frames = laps.get(nxt) or []
+        # 冲线后可能有一两帧还没更新 last_lap，往后看几帧
+        for f in frames[:5]:
+            ms = f.get("last_lap_ms")
+            if isinstance(ms, (int, float)) and 20_000 <= ms <= 3_600_000:
+                out[n] = round(float(ms) / 1000.0, 3)
+                break
+    return out
+
+
 def lap_distances(laps: dict[int, list[dict]]) -> tuple[dict[int, float], float]:
     """每圈积分距离 + 基准圈长（残圈判据的唯一事实源）。
 
@@ -957,7 +984,8 @@ def lap_is_complete(dist: float, med: float,
     return lo * med <= dist <= hi * med
 
 
-def clean_laps(frames: list[dict]) -> dict[int, list[dict]]:
+def clean_laps(frames: list[dict],
+               laps: dict[int, list[dict]] | None = None) -> dict[int, list[dict]]:
     """按圈分组并剔除假圈（保持帧顺序）。
 
     假圈都源于 GT7 的 lap 字段语义：
@@ -978,7 +1006,7 @@ def clean_laps(frames: list[dict]) -> dict[int, list[dict]]:
     ⚠️ 只剔除**首圈与末圈**：中间圈即使跑得慢（事故/慢速圈）也保留，
        避免误删用户的真实数据。单圈场次不剔除（首尾同一圈）。
     """
-    laps = split_laps(frames)
+    laps = split_laps(frames) if laps is None else dict(laps)
     if not laps:
         return laps
     # 菜单态（0xFFFF 等特殊值）视为无效圈
@@ -2196,7 +2224,8 @@ def match_pv_pairs(peaks_ref: list[dict], peaks_cur: list[dict],
 
 def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = None,
                     cur_lap_no: int | None = None, step: float = 10.0,
-                    grouped: dict[int, list[dict]] | None = None) -> dict:
+                    grouped: dict[int, list[dict]] | None = None,
+                    official: dict[int, float] | None = None) -> dict:
     """门面：分组 → 每圈采样 → 选参考圈/对比圈 → 时间差 + 峰谷 + 赛车线。
 
     `ref_lap_no` 缺省 = 最快圈；`cur_lap_no` 缺省 = 最后一圈（圈号最大的有效圈）。
@@ -2207,6 +2236,10 @@ def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = N
     _valid_laps 的记忆化缓存里取），直接传进来即可 —— 此时 `frames` 可以不传。
     详情页一次渲染里 analyze_session 与这里都要同一份分组，不共用就是白扫
     21 万帧两遍。
+
+    `official` 可选：官方圈速映射（lap → 秒）。调用方若有**原始分组**算出的
+    版本（含 clean_laps 丢弃的末圈）就传进来，否则本函数按清洗后的分组算，
+    最后一圈会退回帧跨度。
 
     clean_laps 会剔除首/末假圈（前圈、完赛离场圈）与菜单态，
     否则 25s 的完赛余圈会被当成「最快圈」画出离场的小段赛车线。
@@ -2234,15 +2267,23 @@ def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = N
                 "race_line": {"segments": []}}
 
     # 摘要只需要 4 个标量，逐帧流式算即可，不必先建 10 键的采样点。
+    # 圈速优先用官方 last_lap（帧跨度会把暂停/进站算进去）。
+    # `official` 可由调用方传入（含 clean_laps 丢弃的末圈），否则就地算。
+    if official is None:
+        official = official_lap_times(laps)
     summary = []
     for n, fs in valid.items():
         # 🔴 duration 必须用原始帧跨度（和 analyze_session 的圈速表同一口径）。
         #    之前用重采样最后一点的 t_rel，终点被采样网格截断，
         #    会出现「表格标第 6 圈最快、选择器默认第 8 圈」的对不上。
-        dur = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+        span = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+        off = official.get(n)
+        dur = off if off is not None else span
         speeds = [(f.get("speed_kph") or 0.0) for f in fs]
         summary.append({
             "lap": n, "duration_s": round(dur, 3),
+            "span_s": round(span, 3),
+            "time_source": "official" if off is not None else "span",
             # 与 lap_samples 末尾的 dist 同源（都是速度积分），round 后一致
             "distance_m": round(dists.get(n, 0.0), 1),
             "max_speed_kph": max(speeds),

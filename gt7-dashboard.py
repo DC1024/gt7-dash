@@ -482,6 +482,11 @@ _FRAME_COL_KIND: dict[str, str] = {
     #    时间线卡（/pitstops）的唯一名次来源。此前全库无人读所以没存；
     #    加入后老场次照样能读出（recorder 落盘就有该字段）。
     "quali_pos": "n",
+    # GT7 官方的「上一圈用时」（毫秒）。圈速表优先用它：帧跨度会把暂停/进站
+    # 的墙上时间算进去（实测第 11 圈 182s vs 官方 127s）。
+    # 🔴 值出现在**下一圈的首帧**（冲线后 lap 才 +1），见
+    #    gt7analysis.official_lap_times。
+    "last_lap_ms": "n",
     "g_force": "a",
     # 四轮角速度（rad/s，顺序 前左/前右/后左/后右）。
     # 只有它是「车轮实际转多快」的唯一来源 —— 车身速度传感器测不出空转和抱死，
@@ -1070,13 +1075,15 @@ def compare_session(path: Path, ref_lap_no: int | None = None,
     """
     try:
         _, grouped, _ = _valid_laps(path)
+        _, store = _load_frames(path)
         import gt7analysis
         # 赛车线抽稀在 gt7analysis.race_line 内部做（decimate=6）。
         # 🔴 不能在这里对每段各自 [::6]：分段后各自抽稀会把每段末尾
         #    到下一个边界的点丢掉，一圈上千个分色段留下上千个断隔。
         # 圈分组走 _valid_laps 的记忆化结果，不再自己跑一遍 clean_laps。
         r = gt7analysis.analyze_compare(None, ref_lap_no=ref_lap_no,
-                                        cur_lap_no=cmp_lap_no, grouped=grouped)
+                                        cur_lap_no=cmp_lap_no, grouped=grouped,
+                                        official=_official_laps(store) if store else None)
         return r
     except Exception as e:
         return {"error": str(e)}
@@ -1799,26 +1806,32 @@ def _analyze_frames(path: Path, header: dict,
     # clean_laps 只删首/末残圈，中间圈可能是一次中途退出（只有 55% 圈长），
     # 时长却照样 >20s —— 只判时长会把它当最快圈。
     dists, med_d = gt7analysis.lap_distances(laps)
+    # 官方圈速：帧跨度会把暂停/进站算进去，优先用 last_lap_ms。
+    # 用原始分组（含末圈）算，最后一圈的官方值在完赛离场圈首帧里。
+    official = _official_laps(frames)
 
     lap_times = []
     for lap_no, fs in sorted(laps.items()):
         if len(fs) < 2:
             continue
-        # 用帧数×间隔估算更稳：只取首尾两帧的跨度，
-        # 中间即使丢包也不影响总时长。
-        duration = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+        # 帧跨度（墙上时间）——没有官方值时兜底
+        span = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+        off = official.get(lap_no)
+        duration = off if off is not None else span
         dist = dists.get(lap_no, 0.0)
         # ⚠️ 一圈至少要 20 秒（GT7 最短赛道也1分多）。
         #    数据不足 20 秒说明这是「采集刚开始」或「刚进圈」，
         #    此时报出来的圈速是假的，宁可不给。
+        row = {
+            "lap": lap_no, "time": round(duration, 3),
+            # 帧跨度保留下来：UI/排障能看出「官方 127s、墙上 182s」的差
+            "span_s": round(span, 3),
+            "time_source": "official" if off is not None else "span",
+            "dist_m": round(dist, 1),
+        }
         if duration < 20.0 or not gt7analysis.lap_is_complete(dist, med_d):
-            lap_times.append(
-                {"lap": lap_no, "time": round(duration, 3),
-                 "dist_m": round(dist, 1), "incomplete": True}
-            )
-            continue
-        lap_times.append({"lap": lap_no, "time": round(duration, 3),
-                          "dist_m": round(dist, 1)})
+            row["incomplete"] = True
+        lap_times.append(row)
 
     valid_laps = [l for l in lap_times if not l.get("incomplete")]
 
@@ -2017,6 +2030,24 @@ def _frame_row(f: dict, t0: float) -> list:
     ]
 
 
+def _official_laps(store: "FrameStore") -> dict[int, float]:
+    """每圈官方用时（秒），按 FrameStore 记忆化。
+
+    🔴 必须用**原始分组**（含 clean_laps 会丢弃的末圈）：最后一圈的官方值
+       存在「下一圈（往往是完赛离场圈）的首帧」里。用清洗后的分组会取不到，
+       最后一场比赛的最后完整圈就会退回帧跨度。
+    """
+    import gt7analysis
+
+    def _compute() -> dict[int, float]:
+        raw = {n: fs for n, fs in
+               gt7analysis.split_laps(store.lap_frames()).items()
+               if n < 65000}
+        return gt7analysis.official_lap_times(raw)
+
+    return store.memo_compute("official_laps", _compute)
+
+
 def _valid_laps(path: Path) -> tuple[list[dict], dict, float]:
     """场次的有效圈清单 + 按圈分组的帧 + 该场起始 t。
 
@@ -2038,16 +2069,26 @@ def _valid_laps(path: Path) -> tuple[list[dict], dict, float]:
     def _compute():
         t0 = store[0].get("t") or 0.0
         import gt7analysis
-        grouped = gt7analysis.clean_laps(store.lap_frames())
+        raw = {n: fs for n, fs in
+               gt7analysis.split_laps(store.lap_frames()).items()
+               if n < 65000}
+        grouped = gt7analysis.clean_laps(store.lap_frames(), laps=raw)
+        # 官方圈速（优先）与帧跨度（兜底）：圈速选择器与详情页同一口径。
+        # 用 raw 算官方值，末圈的官方值在「完赛离场圈」首帧里。
+        official = store.memo_compute(
+            "official_laps", lambda: gt7analysis.official_lap_times(raw))
         laps = []
         for no, fs in sorted(grouped.items()):
             if len(fs) < 2:
                 continue
+            span = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+            off = official.get(no)
             laps.append({
                 "lap": no,
                 "t0": round((fs[0].get("t") or 0.0) - t0, 3),
-                "dur": round((fs[-1].get("t") or 0.0)
-                             - (fs[0].get("t") or 0.0), 3),
+                "dur": round(off if off is not None else span, 3),
+                "span_s": round(span, 3),
+                "time_source": "official" if off is not None else "span",
                 "frames": len(fs),
             })
         return (laps, grouped, t0)
