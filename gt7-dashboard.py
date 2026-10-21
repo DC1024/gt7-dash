@@ -958,10 +958,16 @@ def _load_frames(path: Path) -> tuple[dict, FrameStore]:
     except (OSError, json.JSONDecodeError, ValueError):
         return {}, FrameStore.empty()
     with _CACHE_LOCK:
-        _frames_cache_evict()
+        # 🔴 覆盖写入前必须先 forget：同一路径被重新解析（正在录制的场次
+        #    mtime/size 一直在变）时，旧条目会被字典赋值直接顶掉，但它的
+        #    帧数还留在 _CACHED_FRAMES_TOTAL 里 —— 计数只增不减，虚高到
+        #    超过上限后 evict 会在每次冷解析前清空缓存，缓存退化成 1 场。
+        _frames_cache_forget(key)
         _FRAMES_CACHE[key] = (sig[0], sig[1], header, store)
         global _CACHED_FRAMES_TOTAL
         _CACHED_FRAMES_TOTAL += len(store)
+        # 插入之后再驱逐：放在插入前会让「本次新增」逃过上限检查。
+        _frames_cache_evict()
     return header, store
 
 
