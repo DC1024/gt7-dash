@@ -1776,9 +1776,22 @@ class Recorder:
         按名义 60Hz 均分，别把一次卡顿摊成一个巨大的 dt。
         """
         n = len(raw_times)
-        if n <= 1:
-            return list(raw_times)
         end = time.time() if end is None else end
+        # 🔴 保证时间**严格递增**：解码是子进程调用，处理耗时可能超过一个
+        #    60Hz 帧间隔，于是「上一批的 end」会晚于「本批首包的到达时刻」。
+        #    不夹紧的话重建时间会回退，下一次正向 dt 又把同一段时间重复计入
+        #    距离积分（实测一场比赛里圈长被放大约 40%）。
+        if self._last_batch_t > 0:
+            floor = self._last_batch_t + max(1, n) / 120.0
+            if end < floor:
+                end = floor
+        if n <= 1:
+            # 单包也必须推进游标，否则下一批的 span 会从更早的时刻算起
+            t = raw_times[0] if n else end
+            if self._last_batch_t > 0 and t < self._last_batch_t + 1 / 120.0:
+                t = self._last_batch_t + 1 / 120.0
+            self._last_batch_t = t
+            return [t] if n else []
         span = end - self._last_batch_t if self._last_batch_t > 0 else 0.0
         if not (0.0 < span < 1.0):
             span = n / 60.0

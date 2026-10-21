@@ -345,6 +345,32 @@ class TestBatchTimes:
         assert times[-1] == 1000.0
         assert abs((times[-1] - times[-2]) - 1 / 60) < 0.001
 
+    def test_single_batch_advances_cursor(self, rec, make_recorder):
+        """单包也要推进游标，否则下一批会从更早的时刻起算。"""
+        r = make_recorder()
+        r._last_batch_t = 1000.0
+        r._batch_times([1000.05], end=1000.1)
+        assert r._last_batch_t == 1000.05
+
+    def test_times_monotonic_across_mixed_batches(self, rec, make_recorder):
+        """单包/多包交替时，重建时间必须严格递增（否则距离重复计时）。"""
+        r = make_recorder()
+        r._last_batch_t = 1000.0
+        seq = []
+        seq += r._batch_times([1000.02], end=1000.02)
+        seq += r._batch_times([1000.03, 1000.035], end=1000.04)
+        seq += r._batch_times([1000.05], end=1000.05)
+        seq += r._batch_times([1000.06, 1000.07, 1000.08], end=1000.09)
+        assert all(b > a for a, b in zip(seq, seq[1:])), seq
+
+    def test_no_backward_jump_when_processing_slow(self, rec, make_recorder):
+        """解码耗时让上一批 end 晚于本批首包到达时，不能回退时间。"""
+        r = make_recorder()
+        r._last_batch_t = 1000.2
+        times = r._batch_times([1000.1, 1000.11], end=1000.12)
+        assert times[0] > 1000.2, times
+        assert times[1] > times[0]
+
     def test_g_force_not_zero_after_rebuild(self, rec, make_recorder):
         """重建后 10 个包要能算出非零 G（用 10µs 间隔则全是 0）。"""
         r = make_recorder()
