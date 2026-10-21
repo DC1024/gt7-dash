@@ -1132,6 +1132,76 @@ def save_settings(history_dir: Path, settings: dict[str, Any]) -> None:
     fp.write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+# —— B3：事件阈值（运行时可调，不用改源码重启）——
+#
+# 之前 Thresholds 是个 dataclass，"全部可调，按自己的口味改" —— 实际意思是
+# **改源码再重启**。检测器的判据全依赖这些数，不同车型/赛道/驾驶风格差别很大，
+# 不能调等于把用户锁死在作者的默认值上。
+#
+# 存储：data/settings.json 的 event_thresholds 段（只存**改过的**键，
+# 没改的走 Thresholds 默认值 —— 这样升级加了新阈值也不会被旧设置卡住）。
+
+# 只暴露给 UI 的这一批（其余仍可通过 API 改，只是不给控件，避免面板塞满）
+_TH_UI_KEYS: list[tuple[str, str, str]] = [
+    ("spin_lat_g", "打滑横向G", "g"),
+    ("spin_slip_ratio", "打滑滑移率", ""),
+    ("impact_long_g", "碰撞纵向G", "g"),
+    ("hard_brake_min_speed", "急刹最低车速", "km/h"),
+    ("offtrack_slip", "出界滑移率", ""),
+    ("wheel_slip_delta", "单轮打滑差", ""),
+    ("pit_speed_max", "进站限速", "km/h"),
+    ("pit_min_duration", "进站最短时长", "s"),
+    ("position_hold_s", "名次稳定时长", "s"),
+]
+
+
+def _threshold_fields() -> dict[str, float]:
+    """Thresholds 的全部数值字段与默认值。"""
+    mod = _load_detector()
+    if mod is None:
+        return {}
+    return {k: float(v) for k, v in vars(mod.DEFAULT).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+def event_thresholds(history_dir: Path) -> dict[str, float]:
+    """生效中的阈值 = 默认值 ← 用户覆盖。返回完整字典（前端直接显示）。"""
+    defaults = _threshold_fields()
+    if not defaults:
+        return {}
+    raw = (load_settings(history_dir).get("event_thresholds") or {})
+    out = dict(defaults)
+    for k, v in raw.items():
+        if k not in defaults:
+            continue                      # 旧设置里的废弃键：忽略，不报错
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv == fv and abs(fv) < 1e6:    # 排除 NaN / inf / 离谱值
+            out[k] = fv
+    return out
+
+
+def _threshold_overrides(history_dir: Path) -> dict[str, float]:
+    """只返回**被用户改过**的键（给 Thresholds(**overrides) 用）。"""
+    defaults = _threshold_fields()
+    eff = event_thresholds(history_dir)
+    return {k: v for k, v in eff.items() if defaults.get(k) != v}
+
+
+def _threshold_fingerprint(history_dir: Path) -> str:
+    """阈值指纹 —— 塞进 memo key。
+
+    🔴 不加这个，改完阈值再打开事件卡会**看到旧结果**：_events_compute 按
+       ("events", lap_no) 记忆化，键不变就永远命中缓存，用户会以为"改了没用"。
+    """
+    import hashlib
+    eff = event_thresholds(history_dir)
+    blob = json.dumps(eff, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:12]
+
+
 def load_session_meta(history_dir: Path) -> dict[str, Any]:
     fp = history_dir / "sessions_meta.json"
     try:
@@ -2727,7 +2797,15 @@ def _events_compute(det, path: Path, grouped: dict, store: "FrameStore",
     radii = None
     if calib.get("available"):
         radii = (calib["front_m"], calib["rear_m"])
-    detector = det.EventDetector(radii=radii)
+    # B3：用户调过的阈值覆盖默认值（settings.json 的 event_thresholds）
+    overrides = _threshold_overrides(path.parent)
+    try:
+        th = det.Thresholds(**overrides) if overrides else None
+    except TypeError:
+        # 设置里出现了当前版本不认识的字段（降级/回滚场景）→ 用默认值，
+        # 不要因为一条脏设置把整个事件卡打挂。
+        th = None
+    detector = det.EventDetector(th=th, radii=radii)
 
     # 参考圈 = 最快圈（与「圈间对比 / 走线偏差」卡片同一口径，只算一次）
     best_lap = None
@@ -2888,9 +2966,11 @@ def session_events(path: Path, lap_no: int | None = None) -> dict[str, Any]:
     _, store = _load_frames(path)
     if not store:
         return {"available": False, "reason": "no frames"}
+    # 🔴 阈值指纹进 key：否则改完阈值仍命中旧缓存，用户以为"改了没用"。
+    fp = _threshold_fingerprint(path.parent)
     hit = store.memo_compute(
-        ("events", lap_no), lambda: _events_compute(det, path, grouped, store,
-                                                    lap_no))
+        ("events", lap_no, fp), lambda: _events_compute(det, path, grouped,
+                                                        store, lap_no))
     hit = dict(hit)
     hit["laps_list"] = [int(x["lap"]) for x in laps_list]
     return hit
@@ -3357,6 +3437,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | POST | `/api/v1/settings/trash-retention` | 回收站保留天数，body `{"value": 30}`（0=永不清理） |
 | POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
 | POST | `/api/v1/settings/archive-after` | 自动归档保留天数，body `{"value": 30}`（0=不自动归档） |
+| POST | `/api/v1/settings/event-thresholds` | 事件阈值，body `{"values": {"spin_lat_g": 1.2}}`；值传 `null` 表示恢复该键默认。未知键 / 非数字返回 400 |
 
 ### 参考资料
 
@@ -4374,6 +4455,54 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             cors=False)
             return
 
+        # —— 事件阈值：POST /api/v1/settings/event-thresholds ——
+        # body: {"values": {"spin_lat_g": 1.2, ...}}，值为 null 表示恢复该键默认。
+        if parsed.path == "/api/v1/settings/event-thresholds":
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            body = self._read_json_body()
+            vals = body.get("values")
+            if not isinstance(vals, dict):
+                self._send_json({"error": "body 需为 {\"values\": {阈值名: 数字}}"},
+                                400, cors=False)
+                return
+            defaults = _threshold_fields()
+            if not defaults:
+                self._send_json({"error": "事件检测器未加载，无法校验阈值名"},
+                                500, cors=False)
+                return
+            s0 = load_settings(hist)
+            cur = dict(s0.get("event_thresholds") or {})
+            bad = []
+            for k, v in vals.items():
+                if k not in defaults:
+                    bad.append(f"{k}（不认识的阈值名）")
+                    continue
+                if v is None:                 # null = 恢复默认
+                    cur.pop(k, None)
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    bad.append(f"{k}（不是数字）")
+                    continue
+                if fv != fv or abs(fv) > 1e6:
+                    bad.append(f"{k}（数值不合理）")
+                    continue
+                cur[k] = fv
+            if bad:
+                self._send_json({"error": "以下阈值无效：" + "、".join(bad)},
+                                400, cors=False)
+                return
+            s0["event_thresholds"] = cur
+            save_settings(hist, s0)
+            self._send_json({
+                "ok": True,
+                "event_thresholds": event_thresholds(hist),
+                "overridden": sorted(cur.keys()),
+                "hint": "已生效；事件卡下次展开时按新阈值重算（旧缓存已失效）",
+            }, cors=False)
+            return
+
         # —— 归档保留期：POST /api/v1/settings/archive-after {"value": 天数} ——
         if parsed.path == "/api/v1/settings/archive-after":
             hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
@@ -5005,6 +5134,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     # 名字是**按圈长猜的**、未经用户确认 → true。
                     # 消费方据此提示"自动识别，待确认"（圈长相近的不同赛道会认错）。
                     "auto_named": bool(t.get("auto_named")),
+                    # 按圈长粗筛出的内置赛道候选（最多 6 条）。
+                    # 🔴 这个字段一直在 tracks.json 里，但**从来没被前端读过**：
+                    #    算法算了、写盘了，用户永远看不到。E1 就是把它接出来。
+                    "course_candidates": list(t.get("course_candidates") or []),
                     "verified": bool(t.get("verified")),
                     # 已归档：0 场次的空壳赛道（识别结果被并回真赛道后留下的）。
                     # 仍在清单里返回（不是删除），前端把它排到「已归档」区，可恢复/删除。
@@ -5312,6 +5445,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "trash": trash_items,
                     "session_name_template": s.get(
                         "session_name_template", DEFAULT_NAME_TEMPLATE),
+                    # B3：事件阈值（生效值 + 给 UI 的字段说明 + 默认值，
+                    # 前端据此渲染面板和"恢复默认"）
+                    "event_thresholds": event_thresholds(hist),
+                    "event_thresholds_default": _threshold_fields(),
+                    "event_thresholds_ui": [
+                        {"key": k, "label": lb, "unit": u}
+                        for k, lb, u in _TH_UI_KEYS],
                 }, cors=True)
 
             elif path == "/api/v1/docs":
@@ -5491,6 +5631,14 @@ THEME_CSS = r"""
   background:rgba(220,53,69,.10); }
 .bop-badge[data-bop="Low"] { color:var(--ok); border-color:var(--ok);
   background:rgba(25,135,84,.10); }
+
+/* —— 数据降级（B1）——
+   标定不可信 / 输入可疑时，整块弱化 + 顶部横幅。
+   目标不是"藏起来"，而是"看一眼就知道这数字不能直接当成结论"。 */
+.degraded{opacity:.55;filter:saturate(.6)}
+.degrade-banner{margin:0 0 10px;padding:8px 12px;border-radius:8px;
+  background:rgba(240,180,60,.12);border:1px solid rgba(240,180,60,.45);
+  color:var(--warn,#e0a030);font-size:13px;line-height:1.5}
 """
 
 # 首屏防闪：在 <head> 里同步执行，先于 body 绘制把主题落到 <html> 上。
@@ -7120,6 +7268,23 @@ _ANALYSIS_TMPL = r"""
     var lk = SLIP.lockup || {}, ws = SLIP.wheelspin || {};
     var laps = SLIP.laps || [];
 
+    // B1：标定不自洽时整卡降级 —— 数字照给但**视觉上明确不可信**。
+    // 只挂一句小字警告不够：卡片里全是精确到小数点后三位的数值，
+    // 读者会直接采信。所以整块降透明度 + 顶部横幅。
+    if (SLIP.degraded) {
+      card.classList.add('degraded');
+      var dg = el('slipDegrade');
+      if (!dg) {
+        dg = document.createElement('div');
+        dg.id = 'slipDegrade';
+        dg.className = 'degrade-banner';
+        box.parentNode.insertBefore(dg, box);
+      }
+      dg.style.display = '';
+      dg.textContent = '⚠ 轮胎标定不可信：' + (SLIP.degrade_reason || '自洽性未通过')
+                     + ' —— 下面数值仅供参考，不要当作结论';
+    }
+
     // 默认停在「最脏」的那一圈（抱死 + 空转帧数最多），比停在第一圈有用
     var pk = 0, pn = -1;
     for (var i = 0; i < laps.length; i++) {
@@ -7217,6 +7382,17 @@ _EVENTS_TMPL = r"""
     </span>
   </h2>
   <div id="evBody"><p class="an-note">正在检测事件…（首次约 10 秒）</p></div>
+  <!-- B3：阈值面板。默认收起 —— 大多数人不该来动这里，
+       但"不能调"会让不同车型/赛道的人被锁死在作者的默认值上。 -->
+  <details id="thPanel" class="th-panel">
+    <summary>事件阈值（按自己的车/赛道调，不用改源码）</summary>
+    <div id="thGrid" class="th-grid"><p class="an-note">正在读取阈值…</p></div>
+    <div class="th-acts">
+      <button class="sbtn" onclick="thSave()">保存并重算</button>
+      <button class="sbtn" onclick="thReset()">全部恢复默认</button>
+      <span id="thMsg" class="th-msg"></span>
+    </div>
+  </details>
 </div>
 
 <script>
@@ -7400,9 +7576,87 @@ _EVENTS_TMPL = r"""
         renderEvents();
       }, evFetchFail);
   }
+
+  // ---------- B3：事件阈值面板 ----------
+  // 阈值存在 settings.json，改完必须让事件卡按新值重算：
+  // 后端把「阈值指纹」塞进了 memo key，所以 POST 成功后下次 /events 必然
+  // 走冷路径。这里再补一步：清前端缓存 + 重新拉，避免看到旧结果。
+  var TH = null, TH_DEF = null, TH_UI = [];
+
+  function thRender() {
+    var grid = el('thGrid');
+    if (!grid) return;
+    if (!TH) { grid.innerHTML = '<p class="an-note">检测器未加载，阈值不可用</p>'; return; }
+    grid.innerHTML = '';
+    TH_UI.forEach(function (it) {
+      var v = TH[it.key];
+      var changed = TH_DEF && v !== TH_DEF[it.key];
+      var box = document.createElement('div');
+      box.className = 'th-item' + (changed ? ' changed' : '');
+      var lab = document.createElement('label');
+      lab.textContent = it.label + (changed ? ' · 已改' : '');
+      var inp = document.createElement('input');
+      inp.type = 'number'; inp.step = 'any'; inp.dataset.key = it.key;
+      inp.value = (v === undefined || v === null) ? '' : v;
+      var u = document.createElement('span');
+      u.className = 'th-unit';
+      u.textContent = it.unit || ('默认 ' + (TH_DEF ? TH_DEF[it.key] : ''));
+      box.appendChild(lab); box.appendChild(inp); box.appendChild(u);
+      grid.appendChild(box);
+    });
+  }
+
+  function thLoad() {
+    fetch('/api/v1/settings').then(function (r) { return r.json(); })
+      .then(function (d) {
+        TH = d.event_thresholds || null;
+        TH_DEF = d.event_thresholds_default || null;
+        TH_UI = d.event_thresholds_ui || [];
+        thRender();
+      }).catch(function () {
+        var g = el('thGrid');
+        if (g) g.innerHTML = '<p class="an-note">阈值读取失败</p>';
+      });
+  }
+
+  function thCollect() {
+    var out = {};
+    var grid = el('thGrid');
+    if (!grid) return out;
+    var ins = grid.querySelectorAll('input[data-key]');
+    for (var i = 0; i < ins.length; i++) {
+      var k = ins[i].dataset.key, raw = ins[i].value.trim();
+      out[k] = raw === '' ? null : Number(raw);
+    }
+    return out;
+  }
+
+  function thPost(values, msg) {
+    var m = el('thMsg');
+    if (m) m.textContent = '保存中…';
+    fetch('/api/v1/settings/event-thresholds', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: values })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.error) { if (m) m.textContent = '✗ ' + d.error; return; }
+      TH = d.event_thresholds || TH;
+      thRender();
+      if (m) m.textContent = '✓ ' + (msg || '已保存');
+      EV = null;
+      boot();                     // 重新拉 /events（后端 memo key 已带指纹）
+    }).catch(function () { if (m) m.textContent = '✗ 网络错误'; });
+  }
+
+  window.thSave = function () { thPost(thCollect(), '已保存，正在按新阈值重算…'); };
+  window.thReset = function () {
+    var vals = {};
+    TH_UI.forEach(function (it) { vals[it.key] = null; });
+    thPost(vals, '已恢复默认，正在重算…');
+  };
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
-  } else { boot(); }
+    document.addEventListener('DOMContentLoaded', function () { boot(); thLoad(); });
+  } else { boot(); thLoad(); }
 })();
 </script>
 <style>
@@ -8516,6 +8770,26 @@ TRACKS_CSS = """<style>
 .tk-badge{white-space:nowrap;font-size:11px}
 .tk-verified{color:var(--ok)}
 .tk-auto{color:var(--warn)}
+.tk-cands{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 8px}
+.tk-cands-lbl{font-size:12px;color:var(--muted)}
+.tk-cand{font:inherit;font-size:12px;padding:3px 9px;border-radius:999px;
+  cursor:pointer;background:rgba(var(--accent-rgb),.08);color:var(--accent);
+  border:1px solid rgba(var(--accent-rgb),.45)}
+.tk-cand:hover{background:rgba(var(--accent-rgb),.18)}
+/* B3 事件阈值面板 */
+.th-panel{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+.th-panel>summary{cursor:pointer;font-size:13px;color:var(--muted);user-select:none}
+.th-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  gap:10px 16px;margin:12px 0}
+.th-item{display:flex;flex-direction:column;gap:4px}
+.th-item label{font-size:12px;color:var(--muted)}
+.th-item input{font:inherit;font-size:13px;padding:5px 8px;border-radius:6px;
+  border:1px solid var(--line);background:var(--card);color:var(--text);width:100%}
+.th-item .th-unit{font-size:11px;color:var(--muted)}
+.th-item.changed input{border-color:var(--warn);background:rgba(253,126,20,.06)}
+.th-acts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.th-msg{font-size:12px;color:var(--muted)}
+.tk-acts[data-dirty="1"]::after{content:'· 未保存';color:var(--warn);font-size:12px}
 .tk-none{color:var(--muted)}
 .tk-meta{font-size:12px;color:var(--muted);margin:4px 0 8px}
 /* 官方赛道 logo（可选素材，没有这张图就不渲染这个 img）。
@@ -8570,6 +8844,18 @@ function drawAllTracks(){
     catch(e){ if(typeof renderErr==='function') renderErr('track-desc',e);
               else console.error(e); }
   });
+}
+// E1：候选赛道点一下填进输入框（不自动保存 —— 名字是用户的决定）
+function trackPick(btn){
+  var card = btn.closest('.tk-card');
+  if (!card) return;
+  var inp = card.querySelector('.tk-name');
+  if (!inp) return;
+  inp.value = btn.dataset.name || '';
+  inp.focus();
+  // 视觉上标一下"待保存"，避免以为已经生效
+  var acts = card.querySelector('.tk-acts');
+  if (acts) acts.dataset.dirty = '1';
 }
 function trackSave(btn){
   var card=btn.closest('.tk-card'); if(!card) return;
@@ -8749,6 +9035,18 @@ def build_tracks_page(hist: Path) -> str:
                              f'alt="" loading="lazy" '
                              f'title="{_html.escape(name or "赛道 logo")}">')
         desc_attr = _html.escape(json.dumps(desc, ensure_ascii=False))
+        # 候选赛道：只在「按圈长自动命名、尚未确认」时给。
+        # 圈长分不出同长度的正/逆布局，这里让用户一眼选对，比让他自己去
+        # 查 GT7 赛道表强。点一下只**填入输入框**，仍需按保存 —— 不替用户做决定。
+        cands = [c for c in (t.get("course_candidates") or []) if c]
+        cands_html = ""
+        if auto and cands:
+            chips = "".join(
+                f'<button class="tk-cand" data-name="{_html.escape(c)}" '
+                f'onclick="trackPick(this)" title="填入这个名字">{_html.escape(c)}</button>'
+                for c in cands[:6])
+            cands_html = (f'<div class="tk-cands"><span class="tk-cands-lbl">'
+                          f'圈长相近，选一个：</span>{chips}</div>')
         if archived:
             # 已归档赛道：只读展示 + 恢复/彻底删除，不进主网格
             arch_at = _html.escape(str(t.get("archived_at") or "-"))
@@ -8783,6 +9081,7 @@ def build_tracks_page(hist: Path) -> str:
           <span class="tk-badge">{badge}</span>
         </div>
         <div class="tk-meta">圈长 {(ref or 0):.0f} m · {turns} · {sessions} 场{bop_html}</div>
+        {cands_html}
         <div class="tk-acts">
           <button class="sbtn" onclick="trackSave(this)">保存</button>
           <button class="sbtn" onclick="trackConfirm(this)">✓ 已记录</button>

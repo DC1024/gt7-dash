@@ -72,6 +72,7 @@
 | POST | `/api/v1/settings/trash-retention` | 回收站保留天数，body `{"value": 30}`（0=永不清理） |
 | POST | `/api/v1/settings/name-template` | 场次默认命名模板，body `{"value": "{车型} {时间} {最快圈}"}` |
 | POST | `/api/v1/settings/archive-after` | 自动归档保留天数，body `{"value": 30}`（0=不自动归档） |
+| POST | `/api/v1/settings/event-thresholds` | 事件阈值，body `{"values": {"spin_lat_g": 1.2}}`；值传 `null` 表示恢复该键默认。未知键 / 非数字返回 400 |
 
 ### 参考资料
 

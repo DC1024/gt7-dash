@@ -1795,8 +1795,19 @@ def wheel_slip(laps: dict[int, list[dict]], nmax_events: int = 5,
 
     lock_events.sort(key=lambda e: e["slip"])
     spin_events.sort(key=lambda e: e["slip"], reverse=True)
-    return {
+
+    # —— B1：标定不自洽时**降级**，而不是照常输出一堆精确到小数点后三位的数字 ——
+    #
+    # 自洽性检查（标定后自由滚动帧的滑移均值应≈0）不通过，说明半径本身
+    # 就不对（自由滚动帧太少，或油门/刹车阈值没生效）。此时滑移率会整体
+    # 平移一个未知量，图表看着完全正常、数值却是错的。
+    #
+    # 之前只是在前端挂一句"⚠ 未通过"，数字照旧给 —— 用户看到的仍然是
+    # 一张有具体数值的图。现在明确标 degraded，前端据此弱化呈现。
+    degraded = not calib.get("ok", True)
+    out = {
         "available": True,
+        "degraded": degraded,
         "max_per_lap": max_per_lap,
         "calibration": calib,
         "laps": lap_rows,
@@ -1808,6 +1819,15 @@ def wheel_slip(laps: dict[int, list[dict]], nmax_events: int = 5,
                       "worst": spin_events[:nmax_events]},
         "series": series,
     }
+    if degraded:
+        out["degrade_reason"] = (
+            calib.get("reason")
+            or "标定自洽性未通过：滑移率可能整体偏移，数值仅供参考")
+        # 标定不可信时，"最严重的一次抱死/空转"这类排序同样不可信 ——
+        # 别把它们当结论展示。
+        out["lockup"]["worst"] = []
+        out["wheelspin"]["worst"] = []
+    return out
 
 
 # —— 走线偏差（本圈相对参考圈的横向偏移） ————————————
