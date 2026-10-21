@@ -316,6 +316,7 @@ class TestStatusSchema2:
         assert r.duplicate_frames == 1
         assert r._frame_seq == q1, "重复帧不能推进序号（数据没变）"
         assert p2["last_rx_t"] > p1["last_rx_t"], "但收包时刻必须刷新"
+        assert p2["t"] == p1["t"], "数据时刻 t 不能被重复帧推进"
         assert len(p2["history"]) == len(p1["history"]), "重复帧不能灌进缓冲"
 
 

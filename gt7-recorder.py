@@ -916,6 +916,9 @@ class Recorder:
         self._status_writes = 0
         # 上一批包的**处理结束**时刻：批内时间戳重建用（见 _batch_times）
         self._last_batch_t = 0.0
+        # 最近一帧**新数据**的时刻（重复帧不推进）。状态文件的 t 用它，
+        # 与 last_rx_t 分开：暂停时 t 冻住、last_rx_t 继续涨。
+        self._last_frame_t = 0.0
         # 按端口统计收包数（诊断用：排查 176Hz 异常速率）
         self._recv_by_port: dict[str, int] = {}
         # —— 行车轨迹（用于画轨迹图）——
@@ -1617,6 +1620,7 @@ class Recorder:
         # —— 先无条件追加缓冲（每帧都要，曲线靠它）——
         if new_frame:
             self._frame_seq += 1
+            self._last_frame_t = sample.t
             self._status_buf.append({
                 "q": self._frame_seq,
                 "t": round(sample.t, 3),
@@ -1645,7 +1649,8 @@ class Recorder:
                 # 最近一次**收到包**的时刻（含被去重的重复帧）。
                 # 与 t 分开：暂停时 t 不动、它在涨 → 仪表盘据此判「还连着」。
                 "last_rx_t": round(self._last_rx_t, 3),
-                "t": now,
+                # t = 最近一帧**新数据**的时刻；重复帧不推进它。
+                "t": round(self._last_frame_t, 3),
                 "frame": sample.to_json(),
                 "frames_total": self.session.sample_count,
                 "session_start": self.session.started_at,
