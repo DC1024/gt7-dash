@@ -45,15 +45,30 @@ class TestChangelog:
         assert cur == gen_changelog.build(), (
             "CHANGELOG.md 落后于 git 历史，跑 `python tools/gen_changelog.py`")
 
-    def test_每个_tag_都有段落(self):
+    def test_每个发过的版本都有段落(self):
+        """段落以 `gt7_version.py` 的版本变更为准，不是 tag。
+
+        🔴 早先用 tag 判定，结果同一份文件在开发机（tag 多）和 CI（tag 少）
+           上"期望内容"不同，测试永远红。版本号才是任何 clone 都一样的事实。
+        """
         if not (ROOT / "CHANGELOG.md").is_file():
             pytest.skip("该提交还没有 CHANGELOG.md（v1.4.2 之前）")
+        import re as _re
         import subprocess
-        tags = subprocess.run(["git", "tag", "--sort=v:refname"], cwd=ROOT,
-                              capture_output=True, text=True).stdout.split()
+        ver_shas = subprocess.run(
+            ["git", "log", "--format=%H", "--", "gt7_version.py"],
+            cwd=ROOT, capture_output=True, text=True).stdout.split()
+        versions = set()
+        for sha in ver_shas:
+            out = subprocess.run(["git", "show", f"{sha}:gt7_version.py"],
+                                 cwd=ROOT, capture_output=True, text=True)
+            m = _re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']',
+                           out.stdout, _re.M)
+            if m:
+                versions.add(m.group(1))
         text = _read("CHANGELOG.md")
-        missing = [t for t in tags if f"## {t}" not in text]
-        assert not missing, f"这些 tag 在 CHANGELOG 里没有段落：{missing}"
+        missing = sorted(v for v in versions if f"## v{v}" not in text)
+        assert not missing, f"这些版本在 CHANGELOG 里没有段落：{missing}"
 
 
 class TestReleaseNotesGenerated:

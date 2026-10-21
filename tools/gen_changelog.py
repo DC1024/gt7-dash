@@ -126,49 +126,99 @@ def _section_body(commits: list[tuple[str, str, str]]) -> str:
     return "\n".join(out)
 
 
+def _is_ancestor(maybe_ancestor: str, sha: str) -> bool:
+    """`maybe_ancestor` 是否是 `sha` 的祖先（含自身）。"""
+    r = subprocess.run(["git", "merge-base", "--is-ancestor",
+                        maybe_ancestor, sha], cwd=ROOT)
+    return r.returncode == 0
+
+
+def _version_at(sha: str) -> str | None:
+    """读某个提交里 gt7_version.py 的版本号；文件不存在返回 None。"""
+    out = subprocess.run(["git", "show", f"{sha}:gt7_version.py"], cwd=ROOT,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', out.stdout, re.M)
+    return m.group(1) if m else None
+
+
 def build() -> str:
+    """按 **gt7_version.py 的版本变更**切段，而不是按 tag。
+
+    🔴 为什么不能用 tag 切段：CHANGELOG 是**入库的文件**，而 tag 是本地/远端
+       各自拥有的东西。CI 上只有推送过的 tag，开发机上可能有更多 ——
+       同一份文件在两边的"期望内容"就不一样，测试永远红
+       （实测：本地有 v1.2.1~v1.3.7，CI 没有，于是 v1.3.8 那一段
+        在两边包含的提交数不同）。
+       版本号是**代码里的事实**，任何 clone 读到的都一样，所以拿它切段。
+    """
     global _CHANGELOG_ONLY
     _CHANGELOG_ONLY = _changelog_only_shas()
-    tags = _tags()
+
+    commits = _commits("HEAD")                 # 旧 → 新
+    if not commits:
+        return "# 更新日志\n"
+
+    # 哪些提交改过 gt7_version.py（很少，约十几个）
+    ver_shas = _git("log", "--reverse", "--format=%H", "--",
+                    "gt7_version.py").split()
+
+    # 🔴 不要用 `git merge-base --is-ancestor` 逐提交判断祖先：那是
+    #    一次进程 spawn，130 个提交就是 130 次，整个生成从 1s 涨到 37s。
+    #    两个列表（全部提交 / 改过版本文件的提交）都是**同一个拓扑序**，
+    #    直接按位置映射即可，O(n) 且零额外进程。
+    pos = {sha: i for i, (sha, _s, _b) in enumerate(commits)}
+    marks = sorted((pos[s], s) for s in ver_shas if s in pos)
+    ver_at: dict[int, str] = {}
+    for i, sha in marks:
+        v = _version_at(sha)
+        if v:
+            ver_at[i] = v
+
+    groups: list[tuple[str, list]] = []        # [(version, commits)]
+    cur_ver: str | None = None
+    for i, item in enumerate(commits):
+        if i in ver_at:
+            cur_ver = ver_at[i]
+        key = cur_ver or "早期（无版本文件）"
+        if not groups or groups[-1][0] != key:
+            groups.append((key, []))
+        groups[-1][1].append(item)
+
     parts = [
         "# 更新日志",
         "",
         "> 本文件由 `python tools/gen_changelog.py` 从 git 历史生成，**不要手改**。",
         "> 提交信息遵循 `type(scope): 描述`，脚本按 type 分组。",
+        "> 分段依据是 `gt7_version.py` 的版本变更（不是 tag —— tag 各机器不一致）。",
         "",
     ]
-    # 最新 tag 之后（未发版）的提交放最前
-    if tags:
-        head = _git("rev-parse", "HEAD").strip()
-        if head != tags[-1][1]:
-            body = _section_body(_commits(f"{tags[-1][0]}..HEAD"))
-            if body:
-                parts += ["## 未发布", "", body, ""]
-        # 🔴 范围要按 tag 在**升序列表里的前一个**算，不能靠循环变量累加：
-        #    从最新往回遍历时，第一次循环还没有 prev，会把整条历史都算进
-        #    最新那一版（第一次生成时就踩了，v1.4.1 段里塞了 100+ 条）。
-        for i in range(len(tags) - 1, -1, -1):
-            name, sha = tags[i]
-            rng = f"{tags[i - 1][0]}..{sha}" if i else sha
-            body = _section_body(_commits(rng))
-            parts += [f"## {name}", "", body or "- （无变更记录）", ""]
-    else:
-        parts += [_section_body(_commits("HEAD"))]
+    # 最新版本在最前；版本号相同的连续段合并（同一版本多次发版）
+    merged: list[tuple[str, list]] = []
+    for ver, items in groups:
+        if merged and merged[-1][0] == ver:
+            merged[-1][1].extend(items)
+        else:
+            merged.append((ver, list(items)))
+    for ver, items in reversed(merged):
+        title = ver if ver == "早期（无版本文件）" else f"v{ver}"
+        body = _section_body(items)
+        parts += [f"## {title}", "", body or "- （无变更记录）", ""]
     return "\n".join(parts).rstrip() + "\n"
 
 
 def main(argv: list[str]) -> int:
     if "--version" in argv:
-        tag = argv[argv.index("--version") + 1]
-        tags = _tags()
-        idx = [i for i, (n, _) in enumerate(tags) if n == tag]
-        if not idx:
-            print(f"没有 tag {tag}", file=sys.stderr)
+        want = argv[argv.index("--version") + 1].lstrip("v")
+        text = build()
+        # 从生成结果里截出 `## vX.Y.Z` 那一段
+        m = re.search(rf"^## v{re.escape(want)}\n(.*?)(?=^## |\Z)",
+                      text, re.M | re.S)
+        if not m:
+            print(f"CHANGELOG 里没有 v{want} 的段落", file=sys.stderr)
             return 2
-        i = idx[0]
-        prev = tags[i - 1][0] if i else None
-        rng = f"{prev}..{tags[i][0]}" if prev else tags[i][0]
-        print(_section_body(_commits(rng)))
+        print(m.group(1).strip())
         return 0
 
     text = build()
