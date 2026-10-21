@@ -277,6 +277,28 @@ class TelemetryHub:
         return {"name": info["name"], "maker": info["maker"],
                 "group": info["group"], "known": info["known"]}
 
+    def start_background_refresh(self, interval: float = 0.1) -> None:
+        """后台定时 refresh，让缓冲完整性不依赖 HTTP 请求频率。
+
+        🔴 schema 2 的增量窗口只有 12 帧（200ms）。如果只在请求时 refresh，
+           一个 2 秒才拉一次的 API 消费者（gt7-coach 之类）会错过中间的增量，
+           拿到带空洞的 600 帧窗口（实测 2s 轮询时 163 次采样有 8 次带跳号）。
+           后台线程按 10Hz 刷新后，任何消费者拿到的都是完整窗口。
+        """
+        if getattr(self, "_bg_started", False):
+            return
+        self._bg_started = True
+
+        def _run() -> None:
+            while True:
+                try:
+                    self.refresh()
+                except Exception:
+                    pass
+                time.sleep(interval)
+
+        threading.Thread(target=_run, daemon=True, name="hub-refresh").start()
+
     def snapshot(self, max_frames: int = 300,
                  since: int | None = None) -> dict[str, Any]:
         """仪表盘页面拉取。
@@ -12415,6 +12437,8 @@ def main() -> int:
 
     status_path = Path(args.status).resolve()
     HUB = TelemetryHub(status_path)
+    # 后台按 10Hz 刷新：增量协议下，慢速 API 消费者也能拿到完整窗口
+    HUB.start_background_refresh()
 
     class Handler(DashboardHandler):
         pass

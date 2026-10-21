@@ -178,3 +178,26 @@ class TestSchema2Incremental:
         assert [h["speed_kph"] for h in snap["history"]] == [30]
         assert snap["seq"] == 3
         assert len(hub.snapshot()["history"]) == 3, "不带 since 应返回整窗"
+
+    def test_background_refresh_fills_buffer(self, dash, tmp_path):
+        """后台线程按固定频率刷新：慢速 API 消费者也能拿到完整窗口。
+
+        不调用 snapshot（那会顺带 refresh），直接看 _buffer：
+        写入 full 后等一拍应得到 3 帧；再写增量后应续到 6 帧。
+        """
+        sf = tmp_path / "status.json"
+        hub = dash.TelemetryHub(sf)
+        hub.start_background_refresh(0.02)
+
+        self._write(sf, seq=3,
+                    full=[self._f(1, 10), self._f(2, 20), self._f(3, 30)],
+                    history=[self._f(1, 10), self._f(2, 20), self._f(3, 30)])
+        time.sleep(0.25)
+        assert len(hub._buffer) == 3
+
+        self._write(sf, seq=6, history=[self._f(4, 40), self._f(5, 50),
+                                        self._f(6, 60)])
+        time.sleep(0.25)
+        assert len(hub._buffer) == 6
+
+        hub.start_background_refresh(0.02)   # 重复调用不应再起一个线程
