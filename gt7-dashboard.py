@@ -5673,10 +5673,12 @@ function loadTrashSettings() {
         // 用 data-* 传值而不是把文件名塞进 onclick 的引号里：
         // 这段 JS 又是被 Python 三引号字符串包着的，单反斜杠会被 Python 先吃掉，
         // 生成 'trashPost('' + t.name' 这种坏语法（整段脚本直接不执行）。
-        var nm = String(t.name).replace(/"/g, '&quot;');
+        // 🔴 文件名是**文件系统内容**，必须过 esc() 再拼 innerHTML：
+        //    原来只把 " 换成 &quot;，文本节点里的 <img onerror> 会直接执行。
+        var nm = esc(t.name);
         var anom = t.anomalous ? '1' : '0';
         var badge = t.anomalous ? ' <span class="anom-badge" title="异常场次：没有完成圈，或唯一圈不足 20 秒（菜单 / 停车场 / 刚点火的残片），会被自动归档到回收站">异常</span>' : '';
-        return '<tr data-anom="' + anom + '"><td style="font-size:12px;font-family:var(--mono)">' + t.name + badge +
+        return '<tr data-anom="' + anom + '"><td style="font-size:12px;font-family:var(--mono)">' + esc(t.name) + badge +
           '</td><td class="num">' + t.size_kb + ' KB</td><td class="num">' + t.modified +
           '</td><td class="num">' +
           '<a class="sbtn" href="/trash-view?file=' + encodeURIComponent(t.name) + '">查看</a>' +
@@ -8724,7 +8726,12 @@ def build_trash_view_page(hist: Path, name: str) -> str:
     facts_html = "".join(
         f"<tr><td class='fk'>{k}</td><td>{v}</td></tr>" for k, v in facts)
     traj_note = "" if traj else "（车辆未移动，无轨迹）"
+    # 两个上下文分开转义：
+    #   · 文本节点 → _html.escape（HTML 实体）
+    #   · onclick 里的 JS 字符串字面量 → _js_str（\' \\ \x3c）
+    # 只做 HTML 转义挡不住 `'`：浏览器会先把 &#x27; 解码回单引号再交给 JS。
     nm = _html.escape(name)
+    nm_js = _js_str(name)
     body = TRACKS_CSS + f"""
 <div class="top">
   <a class="back" href="/sessions">← 历史场次（回收站）</a>
@@ -8742,8 +8749,8 @@ def build_trash_view_page(hist: Path, name: str) -> str:
     </div>
   </div>
   <div class="tk-acts" style="margin-top:14px">
-    <button class="sbtn" onclick="trashAct('{nm}','restore')">↩ 恢复到历史</button>
-    <button class="sbtn" onclick="trashAct('{nm}','delete')">✕ 彻底删除</button>
+    <button class="sbtn" onclick="trashAct('{nm_js}','restore')">↩ 恢复到历史</button>
+    <button class="sbtn" onclick="trashAct('{nm_js}','delete')">✕ 彻底删除</button>
   </div>
 </div>
 <script>

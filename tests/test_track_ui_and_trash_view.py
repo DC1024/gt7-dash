@@ -151,3 +151,20 @@ class TestTrashView:
         status, body = _req(srv.server_address[1], "GET", "/tracks")
         assert status == 200
         assert "赛道地图" in body
+
+
+def test_trash_view_escapes_js_string(dash, tmp_path):
+    """回收站文件名里的单引号不能在 onclick 里逃出字符串（P2-8）。
+
+    浏览器会先把 HTML 实体 `&#x27;` 解码回 `'`，所以只做 _html.escape 不够；
+    onclick 里的 JS 字面量必须用 _js_str 转义。
+    """
+    trash = tmp_path / "_trash"
+    trash.mkdir()
+    name = "x');alert(1);.jsonl"
+    (trash / name).write_text("{}\n", encoding="utf-8")
+
+    page = dash.build_trash_view_page(tmp_path, name)
+
+    assert "x');alert(1);.jsonl" not in page, "未转义的单引号会逃出 JS 字符串"
+    assert "x\\');alert(1);.jsonl" in page, "应按 JS 字符串规则转义"
