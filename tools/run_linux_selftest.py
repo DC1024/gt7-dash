@@ -53,10 +53,23 @@ def main() -> int:
         rc = out.channel.recv_exit_status()
         return rc, out.read().decode("utf-8", "replace"), err.read().decode("utf-8", "replace")
 
+    # 🔴 用完必须清掉：上一次漏了 finally，服务器 /tmp/gt7-selftest 留了 1.6MB 的
+    #    旧二进制，下次改完二进制再跑，很容易误以为"上传的就是新的"。
+    try:
+        return _run_checks(cli, run, local_md5)
+    finally:
+        try:
+            run(f"rm -rf {REMOTE_DIR}", timeout=20)
+            print(f"\n[cleanup] 已删除远端 {REMOTE_DIR}")
+        except Exception as exc:  # 清理失败不该掩盖真正的测试结论
+            print(f"\n[cleanup] 删除 {REMOTE_DIR} 失败（可手动清理）: {exc}")
+        cli.close()
+
+
+def _run_checks(cli, run, local_md5: str) -> int:
     rc, _, _ = run(f"rm -rf {REMOTE_DIR} && mkdir -p {REMOTE_DIR}")
     if rc != 0:
         print("ERROR: 建临时目录失败")
-        cli.close()
         return 1
 
     sftp = cli.open_sftp()
@@ -69,7 +82,6 @@ def main() -> int:
     print(f"[remote] md5={remote_md5}")
     if remote_md5 != local_md5:
         print(f"FAIL: md5 不一致 local={local_md5} remote={remote_md5}")
-        cli.close()
         return 1
 
     run(f"chmod 755 {remote_bin}")
@@ -106,7 +118,6 @@ def main() -> int:
         if se.strip():
             print(f"  stderr: {se.strip()[:300]}")
 
-    cli.close()
     print("\n" + "=" * 50)
     print(f"-selftest        : {'PASS' if selftest_ok else 'FAIL'}")
     print(f"stdin 解密完整包 : {'PASS' if pipe_ok else 'FAIL'}")
