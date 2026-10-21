@@ -96,6 +96,8 @@ class EventType(str, Enum):
     HEAVY_THROTTLE = "heavy_throttle"   # 大油门出弯
     OFF_TRACK = "off_track"             # 出界
     TANK_SLAP = "tank_slap"             # 压路肩石/草地（未实现）
+    # TODO(B4c): 需要 C 包的 surfaceType[4] 才能判断"压到什么"；
+    #   依赖 TODO(A7)。现在的 OFFTrack 只能靠走线偏差近似。
 
 
 @dataclass

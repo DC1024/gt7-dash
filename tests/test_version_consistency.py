@@ -150,3 +150,16 @@ class TestReadmeInSync:
         assert _real_version() in found, (
             f"README 顶部版本号与 gt7_version.py ({_real_version()}) 不一致；"
             f"找到的是 {sorted(set(found))}")
+
+    def test_宣传站页脚版本与真源一致(self):
+        """docs/index.html 是 GitHub Pages 的源，每次 push 都会重新部署。
+
+        它曾经停在 v1.2.0 整整 6 个版本 —— 线上宣传页展示的是个旧项目，
+        而没有任何东西会提醒你。这里把它纳入版本一致性守卫。
+        """
+        text = _read("docs/index.html")
+        found = re.findall(r"GT7 Dash v(\d+\.\d+\.\d+)", text)
+        assert found, "宣传站页脚找不到 `GT7 Dash vX.Y.Z`"
+        assert set(found) == {_real_version()}, (
+            f"宣传站页脚写的是 {sorted(set(found))}，"
+            f"与 gt7_version.py ({_real_version()}) 不一致")

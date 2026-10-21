@@ -43,7 +43,7 @@ RUN if [ "$SKIP_APT" = "1" ]; then \
 WORKDIR /app
 
 # 先拷代码再设权限，利于利用构建缓存
-COPY gt7-recorder.py gt7-dashboard.py gt7analysis.py gt7_version.py gt7-event-detector.py gt7-overtake-detector.py ./
+COPY gt7-recorder.py gt7-dashboard.py gt7analysis.py gt7_version.py gt7-event-detector.py ./
 
 # —— Salsa20 解密器 ——
 # 🔴 这是必需的：GT7 真机发的包 100% 是 Salsa20 加密的。

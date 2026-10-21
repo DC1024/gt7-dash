@@ -617,7 +617,7 @@ class Decoder:
           - 转速是 **float32 @0x3C**，不是 uint16*2
           - 胎温是 **float32**（摄氏度），不是 uint8-50
           - **position 就是车身坐标（x,y,z 三个 float）** —— 不需要 Addendum2！
-            这意味着 `gt7-overtake-detector.py` 的赛道定位从第一帧就能用
+            这意味着赛道定位（最近邻匹配）从第一帧就能用，不必等几秒攒轨迹
         """
         n = len(data)
         if n < 0x9A:            # 至少要覆盖到 brake(0x92)+1
@@ -806,7 +806,12 @@ class Decoder:
                 # 🔴 格式 A 的 0x128 之后就结束了（296 字节），按扩展偏移读 A 包
                 #    是越界；而 0x128.. 这段在 A 里是轮速/胎径等，语义完全不同，
                 #    绝不能张冠李戴。所以这里用包长严格守门：
-                #      A = 296B、B = 316B（+5 float 运动数据）、~ = 332B（+扩展）
+                #      A = 296B、B = 316B（+5 float 运动数据）、~ = 扩展包
+                # TODO(A3): B 包多出的 5 个 float 目前**完全没解码**
+                #   （wheelRotation / steeringAngularVelocity / sway / heave /
+                #   surge）。--packet-type B 现在只是让包变长，字段全丢。
+                #   价值：sway/heave/surge 是直接测得的车体三轴加速度，
+                #   可以替掉"速度差分算 G"（差分对时钟抖动敏感）。
                 #
                 # ⚠️ 扩展段布局来自社区逆向，两大来源有 4 字节分歧
                 #    （MacManley/gt7-udp 有 torqueVectors，RaceCrewAI/gt-telem 没有），
@@ -817,6 +822,11 @@ class Decoder:
                 #      0x140 torqueVectors(f32)    0x144 energyRecovery(f32)
                 #      0x148 unknown(f32)
                 #    默认心跳是 "A"→ 这段恒为 0；只有显式 --packet-type ~ 才有值。
+                #
+                # TODO(A8): 以上三个字段**没有用真机数据验证过**。
+                #   两个待解的分歧：① 扩展段布局两来源差 4 字节；
+                #   ② 本文件注释写 ~ 包 332B，社区文档普遍写 344B，差 12 字节
+                #   无人解释。启用 --packet-type ~ 之前必须抓一次包核对。
                 energy_recovery=f32(0x144) if n >= 0x148 else 0.0,
                 throttle_filtered=(data[0x13C] / 255.0) if n >= 0x13D else 0.0,
                 brake_filtered=(data[0x13D] / 255.0) if n >= 0x13E else 0.0,
@@ -1193,7 +1203,11 @@ class Recorder:
                     try:
                         # 心跳字符决定 PS5 回哪种包：
                         #   "A" → 296 字节基础包（默认）
-                        #   "B" → 316 字节（+运动数据）  "~" → 332 字节（+能量回收）
+                        #   "B" → 316 字节（+运动数据）  "~" → 扩展包（+能量回收）
+                        # TODO(A7): "C" → 368 字节（GT7 1.68+），独有
+                        #   wheelSteeringAngle[2] / wheelBase / surfaceType[4] /
+                        #   currentLap / carCategory。本版未支持，解码代码也没有。
+                        #   要做得先有一次真机抓包验证偏移（见项目状态盘点 第 4 批）。
                         s1.sendto(self.args.packet_type.encode("ascii"),
                                   (tgt_ip, tgt_port))
                     except OSError:

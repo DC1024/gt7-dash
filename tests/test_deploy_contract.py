@@ -31,13 +31,29 @@ class TestDeployScript:
         assert (ROOT / "tools" / "deploy.sh").is_file(), (
             "没有部署脚本 → 又回到「手工 scp」那条路")
 
+    def test_有_ghcr_拉镜像模式(self):
+        text = _read("tools/deploy.sh")
+        assert "docker pull" in text, (
+            "缺少 ghcr 拉取路径：线上应该跑 CI 构建出来的那个镜像，"
+            "而不是在服务器上另构建一次")
+        assert "ghcr.io/dc1024/gt7-dash" in text
+
+    def test_拉完镜像才重启(self):
+        """不 pull 直接 up，compose 会静默沿用本地旧镜像。
+
+        这是最隐蔽的一类"部署成功"：容器起来了、健康检查也绿，
+        但跑的其实是上一版。
+        """
+        text = _read("tools/deploy.sh")
+        pull = text.find("docker pull")
+        up = text.find("compose up")
+        assert 0 < pull < up, "docker pull 必须出现在 compose up 之前"
+
     def test_用_git_archive_而不是拷工作区(self):
         text = _read("tools/deploy.sh")
         assert "git archive" in text, (
-            "部署快照必须用 `git archive`：只有它能保证"
+            "本地构建路径必须用 `git archive`：只有它能保证"
             "「传上去的字节 == 索引里的字节」")
-        # 反例：`tar czf x.tar.gz .` 或 `scp -r .` 会把工作区原样搬走，
-        # 包括 CRLF、__pycache__、本地临时文件。
         bad = [l for l in text.splitlines()
                if not l.strip().startswith("#")
                and re.search(r"\b(scp\s+-r|rsync\s+-a\s+\.|tar\s+-?c?zf?\s+\S+\s+\.)",
@@ -65,6 +81,25 @@ class TestDeployScript:
         text = _read("tools/deploy.sh")
         assert "\\r" in text or "CRLF" in text, (
             "没有换行复核 —— CRLF 的 .sh 在 Linux 上会 bad interpreter")
+
+
+class TestDeployRootUnified:
+    """T3：两个运维入口必须指向同一个目录。
+
+    历史上 deploy.sh 用 /opt/gt7-dash、manage.sh 用 /opt/gt7-recorder，
+    结果 `manage.sh status` 看的是另一个容器。
+    """
+
+    def _root_of(self, text: str, pattern: str) -> str:
+        m = re.search(pattern, text, re.M)      # 要 re.M：两条定义都在行首
+        assert m, f"找不到部署根目录定义（pattern={pattern}）"
+        return m.group(1)
+
+    def test_两个脚本根目录一致(self):
+        d = self._root_of(_read("tools/deploy.sh"), r'GT7_ROOT:-([^}"]+)')
+        m = self._root_of(_read("manage.sh"), r'^DIR="([^"]+)"')
+        assert d.strip() == m.strip(), (
+            f"deploy.sh 用 {d}、manage.sh 用 {m} —— 两个运维入口指向不同目录")
 
 
 class TestLineEndings:
@@ -143,5 +178,5 @@ class TestCompose:
 class TestVersionStampedIntoImage:
     def test_deploy_构建的镜像带版本_tag(self):
         text = _read("tools/deploy.sh")
-        assert "gt7-dash:v$VERSION" in text, (
+        assert ":v$VERSION" in text, (
             "镜像不打版本 tag，线上跑的是哪个版本又变成谜")
