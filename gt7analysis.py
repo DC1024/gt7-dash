@@ -856,6 +856,8 @@ def _lap_distance_m(frames: list[dict]) -> float:
     """一圈内累计行驶距离（米），按速度 × Δt 积分。
 
     dt 异常（<=0 或 >1s）的区间不计距离，与 lap_samples 一致。
+    ⚠️ 只作为**没有坐标时**的兜底：时间戳异常/丢包会让它偏离真实圈长
+    （实测被放大约 40%）。有坐标时请用 `_lap_geo_length`。
     """
     dist = 0.0
     prev: dict | None = None
@@ -866,6 +868,37 @@ def _lap_distance_m(frames: list[dict]) -> float:
                 dist += (prev.get("speed_kph") or 0.0) / 3.6 * dt
         prev = f
     return dist
+
+
+# 单帧位移超过这个数（>3600 km/h）判为坐标跳变（撞车回放/传送），不计入弧长
+_LAP_GEO_GAP_M = 100.0
+
+
+def _lap_geo_length(frames: list[dict]) -> float:
+    """一圈的**几何弧长**（相邻帧 car_x/car_z 的弦长之和，米）。
+
+    🔴 为什么需要它：速度积分 `Σ v·Δt` 依赖时间戳，丢包/时钟跳变会把圈长
+       放大（实测 5078m 的赛道积出 7066m，进而把完整圈判成残圈）。
+       几何弧长只依赖坐标，不受时间戳影响。
+
+    坐标缺失的帧跳过；单帧位移 >100m 判为跳变跳过；有效点 <10 返回 0
+    （调用方回退速度积分）。
+    """
+    total = 0.0
+    prev: tuple[float, float] | None = None
+    n = 0
+    for f in frames:
+        x, z = f.get("car_x"), f.get("car_z")
+        if x is None or z is None:
+            prev = None
+            continue
+        if prev is not None:
+            d = math.hypot(x - prev[0], z - prev[1])
+            if d < _LAP_GEO_GAP_M:
+                total += d
+        prev = (x, z)
+        n += 1
+    return total if n >= 10 else 0.0
 
 
 def _median(xs: list[float]) -> float:
@@ -958,12 +991,21 @@ def official_lap_times(laps: dict[int, list[dict]]) -> dict[int, float]:
 
 
 def lap_distances(laps: dict[int, list[dict]]) -> tuple[dict[int, float], float]:
-    """每圈积分距离 + 基准圈长（残圈判据的唯一事实源）。
+    """每圈距离 + 基准圈长（残圈判据的唯一事实源）。
+
+    距离优先用**几何弧长**（坐标弦长），它不受时间戳/丢包影响；
+    整场**所有圈**都有有效坐标时才用几何，否则整体回退速度积分 ——
+    避免同一场里两种口径混用，把基准圈长拉歪。
 
     返回 ``(dists, ref)``。``ref == 0.0`` 表示圈数太少（<3），基准不可用，
     调用方应退回「只判时长」的旧口径，不要拿它做距离判断。
     """
-    dists = {n: _lap_distance_m(fs) for n, fs in laps.items()}
+    geo = {n: _lap_geo_length(fs) for n, fs in laps.items()}
+    use_geo = bool(laps) and all(v > 0 for v in geo.values())
+    if use_geo:
+        dists = dict(geo)
+    else:
+        dists = {n: _lap_distance_m(fs) for n, fs in laps.items()}
     return dists, _reference_lap_dist(dists)
 
 
@@ -1038,15 +1080,26 @@ def clean_laps(frames: list[dict],
     return out
 
 
-def lap_samples(frames: list[dict]) -> list[dict]:
+def lap_samples(frames: list[dict], geo: bool | None = None) -> list[dict]:
     """一圈的帧 → 累计距离采样点。
 
     每点：dist(米) / t_rel(圈内秒) / v(m/s) / speed_kph / throttle / brake /
-          glong(纵向G) / gmag(合成 G 大小) / x / z。dt 异常（<=0 或 >1s）的区间不计距离。
+          glong(纵向G) / gmag(合成 G 大小) / x / z。
+
+    🔴 距离轴优先用**几何弧长**：速度积分依赖时间戳，丢包/时钟跳变会把
+       距离放大（实测 5078m 的圈积出 7066m）。只有几何与积分在同一量级
+       （比值 0.5~2.0）时才信几何 —— 合成数据/坐标缩放异常时自动回退，
+       不会因为坐标单位不同把整条距离轴缩小。
+
+    `geo` 可选：True 强制几何（有坐标时）、False 强制积分、None=自动。
+    `lap_profile` 的「积分 vs 几何漂移」诊断必须传 False，否则两者相同。
     """
     pts: list[dict] = []
     dist = 0.0
+    geo_total = 0.0
+    geo_vals: list[float] = []
     prev = None
+    prev_xyz = None
     for f in frames:
         t = f.get("t") or 0.0
         v = (f.get("speed_kph") or 0.0) / 3.6
@@ -1054,6 +1107,16 @@ def lap_samples(frames: list[dict]) -> list[dict]:
             dt = t - prev["t"]
             if 0.001 < dt < 1.0:
                 dist += prev["v"] * dt
+        x, z = f.get("car_x"), f.get("car_z")
+        if x is not None and z is not None:
+            if prev_xyz is not None:
+                d = math.hypot(x - prev_xyz[0], z - prev_xyz[1])
+                if d < _LAP_GEO_GAP_M:
+                    geo_total += d
+            prev_xyz = (x, z)
+        else:
+            prev_xyz = None
+        geo_vals.append(geo_total)
         g = f.get("g_force") or [0.0, 0.0, 0.0]
         pts.append({
             "dist": dist, "t": t, "t_rel": 0.0, "v": v,
@@ -1072,11 +1135,19 @@ def lap_samples(frames: list[dict]) -> list[dict]:
             "x": f.get("car_x"), "z": f.get("car_z"),
         })
         prev = {"t": t, "v": v}
+
+    if geo is True:
+        use_geo = geo_total > 0
+    elif geo is False:
+        use_geo = False
+    else:
+        use_geo = bool(dist > 0 and geo_total > 0
+                       and 0.5 <= geo_total / dist <= 2.0)
     if pts:
         t0 = pts[0]["t"]
-        for p in pts:
+        for i, p in enumerate(pts):
             p["t_rel"] = round(p["t"] - t0, 3)
-            p["dist"] = round(p["dist"], 1)
+            p["dist"] = round(geo_vals[i] if use_geo else p["dist"], 1)
     return pts
 
 
@@ -2438,7 +2509,8 @@ def lap_profile(frames: list[dict], lap_no: int = 0, step_m: float = 5.0,
 
     `frames` 必须是**同一圈**的帧（用 clean_laps/split_laps 切好）。
     """
-    pts = lap_samples(frames)
+    # 这里必须用**速度积分**口径：本函数的诊断就是「积分 vs 几何」的漂移
+    pts = lap_samples(frames, geo=False)
     if len(pts) < 20:
         return {"error": "帧数不足，无法建立圈剖面", "frames": len(pts)}
 
