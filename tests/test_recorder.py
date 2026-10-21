@@ -1,5 +1,6 @@
 """录制器回归测试 —— 今天修掉的每个 bug 都对应一个用例。"""
 import json
+import math
 import time
 
 from packets import build_packet
@@ -316,3 +317,42 @@ class TestStatusSchema2:
         assert r._frame_seq == q1, "重复帧不能推进序号（数据没变）"
         assert p2["last_rx_t"] > p1["last_rx_t"], "但收包时刻必须刷新"
         assert len(p2["history"]) == len(p1["history"]), "重复帧不能灌进缓冲"
+
+
+class TestBatchTimes:
+    """批内时间戳重建（P1-2）：同批包的 dt 不能是微秒级。"""
+
+    def test_spreads_evenly(self, rec, make_recorder):
+        r = make_recorder()
+        r._last_batch_t = 1000.0
+        times = r._batch_times([1000.09] * 10, end=1000.1)
+        assert times[-1] == 1000.1
+        dts = [times[0] - 1000.0] + [times[i] - times[i - 1]
+                                     for i in range(1, len(times))]
+        assert all(0.009 < d < 0.011 for d in dts), dts
+
+    def test_single_packet_uses_raw(self, rec, make_recorder):
+        r = make_recorder()
+        r._last_batch_t = 1000.0
+        assert r._batch_times([1000.05], end=1000.1) == [1000.05]
+
+    def test_abnormal_span_falls_back_to_60hz(self, rec, make_recorder):
+        """主循环卡死 >1s 时按名义 60Hz 均分，别摊出一个巨大的 dt。"""
+        r = make_recorder()
+        r._last_batch_t = 900.0
+        times = r._batch_times([1000.0] * 6, end=1000.0)
+        assert times[-1] == 1000.0
+        assert abs((times[-1] - times[-2]) - 1 / 60) < 0.001
+
+    def test_g_force_not_zero_after_rebuild(self, rec, make_recorder):
+        """重建后 10 个包要能算出非零 G（用 10µs 间隔则全是 0）。"""
+        r = make_recorder()
+        r._last_batch_t = 1000.0
+        times = r._batch_times([1000.09] * 10, end=1000.1)
+        pkts = [build_packet(
+            spd_ms=40.0,
+            vx=40.0 * math.cos(math.radians(0.3) * i),
+            vz=40.0 * math.sin(math.radians(0.3) * i)) for i in range(10)]
+        samples = r.decoder.decode_many(pkts, times)
+        assert any(s is not None and abs(s.g_force[1]) > 0.1
+                   for s in samples[1:])

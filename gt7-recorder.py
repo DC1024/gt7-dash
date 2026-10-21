@@ -914,6 +914,8 @@ class Recorder:
         self._last_rx_t = 0.0
         # 状态文件写了几次（用来决定何时附带一次全量窗口）
         self._status_writes = 0
+        # 上一批包的**处理结束**时刻：批内时间戳重建用（见 _batch_times）
+        self._last_batch_t = 0.0
         # 按端口统计收包数（诊断用：排查 176Hz 异常速率）
         self._recv_by_port: dict[str, int] = {}
         # —— 行车轨迹（用于画轨迹图）——
@@ -1129,8 +1131,11 @@ class Recorder:
                 now = time.time()
                 if self._last_source:
                     batch_addr = self._last_source
+                # 🔴 批内时间戳重建：drain 是微秒级的，直接用 recvfrom 时刻会让
+                #    同一批的 dt≈0，G 力和距离积分全被 0.001 守卫跳过。
+                times = self._batch_times([b[1] for b in batch])
                 samples = self.decoder.decode_many(
-                    [b[0] for b in batch], [b[1] for b in batch]
+                    [b[0] for b in batch], times
                 )
                 # 🔴 处理完**必须清空**！这是本项目最隐蔽的 bug 之一。
                 # batch 定义在 while 之外，若不清空会一直累积，
@@ -1750,6 +1755,32 @@ class Recorder:
                 force=True,
             )
         return removed
+
+    def _batch_times(self, raw_times: list[float],
+                     end: float | None = None) -> list[float]:
+        """把一批包的到达时刻重建成**均匀分布**，保住逐帧 dt。
+
+        🔴 为什么不能直接用 recvfrom 的时刻：
+           drain 循环一次读几十个包，时间戳只差几十微秒（实测同批 10µs）。
+           而 G 力与距离积分都要求 `0.001 < dt`，于是除首帧外全被跳过：
+           G 力恒为 0、距离少积分一大截（P1-2）。
+           这些包早就排在 socket 缓冲区里，真实到达时刻已经拿不回来，
+           只能按「上一批结束 → 本批结束」的真实间隔等分。
+
+        单包不重建（用真实到达时刻）；跨度异常（>1s，说明主循环卡死）时
+        按名义 60Hz 均分，别把一次卡顿摊成一个巨大的 dt。
+        """
+        n = len(raw_times)
+        if n <= 1:
+            return list(raw_times)
+        end = time.time() if end is None else end
+        span = end - self._last_batch_t if self._last_batch_t > 0 else 0.0
+        if not (0.0 < span < 1.0):
+            span = n / 60.0
+        self._last_batch_t = end
+        start = end - span
+        # (i+1)/n：首帧也分到一个 dt，否则它与上一批末帧的 dt=0 又被跳过
+        return [start + span * (i + 1) / n for i in range(n)]
 
     def _gap_before_batch(self, first_packet_t: float,
                           last_active: float) -> float:
