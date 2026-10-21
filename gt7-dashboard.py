@@ -71,6 +71,8 @@ from urllib.parse import urlparse, parse_qs, quote
 def _expand_status_frame(h: dict) -> dict[str, Any]:
     """状态文件里的紧凑帧（字段缩写）→ 前端/API 用的完整字段名。"""
     return {
+        # 单调序号：schema 2 的增量续接用；schema 1 没有 → 0（前端回退全量）
+        "q": h.get("q", 0),
         "t": h["t"],
         "speed_kph": h["s"],
         "rpm": h["r"],
@@ -275,11 +277,19 @@ class TelemetryHub:
         return {"name": info["name"], "maker": info["maker"],
                 "group": info["group"], "known": info["known"]}
 
-    def snapshot(self, max_frames: int = 300) -> dict[str, Any]:
-        """仪表盘页面拉取。"""
+    def snapshot(self, max_frames: int = 300,
+                 since: int | None = None) -> dict[str, Any]:
+        """仪表盘页面拉取。
+
+        `since` 可选：只返回序号大于它的帧（增量）。前端据此只取新增部分，
+        慢网/多标签页时不必每次重传整个窗口。序号来自 schema 2 的 `q`；
+        老接收器没有 q（全为 0），过滤后为空 → 前端会回退到全量。
+        """
         self.refresh()
         with self._lock:
             frames = list(self._buffer)[-max_frames:]
+            if since is not None:
+                frames = [f for f in frames if int(f.get("q") or 0) > since]
             latest = dict(self._latest) if self._latest else None
             # 🔴 latest 是**原始帧**，菜单态的 0xFFFF 会原样发给 /api/state 的
             #    调用方（前端自己的 okPos() 只挡 UI，挡不住第三方）。归一一次。
@@ -330,6 +340,8 @@ class TelemetryHub:
                                     else "session"),
                 "latest": latest,
                 "history": frames,
+                # 缓冲区里最后一帧的序号（前端下次带 ?since= 用）
+                "seq": self._last_q,
                 "server_time": time.time(),
             }
 
@@ -4659,9 +4671,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_html(PAGE)
 
             elif path == "/api/state":
-                # ?frames=300 控制返回的帧数
-                n = int(query.get("frames", ["300"])[0])
-                self._send_json(HUB.snapshot(max_frames=max(10, min(n, 600))))
+                # ?frames=300 控制返回的帧数；?since=<seq> 只取新增帧（增量）。
+                # 🔴 frames 非法值不能 500：之前 int('abc') 直接抛到外层。
+                try:
+                    n = int(query.get("frames", ["300"])[0])
+                except (TypeError, ValueError):
+                    n = 300
+                try:
+                    since_raw = query.get("since", [""])[0]
+                    since = int(since_raw) if since_raw else None
+                except (TypeError, ValueError):
+                    since = None
+                self._send_json(HUB.snapshot(max_frames=max(10, min(n, 600)),
+                                             since=since))
 
             elif path == "/api/stats":
                 self._send_json(HUB.stats())
@@ -11024,24 +11046,67 @@ document.addEventListener('keydown', e => {
 // 拉多少帧跟着面板的曲线窗口走：窗口拉到 10 秒，这里就得要 600 帧，
 // 否则曲线会因为数据不够而画不满。
 let _noRespStreak = 0;
+// —— 实时数据增量续接（schema 2）——
+// 服务端每帧带序号 q，只取比本地大的帧，避免每次重传 600 帧。
+// 首次 / 断档（首帧跳号）/ 接收器重启（seq 回退）时强制全量。
+let liveHist = [];
+let liveSeq = 0;
+let forceFull = true;
+let _inFlight = false;
+
 function poll() {
-  fetch('/api/state?frames=' + prefs.chartWindow)
+  // 🔴 背压：上一次请求没回来就跳过这一拍。服务端在算重活（/events 冷启动
+  //    要几秒）或慢 WiFi 上，setInterval 会堆出几十个请求，把浏览器的
+  //    6 条同域连接占满，整个页面一起变慢。
+  if (_inFlight) return;
+  _inFlight = true;
+  let url = '/api/state?frames=' + prefs.chartWindow;
+  if (!forceFull && liveSeq) url += '&since=' + liveSeq;
+
+  fetch(url)
     .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
     // 🔴 渲染异常 ≠ 服务断流：单独 try 吞掉，绝不因此误报「服务无响应」——
     //    否则主数据明明在动、状态栏却红着「服务无响应」，车手会以为坏了。
-    .then(d => { _noRespStreak = 0;
-      try { render(d); } catch (e) { console.error('render 异常（非服务断流）:', e); } })
+    .then(d => {
+      _noRespStreak = 0;
+      try {
+        // 接收器重启：序号归零 → 本地缓冲作废，下一拍拉全量
+        if (d.seq && liveSeq && d.seq < liveSeq) {
+          liveHist = []; liveSeq = 0; forceFull = true;
+        }
+        const inc = d.history || [];
+        const firstQ = inc.length ? (inc[0].q || 0) : 0;
+        // 空响应（暂停时没有新帧）不算断档，别把曲线清空
+        const gap = inc.length
+          ? (!firstQ || (liveSeq && firstQ > liveSeq + 1))
+          : false;
+        if (forceFull || !liveHist.length || gap) {
+          liveHist = inc.slice();
+          forceFull = gap;          // 断档 → 下一拍再拉一次全量补历史
+        } else if (inc.length) {
+          liveHist = liveHist.concat(inc);
+          const cap = Math.max(600, prefs.chartWindow);
+          if (liveHist.length > cap) liveHist = liveHist.slice(-cap);
+        }
+        if (d.seq) liveSeq = d.seq;
+        else if (inc.length) liveSeq = inc[inc.length - 1].q || liveSeq;
+        d.history = liveHist;
+        render(d);
+      } catch (e) { console.error('render 异常（非服务端断流）:', e); }
+    })
     // 🔴 偶发抖动（一次 fetch 失败 / JSON 解析卡顿 / 服务在算重活短时无响应）
     //    不该立刻判死。#5 复审：3 次（300ms）太敏感 —— 用户实测"数据明明在动，
     //    状态栏却闪『服务无响应』"。提到 10 次（~1s）：真断了 1 秒内必红，
     //    假抖动基本滤净。
     .catch(() => {
       _noRespStreak++;
+      forceFull = true;      // 恢复后先拉全量，别在缺口上续接
       if (_noRespStreak >= 10) {
         $('dot').className = 'dot off';
         $('status').textContent = '服务无响应';
       }
-    });
+    })
+    .finally(() => { _inFlight = false; });
 }
 poll();
 setInterval(poll, 100);   // 10Hz 轮询；G 力球靠 rAF 在两次轮询之间平滑插值

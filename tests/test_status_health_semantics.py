@@ -166,3 +166,15 @@ class TestSchema2Incremental:
         hub = dash.TelemetryHub(sf)
         hub.refresh()
         assert [h["speed_kph"] for h in hub.snapshot()["history"]] == [11.0]
+
+    def test_snapshot_since_returns_only_new_frames(self, dash, tmp_path):
+        """?since=<seq> 只回新增帧；不带 since 时仍是整窗。"""
+        sf = tmp_path / "status.json"
+        hub = dash.TelemetryHub(sf)
+        self._write(sf, seq=3,
+                    full=[self._f(1, 10), self._f(2, 20), self._f(3, 30)],
+                    history=[self._f(1, 10), self._f(2, 20), self._f(3, 30)])
+        snap = hub.snapshot(since=2)
+        assert [h["speed_kph"] for h in snap["history"]] == [30]
+        assert snap["seq"] == 3
+        assert len(hub.snapshot()["history"]) == 3, "不带 since 应返回整窗"
