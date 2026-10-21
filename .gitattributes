@@ -1,6 +1,28 @@
+# 换行策略 —— 部署一致性的第一道闸。
+#
+# 背景（G8 的根因）：
+#   Windows 上 core.autocrlf=true 会把 .py 检出成 CRLF，而服务器上的
+#   `/opt` 副本是**直接 scp 工作区**得来的，于是同一份代码在两边字节不同。
+#   Python 不在乎 CRLF，但 shell 脚本在乎：带 CRLF 的 `#!/bin/sh` 在
+#   Linux 上会报 `bad interpreter: /bin/sh^M`，而且报错信息极难看懂。
+#
+#   规则定在这里之后：
+#     · 索引里永远是 LF（`git ls-files --eol` 的 i/ 列）；
+#     · 部署只允许走 `git archive`（见 tools/deploy.sh），拿到的一定是
+#       LF 的干净快照，与工作区被谁改过无关。
+#
+# 默认全部按文本处理并强制 LF。
+* text=auto eol=lf
+
 # Windows 批处理必须用 CRLF，否则 cmd 执行可能异常
 *.bat text eol=crlf
+*.cmd text eol=crlf
 
 # 二进制产物别做换行转换
 *.zip binary
 *.exe binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.gz binary
+gt7-decrypt/gt7-decrypt-linux-amd64 binary

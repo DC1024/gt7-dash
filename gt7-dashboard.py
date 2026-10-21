@@ -3126,6 +3126,7 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
     return {
         "meta": {
             "api_version": 1,
+            "version": APP_VERSION,
             "server_time": time.time(),
             "source": "GT7 UDP telemetry (Salsa20 decrypted locally)",
         },
@@ -3949,11 +3950,13 @@ _GZIP_LEVEL = 6
 _GZIP_ENABLED = True        # --no-gzip 关掉（排障 / 抓包时看明文）
 
 
-# 版本号唯一定义处。发版时只改这一行。
-# 命名习惯跟随 git tag：这里是 `1.1.0`，对应发行标识 `v1.1.0`。
-# 之所以单独设一个常量：此前 HTTP `Server:` 头里写死过 "GT7Dashboard/1.0"，
-# 发版时容易漏改（coach 那边已经踩过一次同样的坑）。
-APP_VERSION = "1.2.0"
+# 版本号唯一来源：gt7_version.py。发版只改那里 + 打同名 tag。
+# 单文件裁剪部署（只拷 dashboard.py）时可能没有该模块 → 回退 "0.0.0"，
+# 不让 `Server:` 头因为一个缺失的常量把整个服务带崩。
+try:
+    from gt7_version import __version__ as APP_VERSION
+except ImportError:                     # pragma: no cover - 裁剪部署兜底
+    APP_VERSION = "0.0.0"
 
 DEFAULT_PORT = 8787
 
@@ -4885,6 +4888,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     {
                         "ok": True,
+                        # 部署验证用：客户端/脚本据此确认跑的是哪个版本
+                        "version": APP_VERSION,
                         "connected": s.get("connected", False),
                         "frames": s.get("frames", 0),
                         "has_coords": s.get("has_coords", False),

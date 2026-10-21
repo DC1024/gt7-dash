@@ -61,6 +61,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# 版本号唯一来源：gt7_version.py（与仪表盘共用）
+try:
+    from gt7_version import __version__ as APP_VERSION
+except ImportError:                     # pragma: no cover - 单文件打包兜底
+    APP_VERSION = "0.0.0"
+
 
 # ---------------------------------------------------------------------------
 # GT7 协议常量
@@ -158,6 +164,8 @@ class Session:
             # ⚠️ 电动车时各帧的 gas_level 是**剩余电量 kWh**（不是百分比），
             #    容量字段为 0；分析 jsonl 时要按这个标记决定单位。
             "powertrain": self.powertrain,
+            # 哪个版本的接收器写的这场数据：混版本排查时不用猜
+            "recorder_version": APP_VERSION,
         }
 
 
@@ -1017,7 +1025,7 @@ class Recorder:
 
         ps5_mode = (self.args.ps5 or "auto").strip()
         print("=" * 66, flush=True)
-        print("GT7 遥测接收服务", flush=True)
+        print(f"GT7 遥测接收服务 v{APP_VERSION}", flush=True)
         print(f"  监听 0.0.0.0:{PORT_HEARTBEAT} (格式A) / :{PORT_ADVANCED} (格式B/C)",
               flush=True)
         print(f"  输出目录 {outdir}", flush=True)
@@ -1895,6 +1903,11 @@ def main() -> int:
   · 超过 --session-gap 秒收不到任何包 → 结束场次
   → 全自动，**不需要手动 start/stop**
         """,
+    )
+    p.add_argument(
+        "--version", action="version",
+        version=f"gt7-recorder {APP_VERSION}",
+        help="打印版本号后退出",
     )
     p.add_argument(
         "-o", "--output", default="./data",

@@ -7,13 +7,20 @@
 ![GHCR](https://img.shields.io/badge/镜像-ghcr.io-blue)
 ![License](https://img.shields.io/badge/许可-MIT-green)
 
-> **当前版本：v1.2.0** —— 延续上版的**赛道地图**与界面重塑，本版把
-> [ddm999/gt7info](https://github.com/ddm999/gt7info) 的车型数据用得更足：
-> 场次与实时界面现在显示**车型名片**（品牌 + 车名 + 赛事组别徽章）；
-> `/tracks` 页给有标注的赛道加 **BoP 档位徽章**、并可选显示**官方赛道 logo**
-> （跑 `python helper/download_track_logos.py ./data` 拉取，图是游戏素材不入库）；
-> 新增 `GET /api/v1/tyres` 返回社区实测的**轮胎寿命与湿地特性**参考表。
-> 公开 API 的文档补成完整清单（38 个端点）。
+> **当前版本：v1.3.8**（以 `gt7_version.py` 为唯一版本源）—— 这一版几乎全是
+> **数据可信度**与**工程可维护性**，界面上看不出大变化，但仪表盘报的圈速终于
+> 和游戏里的一致了：
+>
+> - **圈速改用 GT7 官方 `last_lap_ms`**，不再自己积分算（此前会把"进行中的
+>   那一圈"算进去，最快圈经常指错人；实测某场 182.050s 的圈，官方是 127.277s）
+> - **距离基准改用几何弧长**（坐标点弦长累加），只有缺失坐标时才回退到速度积分
+> - **录制器批内时间重建保证严格递增**（此前单包批不推进游标，导致后段圈长被
+>   放大约 40%：5976m vs 真实 5078m）
+> - **版本号收敛到唯一真源**：仪表盘 / 接收器 / Go 解密器 / 打包全部从
+>   `gt7_version.py` 取，tag 与版本号不一致时 CI 直接红
+> - **CI 加了 lint 门禁与内联 JS 语法检查**（渲染后抽 `<script>` 交给 `node --check`）
+> - **部署脚本化**：`tools/deploy.sh` 用 `git archive` 出快照，不再 scp 工作区
+>   （CRLF 会让 `.sh` 报 `bad interpreter`），线上版本可从 `/api/health` 核对
 
 ## ⬇️ 下载（Windows 免安装）
 

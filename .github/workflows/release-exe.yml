@@ -40,20 +40,46 @@ jobs:
       - name: 安装 PyInstaller
         run: pip install --upgrade pyinstaller
 
+      # 版本号从 gt7_version.py 读一次，后面 Go / PyInstaller / 校验全用它。
+      # 🔴 不要在 YAML 里写死版本：真源只有一个，写第二处就是又开了一个漂移点。
+      - name: 取版本号
+        id: ver
+        shell: bash
+        run: |
+          V=$(python -c "import gt7_version; print(gt7_version.__version__)")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "本次构建版本 v$V"
+          # tag 构建时再校一次：tag 与真源不一致就直接失败。
+          # （tests/test_version_consistency.py 也查同一件事，双保险 ——
+          #  那边查不到时会 skip，这里是无条件兜底。）
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$V" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME 与 gt7_version.py (v$V) 不一致"
+              exit 1
+            fi
+          fi
+
       - name: 打包仪表盘 exe
         # 🔴 --add-data 必须带上 gt7-event-detector.py：
         #    它在运行时用 importlib 按**文件路径**加载（文件名有连字符，不能 import），
         #    而 onefile 下代码家在临时解包目录里，不打包进去就永远找不到 →
         #    /events 与 /highlights 静默变"不可用"，而 README 把事件集锦当卖点。
         #    --hidden-import 管不了这种情况：它不是 import 出来的。
+        # 🔴 --hidden-import gt7_version：版本模块是在 try/except ImportError 里
+        #    import 的，PyInstaller 的静态分析有时会把「被 try 包住的 import」
+        #    当成可选依赖漏掉，结果 exe 里版本静默变 0.0.0。
         run: >
           pyinstaller --noconfirm --clean --onefile --name gt7-dashboard
           --hidden-import gt7analysis
+          --hidden-import gt7_version
           --add-data "gt7-event-detector.py;."
           gt7-dashboard.py
 
       - name: 打包接收器 exe
-        run: pyinstaller --noconfirm --clean --onefile --name gt7-recorder gt7-recorder.py
+        run: >
+          pyinstaller --noconfirm --clean --onefile --name gt7-recorder
+          --hidden-import gt7_version
+          gt7-recorder.py
 
       - name: 交叉编译解密器（windows/amd64）
         working-directory: gt7-decrypt
@@ -61,7 +87,11 @@ jobs:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: '0'
-        run: go build -trimpath -ldflags "-s -w" -o ../gt7-decrypt.exe .
+          # `-s -w` 去掉符号表压缩体积；`-X main.version` 把版本烧进二进制，
+          # 这样 `gt7-decrypt.exe --version` 能和 zip 名对得上。
+          VERSION: v${{ steps.ver.outputs.version }}
+        run: go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o ../gt7-decrypt.exe .
+
 
       - name: 组装 zip 包
         shell: pwsh
@@ -87,6 +117,19 @@ jobs:
             exit 1
           }
           Write-Host "OK: exe 内已包含 gt7-event-detector.py"
+
+      - name: 校验解密器把版本烧进去了
+        # ldflags 写错（变量名改了、-X 路径不对）时 go build **不会报错**，
+        # 只是悄悄留成 `dev`。必须实际执行一次才知道。
+        shell: pwsh
+        run: |
+          $want = "v${{ steps.ver.outputs.version }}"
+          $out = (& ./gt7-decrypt.exe --version 2>&1 | Out-String).Trim()
+          Write-Host "gt7-decrypt --version => $out"
+          if ($out -notmatch [regex]::Escape($want)) {
+            Write-Error "解密器版本不是 $want（实际：$out）—— ldflags 注入失败"
+            exit 1
+          }
 
       - name: 上传构建产物（手动触发时留档）
         uses: actions/upload-artifact@v4
@@ -185,7 +228,10 @@ jobs:
 
             ## 🧪 测试
 
-            全量 **373 passed**。
+            全量 **${{ needs.test.outputs.passed }} passed**（由 `tests.yml` 实时上报，
+            不再手写 —— 之前正文里那个 `373` 就是手写常量，用例涨到 400+ 后一直没改）。
+
+            本包版本：**v${{ steps.ver.outputs.version }}**
 
             ---
 

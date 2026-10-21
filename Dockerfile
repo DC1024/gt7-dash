@@ -12,7 +12,18 @@
 # 前置条件：PS5 与本机必须同一网段（192.168.43.x），
 # 中间不能经过路由隔离（访客WiFi / VLAN / 交换机隔离都会断）。
 
-FROM python:3.12-slim
+# 🔴 基础镜像可替换（G8）：
+#    服务器常在内网/无外网出口，`apt-get update` 会挂，于是过去只能在服务器上
+#    手写一个「叠加式」Dockerfile（FROM 一个手工 tag 的基镜像 + COPY 几个 .py）。
+#    那套东西不在仓库里 → 服务器跑的东西和仓库里的 Dockerfile 早就不是一回事，
+#    而且没人能重建。
+#
+#    现在把差异做成**构建参数**，仍然只用这一份 Dockerfile：
+#      --build-arg BASE_IMAGE=gt7-base:pre-w3   用一个已装好 tini 的基镜像
+#      --build-arg SKIP_APT=1                   跳过 apt（基镜像里已经有了）
+#    默认值保持"从官方 python 镜像全量构建"，联网环境下行为不变。
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="gt7-recorder" \
       org.opencontainers.image.description="GT7 遥测接收服务，常驻监听 UDP 广播并按场次落盘"
@@ -20,14 +31,19 @@ LABEL org.opencontainers.image.title="gt7-recorder" \
 # 只用标准库，不需要额外依赖，所以镜像可以很精简。
 # 唯一额外装的tini 是为了正确处理 SIGTERM —— Docker 停止容器时
 # 靠它把信号转给 Python，才能触发 _end_session() 落盘文件尾。
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini \
-    && rm -rf /var/lib/apt/lists/*
+ARG SKIP_APT=0
+RUN if [ "$SKIP_APT" = "1" ]; then \
+        echo "跳过 apt（基镜像已含 tini）"; \
+    else \
+        apt-get update \
+        && apt-get install -y --no-install-recommends tini \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /app
 
 # 先拷代码再设权限，利于利用构建缓存
-COPY gt7-recorder.py gt7-dashboard.py gt7analysis.py gt7-event-detector.py gt7-overtake-detector.py ./
+COPY gt7-recorder.py gt7-dashboard.py gt7analysis.py gt7_version.py gt7-event-detector.py gt7-overtake-detector.py ./
 
 # —— Salsa20 解密器 ——
 # 🔴 这是必需的：GT7 真机发的包 100% 是 Salsa20 加密的。

@@ -21,6 +21,10 @@ import (
 	"golang.org/x/crypto/salsa20"
 )
 
+// 版本由构建时注入：go build -ldflags "-X main.version=1.3.7"
+// 源码里留 "dev"，避免忘了注入时误报一个看起来正常的版本。
+var version = "dev"
+
 var key = [32]byte([]byte("Simulator Interface Packet GT7 ver 0.0"))
 
 const (
@@ -50,11 +54,16 @@ func decrypt(dat []byte) []byte {
 }
 
 func main() {
-	var stats, selftest bool
+	var stats, selftest, showVersion bool
 	flag.BoolVar(&stats, "stats", false, "只统计")
 	flag.BoolVar(&selftest, "selftest", false, "自测")
+	flag.BoolVar(&showVersion, "version", false, "打印版本号后退出")
 	flag.Parse()
 
+	if showVersion {
+		fmt.Printf("gt7-decrypt %s\n", version)
+		return
+	}
 	if selftest {
 		runSelfTest()
 		return

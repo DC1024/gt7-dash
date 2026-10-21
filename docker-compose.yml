@@ -12,7 +12,9 @@
 
 services:
   gt7-recorder:
-    image: ghcr.io/dc1024/gt7-dash:latest
+    # 可用 GT7_IMAGE 覆盖：tools/deploy.sh 会用本地构建的
+    # gt7-dash:v<version> 顶掉它，避免「改了 tag 但 compose 还拉旧镜像」。
+    image: ${GT7_IMAGE:-ghcr.io/dc1024/gt7-dash:latest}
     container_name: gt7-recorder
     network_mode: host
     restart: unless-stopped
@@ -34,12 +36,20 @@ services:
       - --verbose
 
   gt7-dashboard:
-    image: ghcr.io/dc1024/gt7-dash:latest
+    # 可用 GT7_IMAGE 覆盖：tools/deploy.sh 会用本地构建的
+    # gt7-dash:v<version> 顶掉它，避免「改了 tag 但 compose 还拉旧镜像」。
+    image: ${GT7_IMAGE:-ghcr.io/dc1024/gt7-dash:latest}
     container_name: gt7-dashboard
     network_mode: host
     restart: unless-stopped
-    depends_on:
-      - gt7-recorder
+    # 🔴 这里**故意没有 depends_on**。
+    #    depends_on 只影响启动顺序，代价却是：只要动 dashboard，
+    #    `docker compose up --force-recreate gt7-dashboard` 会**连带重建
+    #    recorder** —— 正在跑的那场比赛会被切成两个文件（真实踩过：
+    #    用户的第 11 圈因此丢了 30 秒）。
+    #    dashboard 本来就不需要 recorder 先起来：status.json 不存在时
+    #    它按"无实时数据"渲染，两个服务都是 restart: unless-stopped，
+    #    谁先起来都行。要重建单个服务时仍然建议加 `--no-deps`。
     volumes:
       # 需要写权限：场次管理（收藏/改名/删除）要写 sessions_meta.json
       - ./data:/data

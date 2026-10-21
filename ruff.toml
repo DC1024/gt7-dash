@@ -1,0 +1,35 @@
+# ruff 配置 —— G1 的 lint 门禁。
+#
+# 🔴 为什么只开 E9 / F7 这两组：
+#   这个仓库是「零第三方依赖 + 单文件巨脚本」的形态
+#   （gt7-dashboard.py 一万两千行、gt7-recorder.py 两千行），
+#   直接开 ruff 默认规则集会一次冒出上千条 `E501 行太长`、`E741 变量名 l`，
+#   结果是**第一天就把 CI 关掉**——那等于没有门禁。
+#
+#   E9  = 语法错误（E901 无效语法、E902 读不了文件）
+#   F7  = 「语法合法但一定跑不通」：F701 break 在循环外、F704 yield 在函数外、
+#         F706 return 在函数外、F707 裸 except 不在最后、F811 重复定义、
+#         F821 未定义名字（不在 F7 里，见下）
+#
+#   这两组**零误报**：命中了就是真 bug。先把地板钉死，再逐组往上加
+#   （顺序建议：F401 未使用 import → F841 未使用变量 → E7 风格）。
+#
+# 想加规则时改这里，不要在 workflow 里写 `--select`：
+#   规则散在 YAML 和本地两边，本地 `ruff check` 和 CI 结果会不一致。
+
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["E9", "F7"]
+
+# 生成的产物、第三方代码不检查
+extend-exclude = [
+    "gt7-decrypt",        # Go
+    "packaging",
+    "helper",
+]
+
+[lint.per-file-ignores]
+# 测试里允许 `assert (x, "msg")` 这类元组笔误吗？不允许 —— 那是 F631，
+# 属于 F6 组，等开 F6 时再评估。这里暂时没有豁免项。

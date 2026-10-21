@@ -13,14 +13,63 @@ on:
     tags: ['v*']
   pull_request:
   workflow_call:
+    # 把通过数透出去，让 Release 正文里的「全量 N passed」不再是手写的
+    # 常量（那个 373 就是这么烂掉的：用例涨到 400+ 之后正文还写 373）。
+    outputs:
+      passed:
+        description: 本次通过的用例数
+        value: ${{ jobs.pytest.outputs.passed }}
 
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    outputs:
+      # 注意：outputs 里的表达式要用 `jobs.<job_id>.outputs`，
+      # 不是 `steps.<id>.outputs` —— 后者只在同 job 内可见。
+      passed: ${{ steps.run.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pytest
-      - run: pytest -q
+
+      - name: 安装测试依赖
+        run: pip install pytest pytest-cov ruff
+
+      # ---------------------------------------------------------------- G1
+      # lint 门禁。规则集在 ruff.toml 里（只开 E9/F7，零误报的那两组），
+      # 这里**故意不写 --select**：本地 `ruff check` 与 CI 必须完全一致，
+      # 规则散在 YAML 里就会两边打架。
+      - name: ruff（语法错误 / 一定跑不通的写法）
+        run: ruff check --output-format=concise .
+
+      # 内联 JS 的语法检查不在这里做，而是放进 pytest（tests/test_inline_js_syntax.py）：
+      # 页面里的 <script> 是 f-string 拼出来的，静态扫源码拿到的是带 `{expr}`
+      # 的半成品，必须**渲染后**才合法。放测试里本地也能跑，不依赖 CI。
+      - name: 跑测试并统计通过数
+        id: run
+        run: |
+          set -o pipefail
+          pytest -q \
+            --cov=gt7analysis \
+            --cov=gt7_version \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            2>&1 | tee /tmp/pytest.log
+          # 末行形如 `412 passed, 2 skipped in 31.20s`
+          N=$(grep -oE '[0-9]+ passed' /tmp/pytest.log | tail -1 | grep -oE '[0-9]+' || true)
+          echo "passed=${N:-0}" >> "$GITHUB_OUTPUT"
+          echo "本次通过 ${N:-0} 个用例"
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+
+      # 覆盖率**暂时不设 --cov-fail-under**：
+      #   现在没有可信的基线，随手写个 60 会让第一次 PR 就红；
+      #   等这份报告跑过几轮、看清哪些模块是真低，再把阈值按模块定下来。
+      #   在那之前它至少让「这版比上版覆盖掉了多少」可见。
