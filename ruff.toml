@@ -20,16 +20,14 @@
 target-version = "py312"
 line-length = 100
 
-[lint]
-select = ["E9", "F7"]
-
-# 生成的产物、第三方代码不检查
+# 🔴 `extend-exclude` 是**顶层**字段。放进 [lint] 会让 ruff 直接
+#    配置解析失败（`unknown field extend-exclude`）——整条门禁 0 秒挂掉，
+#    而且报错信息埋在 Actions 日志里，很容易以为是"代码有问题"。
 extend-exclude = [
     "gt7-decrypt",        # Go
     "packaging",
     "helper",
 ]
 
-[lint.per-file-ignores]
-# 测试里允许 `assert (x, "msg")` 这类元组笔误吗？不允许 —— 那是 F631，
-# 属于 F6 组，等开 F6 时再评估。这里暂时没有豁免项。
+[lint]
+select = ["E9", "F7"]
