@@ -28,7 +28,14 @@ jobs:
       # 不是 `steps.<id>.outputs` —— 后者只在同 job 内可见。
       passed: ${{ steps.run.outputs.passed }}
     steps:
+      # 🔴 fetch-depth: 0 + fetch-tags：默认是**浅克隆**（depth=1，且不带 tag）。
+      #    CHANGELOG 一致性检查要读完整历史与全部 tag，浅克隆下会报
+      #    「这些 tag 在 CHANGELOG 里没有段落：['v1.4.2']」——
+      #    而本地明明是对的。这个坑第一次上 CI 就踩了。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

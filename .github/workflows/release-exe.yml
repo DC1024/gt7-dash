@@ -26,7 +26,12 @@ jobs:
     needs: [test]
     runs-on: windows-latest
     steps:
+      # 🔴 发行说明由 tools/gen_changelog.py 按 tag 区间生成，
+      #    需要完整历史与全部 tag —— 浅克隆下会生成空段落。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-python@v5
         with:
