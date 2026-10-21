@@ -68,6 +68,22 @@ from urllib.parse import urlparse, parse_qs, quote
 # 共享状态：接收器写入，仪表盘读取
 # ---------------------------------------------------------------------------
 
+def _expand_status_frame(h: dict) -> dict[str, Any]:
+    """状态文件里的紧凑帧（字段缩写）→ 前端/API 用的完整字段名。"""
+    return {
+        "t": h["t"],
+        "speed_kph": h["s"],
+        "rpm": h["r"],
+        "gear": h["g"],
+        "throttle": h["th"],
+        "brake": h["bk"],
+        "lap": h["lap"],
+        "tyre_temp": h["wt"],
+        "wheel_rads": h["wf"],
+        "g_force": h["gf"],
+    }
+
+
 class TelemetryHub:
     """
     遥测数据中枢。
@@ -106,6 +122,11 @@ class TelemetryHub:
         # last_packet_age。与 _last_frame_t（本机读到文件的时刻）不是一回事：
         # 前者回答"PS5 还在发吗"，后者回答"我上次读文件是什么时候"。
         self._last_packet_t = 0.0
+        # 最近一次**收到包**的时刻（schema 2 的 last_rx_t）。暂停时数据不变
+        # 但包还在来，用它判 connected 才不会把暂停误报成断线。
+        self._last_rx_t = 0.0
+        # schema 2 增量协议：本地已收到的最大帧序号
+        self._last_q = 0
         # 本场发车位（接收器在开跑瞬间快照，见 gt7-recorder）
         self._grid_start = 0
         self._has_coords = False
@@ -147,25 +168,36 @@ class TelemetryHub:
                 return
 
             # 接收器给的紧凑历史（字段缩写）→ 展开成前端要的格式
-            history = [
-                {
-                    "t": h["t"],
-                    "speed_kph": h["s"],
-                    "rpm": h["r"],
-                    "gear": h["g"],
-                    "throttle": h["th"],
-                    "brake": h["bk"],
-                    "lap": h["lap"],
-                    "tyre_temp": h["wt"],
-                    "wheel_rads": h["wf"],
-                    "g_force": h["gf"],
-                }
-                for h in payload.get("history", [])
-            ]
+            try:
+                schema = int(payload.get("schema") or 1)
+            except (TypeError, ValueError):
+                schema = 1
+            raw_hist = payload.get("history") or []
+            history = [_expand_status_frame(h) for h in raw_hist]
+            raw_full = payload.get("full")
+            full_hist = ([_expand_status_frame(h) for h in raw_full]
+                         if raw_full else None)
 
             with self._lock:
-                # 整批覆盖（而不是 append）——状态文件里已是完整历史
-                if history:
+                if schema >= 2:
+                    # —— schema 2：增量续接 ——
+                    # full 每约 1 秒来一次：冷启动/断档时整批重建；
+                    # 其余时候只追加 q 比本地大的帧（幂等，重复读不重复加）。
+                    seq = int(payload.get("seq") or 0)
+                    if seq < self._last_q:
+                        # 接收器重启（序号归零）→ 本地序号作废，等 full 重建
+                        self._last_q = 0
+                    if full_hist:
+                        self._buffer.clear()
+                        self._buffer.extend(full_hist)
+                        self._last_q = int(raw_full[-1].get("q") or 0)
+                    for h, item in zip(raw_hist, history):
+                        q = int(h.get("q") or 0)
+                        if q > self._last_q:
+                            self._buffer.append(item)
+                            self._last_q = q
+                elif history:
+                    # —— schema 1（老接收器）：整批覆盖 ——
                     self._buffer.clear()
                     self._buffer.extend(history)
                 self._latest = frame
@@ -209,7 +241,15 @@ class TelemetryHub:
                 #    拿 mtime 判 connected 会让仪表盘永远显示"采集中"——
                 #    这两件事必须分开：mtime=进程活，t=在收包。
                 self._last_packet_t = float(payload.get("t") or 0.0)
-                stale = time.time() - self._last_packet_t > 5.0
+                # 🔴 connected 用**收包时刻**而不是数据时刻：
+                #    游戏暂停时 PS5 仍以 60Hz 发同一帧，接收器把它们去重了，
+                #    数据时刻 t 不再前进 —— 用 t 判会误报「断线」。
+                #    老接收器没有 last_rx_t 字段 → 回退到 t（保持旧语义）。
+                rx = payload.get("last_rx_t")
+                if not isinstance(rx, (int, float)) or rx <= 0:
+                    rx = self._last_packet_t
+                self._last_rx_t = float(rx)
+                stale = time.time() - self._last_rx_t > 5.0
                 self._connected = not stale
 
         except (OSError, json.JSONDecodeError, ValueError, KeyError):
@@ -307,6 +347,7 @@ class TelemetryHub:
                     "frames": 0, "connected": self._connected, "layouts": {},
                     "has_coords": self._has_coords,
                     "last_packet_t": self._last_packet_t,
+                    "last_rx_t": self._last_rx_t,
                 }
             buf = list(self._buffer)
             speeds = [f["speed_kph"] for f in buf]
@@ -324,6 +365,9 @@ class TelemetryHub:
                 # /api/health 用它算 last_packet_age —— 与 connected 同源，
                 # 但把"多旧"这个连续量暴露出来，便于外部按自己的阈值判断。
                 "last_packet_t": self._last_packet_t,
+                # 最近一次**收到包**的时刻：暂停时 t 不动、它在涨。
+                # connected 判的是这个（schema 2）。
+                "last_rx_t": self._last_rx_t,
             }
 
 
@@ -4711,6 +4755,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 #    不是故障。别把两个信号揉成一个布尔值。
                 age = (time.time() - s["last_packet_t"]) \
                     if s.get("last_packet_t") else None
+                rx_age = (time.time() - s["last_rx_t"]) \
+                    if s.get("last_rx_t") else None
                 self._send_json(
                     {
                         "ok": True,
@@ -4719,7 +4765,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "has_coords": s.get("has_coords", False),
                         # 秒；None = 从未收到过包。调用方按"多大算太旧"自行判断
                         # （仪表盘用 5s，容器探针可以用更宽松的阈值）。
+                        # last_packet_age = 数据多旧（暂停时会涨）；
+                        # last_rx_age     = 距上次收到包多久（暂停时仍然很小）。
                         "last_packet_age": round(age, 1) if age is not None else None,
+                        "last_rx_age": round(rx_age, 1) if rx_age is not None else None,
                     }
                 )
 

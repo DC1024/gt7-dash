@@ -98,3 +98,71 @@ class TestHealthSemanticsSeparated:
         hub = self._hub(dash, tmp_path)   # 文件根本不存在
         hub.refresh()
         assert hub.stats()["last_packet_t"] == 0.0
+
+
+class TestSchema2Incremental:
+    """状态文件增量协议（schema 2）：全量重建 + 按序号续接 + 暂停判活。"""
+
+    @staticmethod
+    def _f(q, spd):
+        return {"q": q, "t": q * 0.016, "s": spd, "r": 6000, "g": 4,
+                "th": 0.5, "bk": 0.0, "lap": 1, "wt": [80] * 4,
+                "wf": [50] * 4, "gf": [0.0, 0.0, 0.0]}
+
+    def _write(self, sf, **kw):
+        now = time.time()
+        payload = {"schema": 2, "seq": kw.pop("seq", 1), "t": now,
+                   "last_rx_t": now, "frame": {"speed_kph": 1.0},
+                   "history": [], "session_start": 0.0}
+        payload.update(kw)
+        sf.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_full_rebuilds_buffer(self, dash, tmp_path):
+        sf = tmp_path / "status.json"
+        hub = dash.TelemetryHub(sf)
+        self._write(sf, seq=3, full=[self._f(1, 10), self._f(2, 20), self._f(3, 30)],
+                    history=[self._f(1, 10), self._f(2, 20), self._f(3, 30)])
+        hub.refresh()
+        assert [h["speed_kph"] for h in hub.snapshot()["history"]] == [10, 20, 30]
+
+    def test_delta_appends_without_duplicates(self, dash, tmp_path):
+        sf = tmp_path / "status.json"
+        hub = dash.TelemetryHub(sf)
+        self._write(sf, seq=3, full=[self._f(1, 10), self._f(2, 20), self._f(3, 30)],
+                    history=[self._f(1, 10), self._f(2, 20), self._f(3, 30)])
+        hub.refresh()
+        # 下一批增量：带一帧重叠（q=3），只有 4/5 是新的
+        self._write(sf, seq=5, history=[self._f(3, 30), self._f(4, 40),
+                                        self._f(5, 50)])
+        hub.refresh()
+        assert [h["speed_kph"] for h in hub.snapshot()["history"]] == [10, 20, 30, 40, 50]
+        # 同一份文件再读一次（10Hz 轮询可能重复读到）→ 不能重复追加
+        hub.refresh()
+        assert len(hub.snapshot()["history"]) == 5
+
+    def test_pause_keeps_connected(self, dash, tmp_path):
+        """暂停：数据时刻 t 停在 60 秒前，但 last_rx_t 是刚才 → 仍算连接。"""
+        sf = tmp_path / "status.json"
+        now = time.time()
+        sf.write_text(json.dumps({
+            "schema": 2, "seq": 100, "t": now - 60, "last_rx_t": now,
+            "frame": {"speed_kph": 0.0}, "history": [], "session_start": 0.0,
+        }), encoding="utf-8")
+        hub = dash.TelemetryHub(sf)
+        hub.refresh()
+        assert hub.stats()["connected"] is True
+        assert hub.stats()["last_rx_t"] == now
+
+    def test_old_schema_still_replaces(self, dash, tmp_path):
+        """老接收器（无 schema 字段）仍按整批覆盖处理，不能因升级而失效。"""
+        sf = tmp_path / "status.json"
+        now = time.time()
+        sf.write_text(json.dumps({
+            "t": now, "frame": {"speed_kph": 1.0}, "session_start": 0.0,
+            "history": [{"t": 0.1, "s": 11.0, "r": 6000, "g": 4, "th": 0.5,
+                         "bk": 0.0, "lap": 1, "wt": [80] * 4,
+                         "wf": [50] * 4, "gf": [0, 0, 0]}],
+        }), encoding="utf-8")
+        hub = dash.TelemetryHub(sf)
+        hub.refresh()
+        assert [h["speed_kph"] for h in hub.snapshot()["history"]] == [11.0]

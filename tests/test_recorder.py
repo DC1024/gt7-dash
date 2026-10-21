@@ -1,4 +1,5 @@
 """录制器回归测试 —— 今天修掉的每个 bug 都对应一个用例。"""
+import json
 import time
 
 from packets import build_packet
@@ -267,3 +268,51 @@ class TestSessionGapAfterSuspend:
         r = make_recorder(session_gap=300.0)
         r.session = rec.Session(session_id="x", started_at=1000.0)
         assert r._gap_before_batch(1e9, 0.0) == 0.0
+
+
+class TestStatusSchema2:
+    """状态文件增量协议（schema 2）：每帧带序号、只发增量、定期带全量。"""
+
+    def _sample(self, dec, t):
+        return dec.decode(build_packet(True, 40.0, 100, 50), t)
+
+    def test_payload_has_schema_seq_and_delta(self, rec, dec, make_recorder, tmp_path):
+        sf = tmp_path / "status.json"
+        r = make_recorder(status_file=str(sf))
+        t = time.time()
+        feed(r, dec, drive_frames(60, t0=t))
+        p = json.loads(sf.read_text(encoding="utf-8"))
+        assert p["schema"] == 2
+        # 最后一次写可能被 20Hz 节流挡在最后几帧之前 → seq 可以略小
+        assert 0 < p["seq"] <= r._frame_seq
+        assert p["last_rx_t"] > 0
+        assert len(p["history"]) <= 12, "增量只带最近 12 帧"
+        assert all("q" in h for h in p["history"]), "每帧都要有单调序号"
+
+    def test_full_snapshot_every_20_writes(self, rec, dec, make_recorder, tmp_path):
+        sf = tmp_path / "status.json"
+        r = make_recorder(status_file=str(sf))
+        r.session = rec.Session(session_id="x", started_at=0.0)
+        r.session.recording_started = True
+        t = 1000.0
+        for i in range(20):
+            r._write_status(self._sample(dec, t), t)
+            p = json.loads(sf.read_text(encoding="utf-8"))
+            assert ("full" in p) == (i == 19), f"第 {i+1} 次写的 full 不对"
+            t += 0.06
+
+    def test_duplicate_updates_rx_not_seq(self, rec, dec, make_recorder, tmp_path):
+        """暂停时的重复帧：只刷新 last_rx_t，不推进序号、不灌缓冲。"""
+        sf = tmp_path / "status.json"
+        r = make_recorder(status_file=str(sf))
+        t = time.time()
+        pkt = build_packet(True, 40.0, 100, 50, lap=1, last_lap=95000)
+        feed(r, dec, [(pkt, t)])
+        q1 = r._frame_seq
+        p1 = json.loads(sf.read_text(encoding="utf-8"))
+        feed(r, dec, [(pkt, t + 6.0)])          # 内容相同 → 去重
+        p2 = json.loads(sf.read_text(encoding="utf-8"))
+        assert r.duplicate_frames == 1
+        assert r._frame_seq == q1, "重复帧不能推进序号（数据没变）"
+        assert p2["last_rx_t"] > p1["last_rx_t"], "但收包时刻必须刷新"
+        assert len(p2["history"]) == len(p1["history"]), "重复帧不能灌进缓冲"

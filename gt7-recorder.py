@@ -84,6 +84,13 @@ PLAIN_MAGIC_U32 = 0x47375330
 PORT_HEARTBEAT = 33739# 格式 A：心跳 + 轮速/转速
 PORT_ADVANCED = 33740        # 格式 B/C：Addendum 扩展字段
 
+# —— 状态文件增量协议（schema 2）——
+# 每次写只带最近 N 帧（约 200ms，覆盖 10Hz 轮询 + 抖动），
+# 每 FULL_EVERY 次写附带一次完整 600 帧窗口（20Hz 下约 1 秒），
+# 供仪表盘冷启动/断档自愈。写入量从 1.4MB/s 降到约 0.12MB/s。
+_STATUS_DELTA_FRAMES = 12
+_STATUS_FULL_EVERY = 20
+
 # 会话状态机
 IDLE, SESSION_STARTED, SESSION_ACTIVE = "IDLE", "SESSION_STARTED", "SESSION_ACTIVE"
 
@@ -897,6 +904,16 @@ class Recorder:
         self._last_sig: tuple | None = None
         # 被跳过的重复帧计数
         self.duplicate_frames = 0
+        # —— 状态文件增量协议（schema 2）——
+        # 每帧一个单调序号：仪表盘按它去重/续接，不必每次重发 600 帧。
+        # 只在**数据帧**（非重复帧）上递增，暂停时序号不动。
+        self._frame_seq = 0
+        # 最近一次收到包（含被去重丢弃的重复帧）的时刻。
+        # 与 payload["t"]（数据时刻）分开：暂停时 t 不动，但它仍在涨，
+        # 仪表盘据此判「PS5 还在发」而不是「数据变了」。
+        self._last_rx_t = 0.0
+        # 状态文件写了几次（用来决定何时附带一次全量窗口）
+        self._status_writes = 0
         # 按端口统计收包数（诊断用：排查 176Hz 异常速率）
         self._recv_by_port: dict[str, int] = {}
         # —— 行车轨迹（用于画轨迹图）——
@@ -1242,6 +1259,9 @@ class Recorder:
            因为解密已提到批处理层（decode_many）统一做了，
            每包起一个解密进程的代价承受不起（60Hz × fork）。
         """
+        # 收到包的时刻（含随后被去重丢弃的重复帧）。暂停时数据不变，
+        # 但这个值一直在涨 —— 仪表盘用它区分「暂停」和「断线」。
+        self._last_rx_t = now
         # —— 赛道判定 ——
         # GT7 在菜单、停车场、赛道加载界面也会广播遥测（速度 0）。
         # 如果全落盘，一场比赛会混入大量静止帧，且容易被误认为「正在采集」。
@@ -1332,6 +1352,12 @@ class Recorder:
         )
         if sig == self._last_sig:
             self.duplicate_frames += 1
+            # 🔴 重复帧也要刷新状态文件：否则暂停超过 5 秒后 payload["t"]
+            #    不再更新，仪表盘会把「暂停」误报成「断线」。
+            #    new_frame=False → 不进环形缓冲、不推进序号（数据没变），
+            #    只更新 last_rx_t。schema 2 的负载很小，20Hz 写也不心疼。
+            if self.args.status_file:
+                self._write_status(sample, now, new_frame=False)
             return
         self._last_sig = sig
 
@@ -1546,7 +1572,8 @@ class Recorder:
         except OSError:
             pass
 
-    def _write_status(self, sample: TelemetrySample, now: float) -> None:
+    def _write_status(self, sample: TelemetrySample, now: float,
+                      new_frame: bool = True) -> None:
         """
         写状态文件（原子替换，避免仪表盘读到半截 JSON）。
 
@@ -1556,8 +1583,12 @@ class Recorder:
             60Hz 的数据被 10Hz 的轮询采到 → **曲线只剩 1/6 的点**。
             早期版本就是这样，history 数组里只有 1 帧。
 
-        解法：接收器在状态文件里自带一个 deque（最近 N 帧），
-        仪表盘拿到后整批覆盖自己的缓冲。
+        🔴 schema 2（增量协议）：
+            每帧带单调序号 `q`，状态文件只发**最近 12 帧**的增量，
+            仪表盘按 q 续接自己的 600 帧缓冲；每 20 次写（约 1 秒）
+            附带一次 `full`（完整 600 帧）用于冷启动/断档自愈。
+            旧版每次写都带 600 帧（约 72KB × 20Hz = 1.4MB/s），
+            在 SD 卡上是每天 120GB 的写入量。
 
         ⚠️ 落盘必须节流：仪表盘只需 10Hz，遥测是 60Hz。
             每帧都写 = 每秒 60 次写 20KB JSON，既浪费也拖慢收包主循环
@@ -1567,6 +1598,9 @@ class Recorder:
             🔴 踩过的坑：节流的`return` 原本放在**缓冲追加之前**，
                导致曲线缓冲也被限流 → history 只剩 10 帧（应为 600）。
                缓冲追加必须**每帧都做**，只有写文件才节流。
+
+        `new_frame=False`：重复帧（游戏暂停）只刷新 last_rx_t，
+        不进缓冲、不推进序号 —— 数据没变，序号也不该动。
         """
         # 当前是否在赛道上（仪表盘据此显示「在场/不在场」）
         # 口径必须与 _handle_sample 完全一致，否则界面会和实际记录不一致。
@@ -1576,26 +1610,36 @@ class Recorder:
         )
 
         # —— 先无条件追加缓冲（每帧都要，曲线靠它）——
-        self._status_buf.append({
-            "t": round(sample.t, 3),
-            "s": round(sample.speed_kph, 1),
-            "r": round(sample.rpm, 0),
-            "g": sample.gear,
-            "th": round(sample.throttle, 2),
-            "bk": round(sample.brake, 2),
-            "lap": sample.lap,
-            "wt": [round(x, 0) for x in sample.tyre_temp],
-            "wf": [round(x, 0) for x in sample.wheel_rads],
-            "gf": [round(x, 2) for x in sample.g_force],
-        })
+        if new_frame:
+            self._frame_seq += 1
+            self._status_buf.append({
+                "q": self._frame_seq,
+                "t": round(sample.t, 3),
+                "s": round(sample.speed_kph, 1),
+                "r": round(sample.rpm, 0),
+                "g": sample.gear,
+                "th": round(sample.throttle, 2),
+                "bk": round(sample.brake, 2),
+                "lap": sample.lap,
+                "wt": [round(x, 0) for x in sample.tyre_temp],
+                "wf": [round(x, 0) for x in sample.wheel_rads],
+                "gf": [round(x, 2) for x in sample.g_force],
+            })
 
         # —— 再节流写文件（最多 20Hz）——
         if now - self._last_status_write < 0.05:
             return
         self._last_status_write = now
+        self._status_writes += 1
 
         try:
             payload = {
+                "schema": 2,
+                # 最近一帧数据的序号（仪表盘按它续接/去重）
+                "seq": self._frame_seq,
+                # 最近一次**收到包**的时刻（含被去重的重复帧）。
+                # 与 t 分开：暂停时 t 不动、它在涨 → 仪表盘据此判「还连着」。
+                "last_rx_t": round(self._last_rx_t, 3),
                 "t": now,
                 "frame": sample.to_json(),
                 "frames_total": self.session.sample_count,
@@ -1623,8 +1667,9 @@ class Recorder:
                 "powertrain": self.session.powertrain,
                 "max_energy_recovery": round(self.session.max_energy_recovery, 3),
                 "packet_type": self.args.packet_type,
-                # 紧凑历史：字段名缩写以减小体积
-                "history": list(self._status_buf),
+                # 紧凑历史：只发最近 12 帧的**增量**（schema 2）。
+                # 仪表盘按 q 续接自己的 600 帧缓冲，重复的帧会被丢弃。
+                "history": list(self._status_buf)[-_STATUS_DELTA_FRAMES:],
                 # —— 新增：状态元信息 ——
                 # recording：是否已开始正式录制（vs 仅收到包但车没动）
                 "recording": self.session.recording_started,
@@ -1637,6 +1682,13 @@ class Recorder:
                 "moving_frames": self._moving_frames,
                 "track_min_frames": self.args.track_min_frames,
             }
+
+            # —— 完整窗口：每 N 次写附带一次（约 1 秒）——
+            # 仪表盘冷启动或断档时用它重建 600 帧缓冲；平时只吃增量。
+            # 放在增量之后：同一份 payload 里先有 full 就先用 full 重建，
+            # 再按 q 续接，避免重复。
+            if self._status_writes % _STATUS_FULL_EVERY == 0:
+                payload["full"] = list(self._status_buf)
 
             # —— 轨迹与 G-G 散点：体积大，单独降频到 2Hz ——
             #
