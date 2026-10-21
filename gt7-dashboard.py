@@ -1700,96 +1700,115 @@ def list_sessions(history_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
     return sessions
 
 
-def _dominant_car_code(frames: list[dict]) -> int:
-    """全场出现次数最多的非 0 car_code（一场通常同一辆车）。"""
-    from collections import Counter
-    cnt: Counter[int] = Counter()
-    for f in frames:
-        c = f.get("car_code") or 0
-        if c > 0:
-            cnt[c] += 1
-    return cnt.most_common(1)[0][0] if cnt else 0
-
-
 def analyze_session(path: Path) -> dict[str, Any]:
-    """读取一个已落盘场次做离线统计。"""
+    """读取一个已落盘场次做离线统计。
+
+    🔴 单趟聚合 + 按场次记忆化：
+       旧实现为了 max/avg/has_coords/layouts/car_code 把 21 万帧扫了 6 遍，
+       而 /compare、/raceline、/deviation 每个请求都会再调一次。
+       现在一次遍历拿全标量，结果挂在 FrameStore 上（文件不变就复用）。
+    """
     try:
         header, frames = _load_frames(path)
         if not frames:
             return {"error": "文件为空"}
-
-        speeds = [f["speed_kph"] for f in frames]
-        rpms = [f["rpm"] for f in frames]
-
-        # —— 车型：取全场 car_code 的非 0 众数 → 车名 ——
-        # （不同车对圈速影响极大，场次里必须能看出开的是什么车）
-        car_code = _dominant_car_code(frames)
-        car_name = ""
-        car_maker = ""
-        car_group = ""
-        if car_code:
-            import gt7analysis
-            info = gt7analysis.car_info_of(car_code,
-                                           str(path.parent / "cars.csv"))
-            car_name, car_maker, car_group = (info["name"], info["maker"],
-                                              info["group"])
-
-        # —— 按圈分组（clean_laps 自动剔除前圈 / 完赛离场圈 / 菜单态）——
-        # 🔴 走 _valid_laps 而不是直接调 clean_laps：分组只取决于文件内容，
-        #    而一次详情页渲染里 compare_session / race_line_session 要的是
-        #    同一份分组。各自算一遍 = 把 21 万帧重扫两到三遍。
-        _, laps, _ = _valid_laps(path)
-
-        # 圈完整性：距离口径（与 clean_laps / analyze_compare 同一判据）。
-        # clean_laps 只删首/末残圈，中间圈可能是一次中途退出（只有 55% 圈长），
-        # 时长却照样 >20s —— 只判时长会把它当最快圈。
-        import gt7analysis
-        dists, med_d = gt7analysis.lap_distances(laps)
-
-        lap_times = []
-        for lap_no, fs in sorted(laps.items()):
-            if len(fs) < 2:
-                continue
-            # 用帧数×间隔估算更稳：只取首尾两帧的跨度，
-            # 中间即使丢包也不影响总时长。
-            duration = fs[-1]["t"] - fs[0]["t"]
-            dist = dists.get(lap_no, 0.0)
-            # ⚠️ 一圈至少要 20 秒（GT7 最短赛道也1分多）。
-            #    数据不足 20 秒说明这是「采集刚开始」或「刚进圈」，
-            #    此时报出来的圈速是假的，宁可不给。
-            if duration < 20.0 or not gt7analysis.lap_is_complete(dist, med_d):
-                lap_times.append(
-                    {"lap": lap_no, "time": round(duration, 3),
-                     "dist_m": round(dist, 1), "incomplete": True}
-                )
-                continue
-            lap_times.append({"lap": lap_no, "time": round(duration, 3),
-                              "dist_m": round(dist, 1)})
-
-        valid_laps = [l for l in lap_times if not l.get("incomplete")]
-
-        return {
-            "header": header,
-            "frame_count": len(frames),
-            "duration": round(frames[-1]["t"] - frames[0]["t"], 1),
-            "max_speed": round(max(speeds), 1),
-            "avg_speed": round(sum(speeds) / len(speeds), 1),
-            "max_rpm": round(max(rpms), 0),
-            "laps": lap_times,
-            "best_lap": min(valid_laps, key=lambda x: x["time"]) if valid_laps else None,
-            "has_coords": any(f.get("has_coords") for f in frames),
-            "car_code": car_code,
-            "car_name": car_name,
-            "car_maker": car_maker,
-            "car_group": car_group,
-            "layouts": {
-                k: sum(1 for f in frames if f.get("layout") == k)
-                for k in ("A", "B", "C")
-                if any(f.get("layout") == k for f in frames)
-            },
-        }
+        return frames.memo_compute(
+            "analyze_session", lambda: _analyze_frames(path, header, frames))
     except (OSError, json.JSONDecodeError, ValueError) as e:
         return {"error": f"解析失败: {e}"}
+
+
+def _analyze_frames(path: Path, header: dict,
+                    frames: "FrameStore") -> dict[str, Any]:
+    """analyze_session 的实际计算（单趟聚合）。"""
+    import gt7analysis
+
+    # —— 单趟聚合：速度 / 转速 / 坐标 / 布局 / 车型一次拿全 ——
+    max_speed = 0.0
+    sum_speed = 0.0
+    max_rpm = 0.0
+    has_coords = False
+    layouts: dict[str, int] = {}
+    car_cnt: dict[int, int] = {}
+    for f in frames:
+        sp = f.get("speed_kph") or 0.0
+        if sp > max_speed:
+            max_speed = sp
+        sum_speed += sp
+        rpm = f.get("rpm") or 0.0
+        if rpm > max_rpm:
+            max_rpm = rpm
+        if not has_coords and f.get("has_coords"):
+            has_coords = True
+        lay = f.get("layout")
+        if lay:
+            layouts[lay] = layouts.get(lay, 0) + 1
+        cc = f.get("car_code") or 0
+        if cc > 0:
+            car_cnt[cc] = car_cnt.get(cc, 0) + 1
+
+    # —— 车型：取全场 car_code 的非 0 众数 → 车名 ——
+    # （不同车对圈速影响极大，场次里必须能看出开的是什么车）
+    car_code = max(car_cnt, key=car_cnt.get) if car_cnt else 0
+    car_name = ""
+    car_maker = ""
+    car_group = ""
+    if car_code:
+        info = gt7analysis.car_info_of(car_code, str(path.parent / "cars.csv"))
+        car_name, car_maker, car_group = (info["name"], info["maker"],
+                                          info["group"])
+
+    # —— 按圈分组（clean_laps 自动剔除前圈 / 完赛离场圈 / 菜单态）——
+    # 🔴 走 _valid_laps 而不是直接调 clean_laps：分组只取决于文件内容，
+    #    而一次详情页渲染里 compare_session / race_line_session 要的是
+    #    同一份分组。各自算一遍 = 把 21 万帧重扫两到三遍。
+    _, laps, _ = _valid_laps(path)
+
+    # 圈完整性：距离口径（与 clean_laps / analyze_compare 同一判据）。
+    # clean_laps 只删首/末残圈，中间圈可能是一次中途退出（只有 55% 圈长），
+    # 时长却照样 >20s —— 只判时长会把它当最快圈。
+    dists, med_d = gt7analysis.lap_distances(laps)
+
+    lap_times = []
+    for lap_no, fs in sorted(laps.items()):
+        if len(fs) < 2:
+            continue
+        # 用帧数×间隔估算更稳：只取首尾两帧的跨度，
+        # 中间即使丢包也不影响总时长。
+        duration = (fs[-1].get("t") or 0.0) - (fs[0].get("t") or 0.0)
+        dist = dists.get(lap_no, 0.0)
+        # ⚠️ 一圈至少要 20 秒（GT7 最短赛道也1分多）。
+        #    数据不足 20 秒说明这是「采集刚开始」或「刚进圈」，
+        #    此时报出来的圈速是假的，宁可不给。
+        if duration < 20.0 or not gt7analysis.lap_is_complete(dist, med_d):
+            lap_times.append(
+                {"lap": lap_no, "time": round(duration, 3),
+                 "dist_m": round(dist, 1), "incomplete": True}
+            )
+            continue
+        lap_times.append({"lap": lap_no, "time": round(duration, 3),
+                          "dist_m": round(dist, 1)})
+
+    valid_laps = [l for l in lap_times if not l.get("incomplete")]
+
+    return {
+        "header": header,
+        "frame_count": len(frames),
+        "duration": round((frames[-1].get("t") or 0.0)
+                          - (frames[0].get("t") or 0.0), 1),
+        "max_speed": round(max_speed, 1),
+        "avg_speed": round(sum_speed / len(frames), 1),
+        "max_rpm": round(max_rpm, 0),
+        "laps": lap_times,
+        "best_lap": min(valid_laps, key=lambda x: x["time"]) if valid_laps else None,
+        "has_coords": has_coords,
+        "car_code": car_code,
+        "car_name": car_name,
+        "car_maker": car_maker,
+        "car_group": car_group,
+        # 只报 A/B/C 三种已知布局（老数据可能没有 layout 字段）
+        "layouts": {k: layouts[k] for k in ("A", "B", "C") if k in layouts},
+    }
 
 
 # ---------------------------------------------------------------------------
