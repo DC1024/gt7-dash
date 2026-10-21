@@ -11,7 +11,7 @@ import json
 import pytest
 
 from gt7analysis import (analyze_compare, car_name_of, clean_laps,
-                         split_laps)
+                         lap_distances, lap_is_complete, split_laps)
 
 
 def _lap(lap, n, base_spd, t0, brake_zone=None):
@@ -97,6 +97,74 @@ class TestCleanLaps:
 
     def test_empty_input(self):
         assert clean_laps([]) == {}
+
+
+class TestLapCompleteness:
+    """圈完整性判据（距离口径，P0-1）。
+
+    阈值来自 6 场 57 圈的真实分布：残圈 3.4%~61.2%、完整圈 93.4%~117%、
+    时钟跳变假圈 149%~362%。下界 0.90 落在 61→93 的空档，上界 1.25
+    落在 117→149 的空档。
+    """
+
+    @pytest.mark.parametrize("ratio,want", [
+        (0.34, False),      # 刚进圈
+        (0.61, False),      # 中途退出（真实数据里的那个假最快圈）
+        (0.89, False),      # 差一个弯
+        (0.90, True),       # 下界本身算完整
+        (0.934, True),      # 实测最短的合法圈（切弯，帧率正常）
+        (1.00, True),
+        (1.17, True),       # 滚动发车的出场圈
+        (1.25, True),       # 上界本身算完整
+        (1.26, False),      # 超过上界
+        (1.49, False),      # 休眠后的时钟跳变
+        (3.62, False),
+    ])
+    def test_boundaries(self, ratio, want):
+        assert lap_is_complete(ratio * 1000.0, 1000.0) is want
+
+    def test_unknown_median_keeps_lap(self):
+        """中位数不可用（圈数 <3）时判不了 → 不误杀。"""
+        assert lap_is_complete(100.0, 0.0) is True
+
+    def test_median_needs_three_laps(self):
+        two = split_laps(_lap(1, 100, 100.0, 0.0) + _lap(2, 100, 100.0, 10.0))
+        _, med = lap_distances(two)
+        assert med == 0.0
+
+    def test_partial_first_lap_70pct_is_dropped(self):
+        """录制从一圈的 30% 处开始 → 首圈只有 70%，必须剔除。
+
+        旧判据是「<45% 中位数」，70% 会被保留，进而成为最快圈。
+        """
+        t = 1000.0
+        frames = _lap(1, 5040, 300.0, t)          # 7200 帧的 70%
+        t += 5040 / 60
+        for ln in (2, 3, 4):
+            frames += _lap(ln, 7200, 300.0, t)
+            t += 7200 / 60
+        assert 1 not in clean_laps(frames)
+
+    def test_clock_jump_lap_dropped_when_first(self):
+        """首圈距离是中位数的 2 倍（休眠导致两场合并）→ 不能算完整圈。"""
+        t = 1000.0
+        frames = _lap(1, 14400, 300.0, t)         # 200%
+        t += 14400 / 60
+        for ln in (2, 3, 4):
+            frames += _lap(ln, 7200, 300.0, t)
+            t += 7200 / 60
+        assert 1 not in clean_laps(frames)
+
+    def test_middle_partial_lap_is_kept(self):
+        """中间圈即使只有 55% 也不从分组里删——它可能是一次真实的事故圈，
+        由分析层标 incomplete，而不是从数据里消失。"""
+        t = 1000.0
+        frames = _lap(1, 7200, 300.0, t)
+        t += 7200 / 60
+        frames += _lap(2, 3960, 300.0, t)         # 55%
+        t += 3960 / 60
+        frames += _lap(3, 7200, 300.0, t)
+        assert set(clean_laps(frames)) == {1, 2, 3}
 
 
 class TestRefLapSelection:

@@ -876,6 +876,53 @@ def _median(xs: list[float]) -> float:
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
+# —— 圈完整性：距离口径 ————————————————————————————
+#
+# 为什么不看时长：同一赛道换台车、下雨、堵车，圈速能差 20 秒；距离不会。
+# 为什么不读赛道库：新赛道可能还没识别，而且 tracks.json 的 ref_len_m 本身
+#   也是同一套速度积分算出来的，拿它当基准是循环论证。
+#
+# 上下界都是**实测分布里的空档**（6 场 57 圈，2026-10-21）：
+#   残圈 / 中途退出：3.4% ~ 61.2%
+#   完整圈：        93.4% ~ 117%（117% 是滚动发车的出场圈）
+#   时钟跳变假圈：  149% ~ 362%（主机休眠，同一文件塞了两场比赛）
+# 0.90 落在 61→93 的空档，1.25 落在 117→149 的空档。
+_LAP_DIST_LO = 0.90
+_LAP_DIST_HI = 1.25
+# 圈数少于这个数时中位数不可信：2 圈时它就是两者的平均值，
+# 一个残圈就能把正常圈顶成 182%。
+_LAP_MEDIAN_MIN_N = 3
+
+
+def lap_distances(laps: dict[int, list[dict]]) -> tuple[dict[int, float], float]:
+    """每圈积分距离 + 圈长中位数（残圈判据的唯一事实源）。
+
+    返回 ``(dists, med)``。``med == 0.0`` 表示圈数太少（<3），中位数不可用，
+    调用方应退回「只判时长」的旧口径，不要拿它做距离判断。
+    """
+    dists = {n: _lap_distance_m(fs) for n, fs in laps.items()}
+    med = (_median(list(dists.values()))
+           if len(dists) >= _LAP_MEDIAN_MIN_N else 0.0)
+    return dists, med
+
+
+def lap_is_complete(dist: float, med: float,
+                    lo: float = _LAP_DIST_LO, hi: float = _LAP_DIST_HI) -> bool:
+    """这一圈是否跑完了整条赛道（距离落在中位圈长的 [lo, hi] 区间）。
+
+    🔴 上界与下界同样重要：
+       · 下界挡「中途退出 / 刚进圈」的残圈；
+       · 上界挡「主机休眠后两场写进同一文件」和时钟跳变造成的假圈
+         （实测 149%~362%）。只卡下界会让它们通过。
+
+    ``med <= 0``（圈数 <3，判不了）返回 True —— **判不了就别误杀**，
+    与修复前的行为保持一致。
+    """
+    if med <= 0:
+        return True
+    return lo * med <= dist <= hi * med
+
+
 def clean_laps(frames: list[dict]) -> dict[int, list[dict]]:
     """按圈分组并剔除假圈（保持帧顺序）。
 
@@ -887,8 +934,11 @@ def clean_laps(frames: list[dict]) -> dict[int, list[dict]]:
     🔑 主判据 = **圈距离**（速度积分，单位米）。
        真实圈跑完一整条赛道，各圈距离高度一致（实测同场 5400~5800m）；
        假圈的距离只有几百米（前圈静止/末圈滑行离场）。
-       取各圈距离的**中位数** m，圈距离 < 45% × m 判为假圈。
-       用中位数而非最大值，低速场次也稳。
+       取各圈距离的**中位数** m，落在 [0.90m, 1.25m] 之外的判为假圈
+       （判据见 lap_is_complete：下界挡残圈，上界挡休眠/时钟跳变）。
+       用中位数而非均值：一场 12 圈里混进 2 个 22 小时的假圈，均值会被
+       拉到 126%（正常圈全成了「79%」），中位数仍是 100%。
+       ⚠️ 圈数 <3 时中位数不可信，退回旧的「<45% 中位数」弱判据。
 
     辅助判据 = 峰值速度：某圈几乎全静止（峰值 < 30% × 全场最高峰值）也是假圈。
 
@@ -906,16 +956,20 @@ def clean_laps(frames: list[dict]) -> dict[int, list[dict]]:
     if len(ordered) < 2:                 # 单圈：首尾同一圈，不剔
         return laps
 
-    dists = {n: _lap_distance_m(fs) for n, fs in laps.items()}
-    med_d = _median(list(dists.values()))
+    dists, med_d = lap_distances(laps)
     peaks = {n: _lap_peak_kph(fs) for n, fs in laps.items()}
     max_p = max(peaks.values())
 
     first, last = ordered[0], ordered[-1]
     out = dict(laps)
     for n in (first, last):
-        # 距离过短 → 没跑完赛道（滑行离场 / 原地静止）
-        short = med_d > 0 and dists[n] < 0.45 * med_d
+        if med_d > 0:
+            # 距离偏离中位圈长太多 → 没跑完整圈（残圈 / 多场合并）
+            short = not lap_is_complete(dists[n], med_d)
+        else:
+            # 圈数 <3：中位数不可信，退回弱判据（只挡「几乎没跑」的残片）
+            med_all = _median(list(dists.values()))
+            short = med_all > 0 and dists[n] < 0.45 * med_all
         # 几乎全静止 → 排队 / 停车场
         stalled = max_p > 0 and peaks[n] < 0.30 * max_p
         if short or stalled:
