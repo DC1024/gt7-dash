@@ -94,8 +94,6 @@ def _commits(rev_range: str) -> list[tuple[str, str, str]]:
             continue
         sha, subj = parts[0], parts[1]
         body = parts[2] if len(parts) > 2 else ""
-        if sha in _CHANGELOG_ONLY:
-            continue
         out.append((sha, subj, body))
     return out
 
@@ -104,6 +102,12 @@ def _section_body(commits: list[tuple[str, str, str]]) -> str:
     buckets: dict[str, list[str]] = {k: [] for k, _ in SECTIONS}
     other: list[str] = []
     for _sha, subj, _body in commits:
+        # 🔴 碰过 CHANGELOG.md 的提交不列入正文（否则"更新 CHANGELOG"的提交
+        #    会把自己写进去，下次生成内容又变，永远追不上）。
+        #    ⚠️ 但**不能**从版本识别里排除：版本号 bump 的那个提交往往
+        #    同时改了 CHANGELOG，排掉它整个版本段就消失了（踩过）。
+        if _sha in _CHANGELOG_ONLY:
+            continue
         m = TYPE_RE.match(subj.strip())
         if not m:
             other.append(subj.strip())
@@ -204,6 +208,24 @@ def build() -> str:
             merged[-1][1].extend(items)
         else:
             merged.append((ver, list(items)))
+
+    # 🔴 补空段：版本号刚 bump、但之后的提交全是「碰过 CHANGELOG.md」被排除，
+    #    这个版本就会一条记录都没有、整个段落消失 —— 而"这个版本发过"是事实。
+    #    补一条明确的「无变更记录」，比默默少一段好。
+    have = {v for v, _ in merged}
+    for i in sorted(ver_at):
+        v = ver_at[i]
+        if v not in have:
+            merged.append((v, []))
+            have.add(v)
+
+    def _vkey(item):
+        try:
+            return tuple(int(x) for x in item[0].split("."))
+        except ValueError:
+            return (0,)          # 「早期（无版本文件）」排最后
+    merged.sort(key=_vkey)
+
     for ver, items in reversed(merged):
         title = ver if ver == "早期（无版本文件）" else f"v{ver}"
         body = _section_body(items)
