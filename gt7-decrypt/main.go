@@ -60,6 +60,13 @@ func main() {
 	flag.BoolVar(&showVersion, "version", false, "打印版本号后退出")
 	flag.Parse()
 
+	// 🔴 兜底：ldflags 写错（变量名不对、shell 把 ${VERSION} 展开成空串）
+	//    时 version 会是 ""，`--version` 就只打印一个 "gt7-decrypt"，
+	//    等于"声称有版本但看不出是哪版"。宁可显示 dev，也不要空白。
+	if version == "" {
+		version = "dev"
+	}
+
 	if showVersion {
 		fmt.Printf("gt7-decrypt %s\n", version)
 		return

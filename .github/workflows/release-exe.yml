@@ -83,6 +83,11 @@ jobs:
 
       - name: 交叉编译解密器（windows/amd64）
         working-directory: gt7-decrypt
+        # 🔴 必须显式 bash：windows-latest 的默认 shell 是 PowerShell，
+        #    而 `$VERSION` 在 PowerShell 里是**普通变量**（环境变量要写
+        #    `$env:VERSION`），结果 `-X main.version=` 注入成空串，
+        #    `--version` 只打印 "gt7-decrypt"。实测踩过。
+        shell: bash
         env:
           GOOS: windows
           GOARCH: amd64
