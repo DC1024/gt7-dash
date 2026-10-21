@@ -7,6 +7,8 @@
 
 ### 修复
 - checkout 需要完整历史与 tag，否则 CHANGELOG 检查必然红（`ci`）
+### 测试
+- v1.4.2 之前的提交没有 CHANGELOG.md，跳过而不是报错（`changelog`）
 ### 工程
 - 前端 ESLint / 发行说明自动化 / 镜像 digest / 日志轮转 / metrics（`v1.4.2`）
 
