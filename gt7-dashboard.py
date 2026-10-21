@@ -406,15 +406,22 @@ _CACHE_LOCK = threading.RLock()
 # 提到 6 条 + 总帧数上限 250 万后，近期看过的场次都留在缓存里，二次进入秒开。
 _FRAME_CACHE_MAX_ENTRIES = 6
 _FRAME_CACHE_MAX_FRAMES = 2_500_000
+# 实测每帧常驻约 238B（16 个列 + 4 个四元数组列）。2.5M 帧 ≈ 567MB，
+# 对 1GB 的 Pi/小容器是会把服务打死的量级 —— 再加一道**字节**上限，
+# 让「能缓存几场」由内存预算决定，而不是帧数。
+_FRAME_BYTES_EST = 240
+_FRAME_CACHE_MAX_BYTES = 320 * 1024 * 1024
 _CACHED_FRAMES_TOTAL = 0
+_CACHED_BYTES_TOTAL = 0
 
 
 def _frames_cache_forget(key: str) -> None:
     """移除一个缓存条目并维护帧数计数（调用方需持 _CACHE_LOCK）。"""
     ent = _FRAMES_CACHE.pop(key, None)
     if ent is not None:
-        global _CACHED_FRAMES_TOTAL
+        global _CACHED_FRAMES_TOTAL, _CACHED_BYTES_TOTAL
         _CACHED_FRAMES_TOTAL -= len(ent[3])
+        _CACHED_BYTES_TOTAL -= len(ent[3]) * _FRAME_BYTES_EST
 
 
 def _frames_cache_evict() -> None:
@@ -424,7 +431,8 @@ def _frames_cache_evict() -> None:
     把条目移到末尾续命，从而成为真正的 LRU 而非纯 FIFO。
     """
     while _FRAMES_CACHE and (len(_FRAMES_CACHE) > _FRAME_CACHE_MAX_ENTRIES
-                             or _CACHED_FRAMES_TOTAL > _FRAME_CACHE_MAX_FRAMES):
+                             or _CACHED_FRAMES_TOTAL > _FRAME_CACHE_MAX_FRAMES
+                             or _CACHED_BYTES_TOTAL > _FRAME_CACHE_MAX_BYTES):
         _frames_cache_forget(next(iter(_FRAMES_CACHE)))
 
 
@@ -1020,8 +1028,9 @@ def _load_frames(path: Path) -> tuple[dict, FrameStore]:
         #    超过上限后 evict 会在每次冷解析前清空缓存，缓存退化成 1 场。
         _frames_cache_forget(key)
         _FRAMES_CACHE[key] = (sig[0], sig[1], header, store)
-        global _CACHED_FRAMES_TOTAL
+        global _CACHED_FRAMES_TOTAL, _CACHED_BYTES_TOTAL
         _CACHED_FRAMES_TOTAL += len(store)
+        _CACHED_BYTES_TOTAL += len(store) * _FRAME_BYTES_EST
         # 插入之后再驱逐：放在插入前会让「本次新增」逃过上限检查。
         _frames_cache_evict()
     return header, store

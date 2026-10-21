@@ -30,6 +30,7 @@ def _reset(dash) -> None:
     with dash._CACHE_LOCK:
         dash._FRAMES_CACHE.clear()
         dash._CACHED_FRAMES_TOTAL = 0
+        dash._CACHED_BYTES_TOTAL = 0
 
 
 def _cached_frames(dash) -> int:
@@ -71,3 +72,14 @@ def test_frames_cache_evicts_to_cap(dash, tmp_path):
     finally:
         dash._FRAME_CACHE_MAX_FRAMES = old_cap
         _reset(dash)
+
+
+def test_frames_cache_bytes_counter(dash, tmp_path):
+    """字节计数也要守恒：它才是「能缓存几场」的真正上限。"""
+    _reset(dash)
+    p = tmp_path / "s.jsonl"
+    for n in (100, 200):
+        _write_session(p, n, t0=n)
+        dash._load_frames(p)
+        assert dash._CACHED_BYTES_TOTAL == n * dash._FRAME_BYTES_EST
+    assert dash._CACHED_FRAMES_TOTAL == 200
