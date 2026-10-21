@@ -1671,7 +1671,10 @@ class Recorder:
             return 0
         cutoff = now - retention * 86400
         removed = 0
-        for f in sorted(trash.glob("*.jsonl")):
+        # 🔴 必须同时匹配 .jsonl.gz：归档只换后缀，回收站里的场次可能是
+        #    压缩过的。只 glob("*.jsonl") 会让保留期对归档场次完全失效。
+        for f in sorted(list(trash.glob("*.jsonl"))
+                        + list(trash.glob("*.jsonl.gz"))):
             try:
                 if f.stat().st_mtime < cutoff:
                     f.unlink()

@@ -24,6 +24,34 @@ def test_trash_cleanup_removes_only_expired(rec, make_recorder, tmp_path):
     assert recent.exists(), "未超期文件必须保留"
 
 
+def test_trash_cleanup_removes_expired_archived_gz(rec, make_recorder, tmp_path):
+    """归档后的 .jsonl.gz 也必须按保留期清理（P1-5）。
+
+    归档只换后缀，所以回收站里的文件可能是 .jsonl.gz；
+    原来的 `glob("*.jsonl")` 匹配不到它们 —— 保留期对归档场次完全失效，
+    _trash 会无限增长（只有手动 purge 能清）。
+    """
+    r = make_recorder(output=str(tmp_path), trash_retention_days=30)
+    trash = tmp_path / "_trash"
+    trash.mkdir()
+    old_plain = trash / "old_plain.jsonl"
+    old_plain.write_text("{}")
+    old_gz = trash / "old_archived.jsonl.gz"
+    old_gz.write_bytes(b"\x1f\x8b\x08\x00")
+    recent_gz = trash / "recent_archived.jsonl.gz"
+    recent_gz.write_bytes(b"\x1f\x8b\x08\x00")
+    old_t = time.time() - 31 * 86400
+    for f in (old_plain, old_gz):
+        os.utime(f, (old_t, old_t))
+
+    removed = r._cleanup_trash()
+
+    assert removed == 2, f"应删 1 个 .jsonl + 1 个 .jsonl.gz，实际 {removed}"
+    assert not old_plain.exists(), "超期 .jsonl 应被删除"
+    assert not old_gz.exists(), "超期 .jsonl.gz 应被删除"
+    assert recent_gz.exists(), "未超期 .jsonl.gz 必须保留"
+
+
 def test_trash_retention_zero_disables(rec, make_recorder, tmp_path):
     r = make_recorder(output=str(tmp_path), trash_retention_days=0)
     trash = tmp_path / "_trash"
