@@ -894,28 +894,62 @@ _LAP_DIST_HI = 1.25
 _LAP_MEDIAN_MIN_N = 3
 
 
-def lap_distances(laps: dict[int, list[dict]]) -> tuple[dict[int, float], float]:
-    """每圈积分距离 + 圈长中位数（残圈判据的唯一事实源）。
+def _reference_lap_dist(dists: dict[int, float]) -> float:
+    """从各圈距离里估出「这条赛道一圈有多长」（残圈判据的基准）。
 
-    返回 ``(dists, med)``。``med == 0.0`` 表示圈数太少（<3），中位数不可用，
+    🔴 为什么不能直接用中位数：真实数据里出现过 4 圈的场次，其中 2 圈是
+       时钟跳变的假圈（149% / 304%）、1 圈是 3% 的碎片，中位数被抬到 124%，
+       反而把唯一正常的 100% 圈压成 80% 判成残圈。
+       中位数只有在「一半以上是正常圈」时才稳，4 圈里 3 圈异常就失效。
+
+    做法：
+      1. 先找**最大的「同长度簇」**——以每个值为中心，±10% 内的成员数最多者。
+         正常圈彼此只差 1~3%，很容易成簇；假圈各不相同的长度落单。
+      2. 簇里 ≥2 圈 → 取簇内中位数（对 1~2% 的丢包误差免疫）。
+      3. 一个簇都没有（每圈长度都不同）→ 取「非碎片里最短的」：
+         时钟跳变/多场合并只会让距离**变长**，碎片只会更短，
+         所以最短的那个完整候选就是赛道长度。
+
+    圈数 <3 时返回 0.0：样本太少，判不了。
+    """
+    vals = [v for v in dists.values() if v > 0]
+    if len(vals) < _LAP_MEDIAN_MIN_N:
+        return 0.0
+
+    best_center = 0.0
+    best_members: list[float] = []
+    for c in vals:
+        members = [v for v in vals if 0.90 * c <= v <= 1.10 * c]
+        if (len(members) > len(best_members)
+                or (len(members) == len(best_members) and c < best_center)):
+            best_center, best_members = c, members
+    if len(best_members) >= 2:
+        return _median(best_members)
+
+    non_frag = [v for v in vals if v >= 0.30 * max(vals)]
+    return min(non_frag) if non_frag else _median(vals)
+
+
+def lap_distances(laps: dict[int, list[dict]]) -> tuple[dict[int, float], float]:
+    """每圈积分距离 + 基准圈长（残圈判据的唯一事实源）。
+
+    返回 ``(dists, ref)``。``ref == 0.0`` 表示圈数太少（<3），基准不可用，
     调用方应退回「只判时长」的旧口径，不要拿它做距离判断。
     """
     dists = {n: _lap_distance_m(fs) for n, fs in laps.items()}
-    med = (_median(list(dists.values()))
-           if len(dists) >= _LAP_MEDIAN_MIN_N else 0.0)
-    return dists, med
+    return dists, _reference_lap_dist(dists)
 
 
 def lap_is_complete(dist: float, med: float,
                     lo: float = _LAP_DIST_LO, hi: float = _LAP_DIST_HI) -> bool:
-    """这一圈是否跑完了整条赛道（距离落在中位圈长的 [lo, hi] 区间）。
+    """这一圈是否跑完了整条赛道（距离落在基准圈长的 [lo, hi] 区间）。
 
     🔴 上界与下界同样重要：
        · 下界挡「中途退出 / 刚进圈」的残圈；
        · 上界挡「主机休眠后两场写进同一文件」和时钟跳变造成的假圈
          （实测 149%~362%）。只卡下界会让它们通过。
 
-    ``med <= 0``（圈数 <3，判不了）返回 True —— **判不了就别误杀**，
+    ``ref <= 0``（圈数 <3，判不了）返回 True —— **判不了就别误杀**，
     与修复前的行为保持一致。
     """
     if med <= 0:
@@ -934,11 +968,10 @@ def clean_laps(frames: list[dict]) -> dict[int, list[dict]]:
     🔑 主判据 = **圈距离**（速度积分，单位米）。
        真实圈跑完一整条赛道，各圈距离高度一致（实测同场 5400~5800m）；
        假圈的距离只有几百米（前圈静止/末圈滑行离场）。
-       取各圈距离的**中位数** m，落在 [0.90m, 1.25m] 之外的判为假圈
+       取各圈距离的**基准圈长** m（见 _reference_lap_dist：最大同长簇的中位数，
+       无簇时取非碎片里最短的），落在 [0.90m, 1.25m] 之外的判为假圈
        （判据见 lap_is_complete：下界挡残圈，上界挡休眠/时钟跳变）。
-       用中位数而非均值：一场 12 圈里混进 2 个 22 小时的假圈，均值会被
-       拉到 126%（正常圈全成了「79%」），中位数仍是 100%。
-       ⚠️ 圈数 <3 时中位数不可信，退回旧的「<45% 中位数」弱判据。
+       ⚠️ 圈数 <3 时基准不可用，退回旧的「<45% 中位数」弱判据。
 
     辅助判据 = 峰值速度：某圈几乎全静止（峰值 < 30% × 全场最高峰值）也是假圈。
 
@@ -2177,10 +2210,19 @@ def analyze_compare(frames: list[dict] | None = None, ref_lap_no: int | None = N
 
     clean_laps 会剔除首/末假圈（前圈、完赛离场圈）与菜单态，
     否则 25s 的完赛余圈会被当成「最快圈」画出离场的小段赛车线。
+    本函数再按**圈长**（0.90~1.25 × 基准圈长）过滤一遍：中间圈的残圈
+    clean_laps 不删（那可能是一次真实的事故圈），只能在这里挡——
+    否则一段跑了 55% 的圈会以「更短的时长」被选成参考圈。
     """
     laps = clean_laps(frames) if grouped is None else grouped
+    # 圈完整性：距离口径（与 clean_laps / analyze_session 同一判据）。
+    # 只过滤「帧数 ≥30」不够：一次中途退出可能跑了 55% 圈长、60 多秒，
+    # 帧数完全够，时长也够，于是被当成最快圈。med==0（圈数 <3）时
+    # lap_is_complete 返回 True，保持旧行为。
+    dists, med_d = lap_distances(laps)
     samples = {n: lap_samples(fs) for n, fs in laps.items()
-               if len(fs) >= 30}                     # 少于 30 帧的伪圈跳过
+               if len(fs) >= 30
+               and lap_is_complete(dists.get(n, 0.0), med_d)}
     if not samples:
         return {"laps_analyzed": 0, "lap_summary": [], "ref_lap": None,
                 "cur_lap": None, "time_diff": {"step": step, "grid": [],

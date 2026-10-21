@@ -32,6 +32,7 @@ def _lap(lap, n, base_spd, t0, brake_zone=None):
         ang = dist / 900.0
         frames.append({
             "t": t0 + i * dt, "lap": lap, "speed_kph": spd,
+            "rpm": 6000.0 if spd else 900.0,
             "throttle": 0.0 if brake else 0.6, "brake": brake,
             "g_force": [-0.5 if brake else 0.2, 0.3, 0.0],
             "car_x": 100.0 + 900.0 * (ang if brake_zone else dist / 40.0),
@@ -132,6 +133,43 @@ class TestLapCompleteness:
         _, med = lap_distances(two)
         assert med == 0.0
 
+    def test_reference_survives_half_outliers(self):
+        """4 圈里 2 个时钟跳变 + 1 个碎片：基准不能被抬到 124%。
+
+        真实场次 20261021_223244 的形状：7173m（正常）/ 10709m（1.5 圈）/
+        21823m（3 圈）/ 243m（碎片）。普通中位数 = 8941m，会把正常的
+        7173m 压成 80% 判成残圈 —— 所以基准要取「最大同长簇」，
+        没有簇时取非碎片里最短的。
+        """
+        t = 1000.0
+        frames = _lap(1, 7200, 300.0, t)          # 基准 ~10000m
+        t += 7200 / 60
+        frames += _lap(2, 10800, 300.0, t)        # 1.5 倍
+        t += 10800 / 60
+        frames += _lap(3, 21600, 300.0, t)        # 3 倍
+        t += 21600 / 60
+        frames += _lap(4, 240, 300.0, t)          # 3% 碎片
+        dists, ref = lap_distances(split_laps(frames))
+        assert ref == pytest.approx(dists[1], rel=0.02)
+        assert lap_is_complete(dists[1], ref) is True
+        assert lap_is_complete(dists[2], ref) is False
+        assert lap_is_complete(dists[3], ref) is False
+        assert lap_is_complete(dists[4], ref) is False
+
+    def test_reference_prefers_largest_cluster(self):
+        """正常圈彼此只差 1~2% → 成簇；单个 200% 假圈不该影响基准。"""
+        t = 1000.0
+        frames = _lap(1, 7200, 300.0, t)
+        t += 7200 / 60
+        frames += _lap(2, 7200, 303.0, t)         # +1%
+        t += 7200 / 60
+        frames += _lap(3, 7200, 297.0, t)         # -1%
+        t += 7200 / 60
+        frames += _lap(4, 14400, 300.0, t)        # 200%
+        dists, ref = lap_distances(split_laps(frames))
+        assert ref == pytest.approx(dists[1], rel=0.02)
+        assert lap_is_complete(dists[4], ref) is False
+
     def test_partial_first_lap_70pct_is_dropped(self):
         """录制从一圈的 30% 处开始 → 首圈只有 70%，必须剔除。
 
@@ -165,6 +203,38 @@ class TestLapCompleteness:
         t += 3960 / 60
         frames += _lap(3, 7200, 300.0, t)
         assert set(clean_laps(frames)) == {1, 2, 3}
+
+    @staticmethod
+    def _race_with_partial_middle():
+        """4 圈：第 2 圈只跑了 55%（66s，时长 >20s，帧数也够）。"""
+        t = 1000.0
+        frames = _lap(1, 7200, 300.0, t)
+        t += 7200 / 60
+        frames += _lap(2, 3960, 300.0, t)
+        t += 3960 / 60
+        frames += _lap(3, 7200, 300.0, t)
+        t += 7200 / 60
+        frames += _lap(4, 7200, 300.0, t)
+        return frames
+
+    def test_partial_middle_not_in_compare(self):
+        """中间残圈不能被选成参考圈，也不能出现在圈速摘要里。"""
+        r = analyze_compare(self._race_with_partial_middle())
+        assert r["ref_lap"] != 2
+        assert 2 not in [s["lap"] for s in r["lap_summary"]]
+
+    def test_analyze_session_marks_partial_middle(self, dash, tmp_path):
+        """详情页圈速表要把中间残圈标成 incomplete，且不能当最快圈。"""
+        p = tmp_path / "20261021_120000_T.jsonl"
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"session_id": "x"}) + "\n")
+            for fr in self._race_with_partial_middle():
+                f.write(json.dumps(fr, separators=(",", ":")) + "\n")
+        st = dash.analyze_session(p)
+        rows = {l["lap"]: l for l in st["laps"]}
+        assert rows[2]["incomplete"] is True
+        assert rows[2]["dist_m"] < rows[1]["dist_m"] * 0.8
+        assert st["best_lap"]["lap"] in (1, 3, 4)
 
 
 class TestRefLapSelection:

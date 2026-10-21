@@ -1684,6 +1684,12 @@ def analyze_session(path: Path) -> dict[str, Any]:
         #    同一份分组。各自算一遍 = 把 21 万帧重扫两到三遍。
         _, laps, _ = _valid_laps(path)
 
+        # 圈完整性：距离口径（与 clean_laps / analyze_compare 同一判据）。
+        # clean_laps 只删首/末残圈，中间圈可能是一次中途退出（只有 55% 圈长），
+        # 时长却照样 >20s —— 只判时长会把它当最快圈。
+        import gt7analysis
+        dists, med_d = gt7analysis.lap_distances(laps)
+
         lap_times = []
         for lap_no, fs in sorted(laps.items()):
             if len(fs) < 2:
@@ -1691,15 +1697,18 @@ def analyze_session(path: Path) -> dict[str, Any]:
             # 用帧数×间隔估算更稳：只取首尾两帧的跨度，
             # 中间即使丢包也不影响总时长。
             duration = fs[-1]["t"] - fs[0]["t"]
+            dist = dists.get(lap_no, 0.0)
             # ⚠️ 一圈至少要 20 秒（GT7 最短赛道也1分多）。
             #    数据不足 20 秒说明这是「采集刚开始」或「刚进圈」，
             #    此时报出来的圈速是假的，宁可不给。
-            if duration < 20.0:
+            if duration < 20.0 or not gt7analysis.lap_is_complete(dist, med_d):
                 lap_times.append(
-                    {"lap": lap_no, "time": round(duration, 3), "incomplete": True}
+                    {"lap": lap_no, "time": round(duration, 3),
+                     "dist_m": round(dist, 1), "incomplete": True}
                 )
                 continue
-            lap_times.append({"lap": lap_no, "time": round(duration, 3)})
+            lap_times.append({"lap": lap_no, "time": round(duration, 3),
+                              "dist_m": round(dist, 1)})
 
         valid_laps = [l for l in lap_times if not l.get("incomplete")]
 
