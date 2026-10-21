@@ -287,7 +287,7 @@ class TestStatusSchema2:
         # 最后一次写可能被 20Hz 节流挡在最后几帧之前 → seq 可以略小
         assert 0 < p["seq"] <= r._frame_seq
         assert p["last_rx_t"] > 0
-        assert len(p["history"]) <= 12, "增量只带最近 12 帧"
+        assert len(p["history"]) <= rec._STATUS_DELTA_FRAMES, "增量只带最近 N 帧"
         assert all("q" in h for h in p["history"]), "每帧都要有单调序号"
 
     def test_full_snapshot_every_20_writes(self, rec, dec, make_recorder, tmp_path):

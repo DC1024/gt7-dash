@@ -85,10 +85,11 @@ PORT_HEARTBEAT = 33739# 格式 A：心跳 + 轮速/转速
 PORT_ADVANCED = 33740        # 格式 B/C：Addendum 扩展字段
 
 # —— 状态文件增量协议（schema 2）——
-# 每次写只带最近 N 帧（约 200ms，覆盖 10Hz 轮询 + 抖动），
-# 每 FULL_EVERY 次写附带一次完整 600 帧窗口（20Hz 下约 1 秒），
-# 供仪表盘冷启动/断档自愈。写入量从 1.4MB/s 降到约 0.12MB/s。
-_STATUS_DELTA_FRAMES = 12
+# 每次写只带最近 N 帧（约 1 秒）。原先是 12 帧（200ms），但真机比赛里
+# 刷新线程被 GIL/序列化拖住超过 200ms 时会出现瞬时跳号；扩到 60 帧后
+# 1 秒内的延迟都能覆盖，再长的靠 FULL_EVERY 的完整窗口自愈。
+# 写入量约 0.18MB/s（仍比原来的 1.4MB/s 低 8 倍）。
+_STATUS_DELTA_FRAMES = 60
 _STATUS_FULL_EVERY = 20
 
 # 会话状态机
