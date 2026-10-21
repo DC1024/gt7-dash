@@ -113,3 +113,34 @@ class TestGzip:
         assert r.status == 200
         assert len(body) < dash._GZIP_MIN_BYTES, "这条响应已经大到该压了，换个端点"
         assert r.getheader("Content-Encoding") is None
+
+
+def test_bounded_server_serves_concurrent(dash, tmp_path):
+    """并发上限 2 时，5 个并发请求全部成功 —— 信号量不能造成死锁。"""
+    import threading
+    import urllib.request
+
+    dash.HUB = dash.TelemetryHub(tmp_path / "status.json")
+    srv = dash.BoundedHTTPServer(("127.0.0.1", 0), dash.DashboardHandler,
+                                 max_workers=2)
+    srv.daemon_threads = True
+    srv.history_dir = str(tmp_path)  # type: ignore[attr-defined]
+    srv.allow_hosts = ()             # type: ignore[attr-defined]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/api/health"
+        codes = []
+
+        def hit():
+            with urllib.request.urlopen(url, timeout=15) as r:
+                codes.append(r.status)
+
+        ts = [threading.Thread(target=hit) for _ in range(5)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(20)
+        assert codes == [200] * 5, codes
+    finally:
+        srv.shutdown()
+        srv.server_close()

@@ -12335,6 +12335,37 @@ def _lan_ipv4_addresses() -> list[str]:
     return out
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """有并发上限的 ThreadingHTTPServer。
+
+    🔴 每个连接一条线程、空闲 300 秒。没有上限时，局域网里开几百个连接
+       就能把线程和内存耗尽（每个线程约 8MB 栈空间）。用信号量把并发压到
+       max_workers：超出时 accept 会阻塞，新连接留在内核 backlog 里排队，
+       而不是无限建线程。backlog 满了才拒绝 —— 这就是我们要的背压。
+    """
+
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, addr, handler, max_workers: int = 48):
+        super().__init__(addr, handler)
+        self._workers = threading.BoundedSemaphore(max_workers)
+
+    def process_request(self, request, client_address):
+        self._workers.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._workers.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._workers.release()
+
+
 def main() -> int:
     global PAGE, HUB, _GZIP_ENABLED
 
@@ -12379,7 +12410,7 @@ def main() -> int:
     class Handler(DashboardHandler):
         pass
 
-    srv = ThreadingHTTPServer((args.bind, args.port), Handler)
+    srv = BoundedHTTPServer((args.bind, args.port), Handler, max_workers=48)
     srv.daemon_threads = True
     # ⚠️ 必须挂在 server 实例上——handler 里读的是 self.server.history_dir。
     #    挂在 Handler 类上是无效的（早期版本踩过，报
