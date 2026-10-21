@@ -1098,6 +1098,17 @@ class Recorder:
 
             # —— 批量处理本轮收到的包 ——
             if batch:
+                # 🔴 先判「休眠间隔」，再刷新 last_active。
+                #    顺序反了的话，22 小时的间隔在检查时已经变成 0 ——
+                #    两场比赛会被写进同一个 jsonl（见 _gap_before_batch）。
+                gap = self._gap_before_batch(batch[0][1], last_active)
+                if gap:
+                    self.log(
+                        f"距上一帧 {gap:.0f} 秒（休眠/时钟跳变）→ 结束本场，"
+                        f"后续帧自动开新场", force=True)
+                    self._end_session()
+                    self._moving_frames = 0
+                    last_active = 0.0
                 now = time.time()
                 if self._last_source:
                     batch_addr = self._last_source
@@ -1687,6 +1698,22 @@ class Recorder:
                 force=True,
             )
         return removed
+
+    def _gap_before_batch(self, first_packet_t: float,
+                          last_active: float) -> float:
+        """本批首包距上一批的真实间隔；未超过 session_gap 时返回 0。
+
+        🔴 必须在刷新 `last_active` **之前**调用，且用**包自己的到达时刻**：
+           主机挂起（VM pause / 笔记本睡眠）恢复后，第一个循环迭代会立刻
+           读到积压的包。如果先 `last_active = now` 再判间隔，22 小时的间隔
+           已经变成 0，切场永远不会触发，两场比赛会被写进同一个 jsonl。
+           真实数据 20261019_012823 就是这样：时间戳跳了 22 小时、圈号
+           从中间重新计数，还留下 200%~362% 的假圈污染圈长基准。
+        """
+        if self.session is None or not now_is_set(last_active):
+            return 0.0
+        gap = first_packet_t - last_active
+        return gap if gap > self.args.session_gap else 0.0
 
     def _check_off_track(self, now: float) -> None:
         """场次边界检查：离开赛道持续 off_track_timeout 秒 → 结束本场。

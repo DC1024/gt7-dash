@@ -238,3 +238,32 @@ class TestLapStartedAt:
         assert payload["lap_started_at"] == r._lap_started_at
         # 关键语义：lap_started_at 必须晚于 session_start（否则等于没做这件事）
         assert payload["lap_started_at"] > payload["session_start"]
+
+
+class TestSessionGapAfterSuspend:
+    """主机休眠 / 系统时钟跳变后必须切场（P1-8）。
+
+    真实数据：20261019_012823 里时间戳跳了 22 小时，两场比赛被写进同一个
+    jsonl，圈号从中间重新计数。根因是 last_active 在处理批次时先被刷新，
+    间隔检查永远看到 0。修法：在刷新之前、用包自己的到达时刻判间隔。
+    """
+
+    def test_detects_long_gap(self, rec, make_recorder):
+        r = make_recorder(session_gap=300.0)
+        r.session = rec.Session(session_id="x", started_at=1000.0)
+        assert r._gap_before_batch(1000.0 + 22 * 3600, 1000.0) == 22 * 3600
+
+    def test_no_gap_within_threshold(self, rec, make_recorder):
+        r = make_recorder(session_gap=300.0)
+        r.session = rec.Session(session_id="x", started_at=1000.0)
+        assert r._gap_before_batch(1000.0 + 299, 1000.0) == 0.0
+
+    def test_no_session_no_gap(self, rec, make_recorder):
+        r = make_recorder(session_gap=300.0)
+        assert r._gap_before_batch(1e9, 1000.0) == 0.0
+
+    def test_unset_last_active_no_gap(self, rec, make_recorder):
+        """从没收到过包（last_active=0）时不能误判成 22 小时间隔。"""
+        r = make_recorder(session_gap=300.0)
+        r.session = rec.Session(session_id="x", started_at=1000.0)
+        assert r._gap_before_batch(1e9, 0.0) == 0.0
