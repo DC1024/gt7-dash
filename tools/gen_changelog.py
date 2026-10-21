@@ -48,7 +48,7 @@ def _tags() -> list[tuple[str, str]]:
 
 
 def _changelog_only_shas() -> set[str]:
-    """只改了 CHANGELOG.md 的提交集合。
+    """碰过 CHANGELOG.md 的提交集合。
 
     🔴 必须排除，否则这个检查是**自指的**：生成 CHANGELOG 后提交，
     HEAD 前移，build() 里就多出一条「更新 CHANGELOG」，于是文件永远
@@ -62,7 +62,10 @@ def _changelog_only_shas() -> set[str]:
     files: list[str] = []
 
     def flush():
-        if cur and files == ["CHANGELOG.md"]:
+        # 🔴 只要**碰过** CHANGELOG.md 就排除，而不是"只改了它"。
+        #    否则生成后提交时，那个提交本身（改了脚本+CHANGELOG）会被
+        #    列进自己那一版，下次生成内容又变 —— 永远追不上，测试永远红。
+        if cur and "CHANGELOG.md" in files:
             out.add(cur)
 
     for line in _git("log", "--all", "--format=%x02%H", "--name-only").splitlines():
