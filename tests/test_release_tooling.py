@@ -31,6 +31,10 @@ class TestChangelog:
             "没有 CHANGELOG —— 想知道某一版改了什么只能翻 git log")
 
     def test_CHANGELOG_与_git_历史一致(self):
+        if not (ROOT / "CHANGELOG.md").is_file():
+            # CHANGELOG 是 v1.4.2 才引入的。更早的 tag 上 CI 也会跑这条，
+            # 那些提交里根本没有这个文件 —— 跳过，别让历史快照永远红。
+            pytest.skip("该提交还没有 CHANGELOG.md（v1.4.2 之前）")
         """落后于 git 就失败，逼你跑一次生成脚本。
 
         这条断言的价值在于「不会悄悄落后」：手写 CHANGELOG 的结局一定是
@@ -42,6 +46,8 @@ class TestChangelog:
             "CHANGELOG.md 落后于 git 历史，跑 `python tools/gen_changelog.py`")
 
     def test_每个_tag_都有段落(self):
+        if not (ROOT / "CHANGELOG.md").is_file():
+            pytest.skip("该提交还没有 CHANGELOG.md（v1.4.2 之前）")
         import subprocess
         tags = subprocess.run(["git", "tag", "--sort=v:refname"], cwd=ROOT,
                               capture_output=True, text=True).stdout.split()
