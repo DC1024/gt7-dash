@@ -93,39 +93,91 @@ func main() {
 		fmt.Fprintf(os.Stderr, "decrypt: ok=%d bad=%d\n", ok, bad)
 	}
 	if ok == 0 {
+		// 🔴 os.Exit 不会跑 defer，bufio 里没刷出去的内容会**整段丢失**。
+		//    这里的输出正是调用方用来定位问题的最后几条 FAIL 行，
+		//    丢了之后只看得到"空输出 + 退出码 1"，无从下手。
+		out.Flush()
 		os.Exit(1)
 	}
 }
 
 func runSelfTest() {
-	// 构造一个已知明文，加密再解密，验证往返
-	plain := make([]byte, 296)
-	binary.LittleEndian.PutUint32(plain[0:], magicWanted)
-	plain[4] = 1
-	plain[5] = 0
-	binary.LittleEndian.PutUint16(plain[6:], 0x0F)
-	binary.LittleEndian.PutUint32(plain[8:], 12345)
-	iv1 := uint32(0xDEADBEEF)
-	binary.LittleEndian.PutUint32(plain[0x40:], iv1^ivMask)
+	// 🔴 这里曾经是个**自证循环**：
+	//    旧代码用自己的 IV 加密一段明文，再交给 decrypt() 解回来，
+	//    然后断言"解出来的 == 我放进去的"。而 decrypt() 的 IV 是从密文的
+	//    0x40 读的 —— 加密时又把同一个值写在明文的 0x40 处，
+	//    于是无论 IV 推导方向写反、还是密钥流偏移算错，它都能"通过"。
+	//    实测：把 decrypt() 里的 iv1/iv2 对调，旧 selftest 依然打印 OK。
+	//
+	// 现在改成**外部生成的 golden vector**：
+	//    由 tools/verify_salsa20.py 产出（Python 侧 Salsa20 + 正确的
+	//    "nonce 取自密文" 构造），Go 这边只做"喂密文、比明文"。
+	//    向量是死的常量，Go 无法自己捏一个能过的输入。
+	//
+	// 重新生成：
+	//    cd tools && python -c "from verify_salsa20 import build_plain; \
+	//      from probe_fields import encrypt_packet_pair; \
+	//      c,p=encrypt_packet_pair(build_plain()); print(c[:80].hex()); print(p[:64].hex())"
+	//    然后把下面两行常量替换掉（并同步 tools/verify_salsa20.py 的 seed）。
+	//
+	// 🔴 密文为什么是 **80** 字节而不是 64：
+	//    这个协议把 IV 藏在密文的 0x40（=64）处，decrypt() 第一件事就是读它。
+	//    向量只截前 64 字节 → 0x40 正好落在向量之外，补齐时被填成 0 →
+	//    推出 iv1=0、密钥流全错、magic 校验失败。
+	//    症状极具误导性：Python 侧拿**完整包**验证是好的，Go 却"解不开"，
+	//    看起来像 Go 的 IV 推导写错了。实际只是向量没盖住 IV。
+	//    80 同时覆盖 0x40..0x43 的 IV 与前 64 字节明文，够用且不至于贴一大坨。
+	const (
+		goldenCipherHex = "d732167a7a33c22cf0269d95b587111168ea08e3622871f2c6f8afd811462eb0" +
+			"a2d2e1368744b15da2460d91e6cbc1b299008a8ba9ecab6e4d98716b1c9f746c" +
+			"785634127a286a2f952857170cf4208b"
+		goldenPlainHex = "3053374724d23172ef38e37b080e925770007ce01b72c0f98019cc8fe1558a50" +
+			"5855492ea5e96d92b926d76001bc12af741642455b36cdd5e34fc6f8641f1eeb"
+	)
 
-	iv := make([]byte, 8)
-	binary.LittleEndian.PutUint32(iv, iv1^ivMask^ivMask) // = iv1^mask
-	binary.LittleEndian.PutUint32(iv[4:], iv1)
-	enc := make([]byte, len(plain))
-	salsa20.XORKeyStream(enc, plain, iv, &key)
+	cipher, err := hex.DecodeString(goldenCipherHex)
+	if err != nil {
+		fmt.Println("SELFTEST FAILED: 内置向量解码失败:", err)
+		os.Exit(1)
+	}
+	want, err := hex.DecodeString(goldenPlainHex)
+	if err != nil {
+		fmt.Println("SELFTEST FAILED: 期望明文解码失败:", err)
+		os.Exit(1)
+	}
 
-	got := decrypt(enc)
+	// 补齐到 296 字节：decrypt 要求 len >= 0x44+8，且真实包就是 296。
+	// 补零不影响前 64 字节的比对（密钥流是按字节位置生成的）。
+	//
+	// 🔴 但前提是**向量本身已经盖住了 IV**（0x40..0x43）。补齐不会"补出"
+	//    IV：补的是 0，于是 iv1=0，解出来必然是垃圾。这条断言就是防这个 ——
+	//    否则下一个人改短向量时，只会得到一句"magic 校验没过"，查不到这里。
+	if len(cipher) < 0x44 {
+		fmt.Printf("SELFTEST FAILED: golden 向量只有 %d 字节，没盖到 IV(0x40..0x43)。\n"+
+			"  请用 tools/verify_salsa20.py 重新生成 80 字节密文（见上方注释）。\n", len(cipher))
+		os.Exit(1)
+	}
+	if len(cipher) < 296 {
+		padded := make([]byte, 296)
+		copy(padded, cipher)
+		cipher = padded
+	}
+
+	got := decrypt(cipher)
 	if got == nil {
-		fmt.Println("SELFTEST FAILED: 无法解回自己加密的包")
+		fmt.Println("SELFTEST FAILED: 解不开 golden vector（magic 校验没过 → IV 推导或密钥流错）")
 		os.Exit(1)
 	}
 	if binary.LittleEndian.Uint32(got[:4]) != magicWanted {
 		fmt.Println("SELFTEST FAILED: magic 不对")
 		os.Exit(1)
 	}
-	if binary.LittleEndian.Uint32(got[8:]) != 12345 {
-		fmt.Println("SELFTEST FAILED: seq 不对")
-		os.Exit(1)
+	for i := 0; i < len(want) && i < len(got); i++ {
+		if got[i] != want[i] {
+			fmt.Printf("SELFTEST FAILED: 明文第 %d 字节不符 got=%02x want=%02x\n",
+				i, got[i], want[i])
+			os.Exit(1)
+		}
 	}
 	fmt.Println("SELFTEST OK")
 }

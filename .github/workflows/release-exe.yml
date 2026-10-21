@@ -11,7 +11,19 @@ permissions:
   contents: write            # 创建 Release 需要
 
 jobs:
+  # 🔴 发布前必须先过测试，不能"绿灯发布、默默出事"。
+  #
+  # 为什么是 `uses:` 而不是 `needs: [pytest]`：
+  #   `needs` 只能引用**同一个 workflow 文件里**的 job。tests.yml 是另一个
+  #   workflow，跨文件的 needs 在 GitHub Actions 里不存在。想复用它就得
+  #   把它声明成 `workflow_call`（已加），在这里以 job 的形式调用。
+  #   （另一种写法 `workflow_run` 只能拿到"上一次运行结束后"的结果，
+  #     而且 tag push 时它压根不触发 —— 等于没拦住，别用。）
+  test:
+    uses: ./.github/workflows/tests.yml
+
   windows-exe:
+    needs: [test]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

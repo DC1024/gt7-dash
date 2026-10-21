@@ -61,7 +61,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +102,10 @@ class TelemetryHub:
         self._warning: str | None = None
         self._connected = False
         self._last_frame_t = 0.0
+        # 最近一帧**数据时刻**（status.json 的 `t`），供 /api/health 报
+        # last_packet_age。与 _last_frame_t（本机读到文件的时刻）不是一回事：
+        # 前者回答"PS5 还在发吗"，后者回答"我上次读文件是什么时候"。
+        self._last_packet_t = 0.0
         # 本场发车位（接收器在开跑瞬间快照，见 gt7-recorder）
         self._grid_start = 0
         self._has_coords = False
@@ -195,9 +199,17 @@ class TelemetryHub:
                 self._last_frame_t = time.time()
                 # 🔴 connected 不能只看「状态文件存在且能解析」：
                 #    PS5 关机后接收器不再更新文件，但旧文件还在，
-                #    仪表盘会永远显示「采集中」。用文件写入时刻判新鲜度：
+                #    仪表盘会永远显示「采集中」。用**数据时刻**判新鲜度：
                 #    超过 5 秒没更新（接收器 20Hz 写）= 数据流已断。
-                stale = time.time() - float(payload.get("t") or 0.0) > 5.0
+                #
+                # 🔴 这里用的是 payload["t"]（**数据时刻**），不是文件 mtime：
+                #    recorder 会每 20 秒 touch 一次 mtime 来向 Docker
+                #    HEALTHCHECK 证明"进程还活着"（_touch_status_alive），
+                #    mtime 因此**在 PS5 关机时也是新鲜的**。
+                #    拿 mtime 判 connected 会让仪表盘永远显示"采集中"——
+                #    这两件事必须分开：mtime=进程活，t=在收包。
+                self._last_packet_t = float(payload.get("t") or 0.0)
+                stale = time.time() - self._last_packet_t > 5.0
                 self._connected = not stale
 
         except (OSError, json.JSONDecodeError, ValueError, KeyError):
@@ -286,9 +298,15 @@ class TelemetryHub:
         self.refresh()
         with self._lock:
             if not self._buffer:
+                # 🔴 connected 不能用硬编码 False：它是 refresh() 按数据时刻
+                #    算出来的独立状态。PS5 刚连上的那几帧，payload 里有 frame
+                #    但 history 还是空 → 这里若写死 False，/api/health 会在
+                #    "刚连上"这个时刻误报断开，而 max_speed/rpm 这类只有
+                #    缓冲才有的量确实无从计算（保持缺省即可）。
                 return {
-                    "frames": 0, "connected": False, "layouts": {},
+                    "frames": 0, "connected": self._connected, "layouts": {},
                     "has_coords": self._has_coords,
+                    "last_packet_t": self._last_packet_t,
                 }
             buf = list(self._buffer)
             speeds = [f["speed_kph"] for f in buf]
@@ -302,6 +320,10 @@ class TelemetryHub:
                 "max_rpm": round(max(rpms), 0),
                 "avg_speed": round(sum(speeds) / len(speeds), 1),
                 "has_coords": self._has_coords,
+                # 最近一帧的**数据时刻**（墙上秒）。0 = 从未收到过包。
+                # /api/health 用它算 last_packet_age —— 与 connected 同源，
+                # 但把"多旧"这个连续量暴露出来，便于外部按自己的阈值判断。
+                "last_packet_t": self._last_packet_t,
             }
 
 
@@ -732,6 +754,61 @@ def glob_sessions(history_dir: Path) -> list[Path]:
                 seen[key] = f
     return sorted(seen.values(), key=lambda p: session_stem(p.name),
                   reverse=True)
+
+
+def _safe_session(hist: Path, name: str) -> Path | None:
+    """把用户给的 `name` 落成 hist 之下的合法场次文件；不合法返回 None。
+
+    🔴 为什么不能用 `str(target).startswith(str(hist))`（原来 8 处都这么写）：
+       前缀法是**字符串**比较，挡不住兄弟目录：
+
+           hist   = /opt/gt7/data
+           target = /opt/gt7/data_evil/leak.jsonl
+           "/opt/gt7/data_evil/leak.jsonl".startswith("/opt/gt7/data") → True
+
+       正确做法是 `relative_to()`：它按**路径分量**逐段比较，
+       `data_evil` 不是 `data` 的子目录，直接抛 ValueError。
+
+    三道叠加（任意一道单独都不够）：
+      1. `relative_to(hist)` 做**真正的边界判断** —— 这是唯一不能省的一道。
+         它按路径分量比较，挡住 `data_evil` 这类同前缀兄弟目录；
+         resolve 之后也比，所以符号链接指到外面同样拦得住。
+      2. `is_session_file` 要求 `.jsonl` / `.jsonl.gz` 后缀 ——
+         `../../etc/passwd` 这种即使位置恰好落在 hist 内也过不了。
+      3. `is_file()` 要求真存在且是普通文件，挡掉目录 / 设备文件。
+
+    ⚠️ **故意不在这里做 `Path(name).name` 剥离**（虽然那样看起来更"安全"）：
+       把 `linkdir/leak.jsonl` 剥成 `leak.jsonl` 会让"符号链接目录指到外面"
+       这条攻击面**在到达 relative_to 之前就被抹平**，于是 relative_to 变成
+       永远不会失败的死代码，测试也测不出它坏了。
+       剥离的责任在调用方（路径段入口已经用 `Path(seg[4]).name`），
+       这里只负责回答"这个路径能不能出 hist"。
+
+    找不到文件返回 None，而不是抛异常：调用方一律回 404，
+    404 不会泄露"这个文件存不存在"。
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    # 空字节：Windows 会抛 ValueError、POSIX 会截断 —— 一律拒
+    if "\x00" in raw:
+        return None
+    try:
+        # 反斜杠统一成正斜杠：Windows 上 `..\x` 与 `../x` 等价，
+        # 但 Path 只认前者为分隔符，混用会被当成普通文件名字符。
+        cand = hist / raw.replace("\\", "/")
+        cand = resolve_session(cand)
+        cand = cand.resolve()
+        hist_res = hist.resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    try:
+        cand.relative_to(hist_res)          # ← 真正的边界判断
+    except ValueError:
+        return None
+    if not is_session_file(cand) or not cand.is_file():
+        return None
+    return cand
 
 
 def _parse_frames(path: Path) -> tuple[dict, FrameStore]:
@@ -4185,10 +4262,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "file 与 name 都不能为空"}, 400,
                                 cors=False)
                 return
-            target = (hist / Path(fname).name).resolve()
-            target = resolve_session(target)
-            if (not str(target).startswith(str(hist)) or not target.exists()
-                    or not is_session_file(target)):
+            target = _safe_session(hist, fname)
+            if target is None:
                 self._send_json({"error": "session not found", "file": fname},
                                 404, cors=False)
                 return
@@ -4309,11 +4384,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
 
         hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-        target = (hist / name).resolve()
-        # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
-        target = resolve_session(target)
-        if (not str(target).startswith(str(hist)) or not target.exists()
-                or not is_session_file(target)):
+        target = _safe_session(hist, name)   # 边界判断见 _safe_session
+        if target is None:
             self._send_json({"error": "session not found", "file": name},
                             404, cors=False)
             return
@@ -4382,9 +4454,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
           {"clear": true}                          解绑
         """
         hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-        target = resolve_session((hist / Path(name).name).resolve())
-        if (not str(target).startswith(str(hist)) or not target.exists()
-                or not is_session_file(target)):
+        target = _safe_session(hist, name)
+        if target is None:
             self._send_json({"error": "session not found", "file": name},
                             404, cors=False)
             return
@@ -4573,11 +4644,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_html("<h1>缺少 file 参数</h1>", 400)
                     return
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-                target = (hist / name).resolve()
-                target = resolve_session(target)     # 归档后只有 X.jsonl.gz
-                # 目录穿越防护
-                if (not str(target).startswith(str(hist))
-                        or not target.exists() or not is_session_file(target)):
+                # 🔴 边界判断统一走 _safe_session（relative_to）：
+                #    原来的 `startswith(str(hist))` 挡不住兄弟目录
+                #    （data vs data_evil），详见该函数 docstring。
+                target = _safe_session(hist, name)
+                if target is None:
                     self._send_html("<h1>文件不存在或非法路径</h1>", 404)
                     return
                 # 参考圈选择器：?ref_lap=N 指定赛车线看第几圈，缺省=最快圈。
@@ -4608,24 +4679,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not name:
                     self._send_json({"error": "缺少 file 参数"}, 400)
                     return
-                # 防目录穿越
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-                target = (hist / name).resolve()
-                target = resolve_session(target)     # 归档后只有 X.jsonl.gz
-                if (not str(target).startswith(str(hist))
-                        or not target.exists() or not is_session_file(target)):
+                target = _safe_session(hist, name)   # 边界判断见 _safe_session
+                if target is None:
                     self._send_json({"error": "文件不存在或非法路径"}, 404)
                     return
                 self._send_json(analyze_session(target))
 
             elif path == "/api/health":
                 s = HUB.stats()
+                # 🔴 这个端点要能区分两件事，否则运维没法判断到底哪里坏了：
+                #    · recorder 进程活着吗 → 容器 HEALTHCHECK（查 status.json
+                #      的 mtime；recorder 每 20s touch 一次，与是否收包无关）
+                #    · PS5 还在发遥测吗   → 本端点的 last_packet_age
+                #    PS5 关机时前者 healthy、后者持续增长，这是**正确**表现，
+                #    不是故障。别把两个信号揉成一个布尔值。
+                age = (time.time() - s["last_packet_t"]) \
+                    if s.get("last_packet_t") else None
                 self._send_json(
                     {
                         "ok": True,
                         "connected": s.get("connected", False),
                         "frames": s.get("frames", 0),
                         "has_coords": s.get("has_coords", False),
+                        # 秒；None = 从未收到过包。调用方按"多大算太旧"自行判断
+                        # （仪表盘用 5s，容器探针可以用更宽松的阈值）。
+                        "last_packet_age": round(age, 1) if age is not None else None,
                     }
                 )
 
@@ -4701,11 +4780,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 seg = path.split("/")
                 name = Path(seg[4]).name if len(seg) == 6 else ""
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-                target = (hist / name).resolve()
-                # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
-                target = resolve_session(target)
-                if (not str(target).startswith(str(hist)) or not target.exists()
-                        or not is_session_file(target)):
+                # 边界判断统一走 _safe_session（relative_to）
+                target = _safe_session(hist, name)
+                if target is None:
                     self._send_json({"error": "session not found", "file": name},
                                     404, cors=True)
                     return
@@ -4754,11 +4831,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 seg = path.split("/")
                 name = Path(seg[4]).name if len(seg) == 6 else ""
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-                target = (hist / name).resolve()
-                # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
-                target = resolve_session(target)
-                if (not str(target).startswith(str(hist)) or not target.exists()
-                        or not is_session_file(target)):
+                # 边界判断统一走 _safe_session（relative_to）
+                target = _safe_session(hist, name)
+                if target is None:
                     self._send_json({"error": "session not found", "file": name},
                                     404, cors=True)
                     return
@@ -4938,11 +5013,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # /api/v1/sessions/<文件名> —— 防目录穿越：只取文件名部分
                 name = Path(path.rsplit("/", 1)[-1]).name
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
-                target = (hist / name).resolve()
-                # 已被归档的场次磁盘上只有 X.jsonl.gz，补一次兜底
-                target = resolve_session(target)
-                if (not str(target).startswith(str(hist)) or not target.exists()
-                        or not is_session_file(target)):
+                # 边界判断统一走 _safe_session（relative_to）
+                target = _safe_session(hist, name)
+                if target is None:
                     self._send_json({"error": "session not found", "name": name},
                                     404, cors=True)
                     return
@@ -7991,6 +8064,44 @@ _TELEMETRY_TMPL = r"""
 """
 
 
+def _js_str(s: Any) -> str:
+    """把任意字符串变成可安全放进**内联 JS 字符串字面量**的内容。
+
+    🔴 这是 HTML 转义覆盖不到的上下文：`onclick="sessRen('...')"` 里，
+       JS 的元字符是 `'` / `\\` / 换行，不是 `<` / `&`。
+
+    用法是把结果放进**双引号** JS 字面量（调用处写 `&quot;`，因为外层是
+    HTML 属性），所以这里只转义能"逃出双引号"的字符：
+      · `\\` 必须先转，否则后面加的反斜杠会被二次转义；
+      · `"` 转成 `\\"`（HTML 里写成 &quot; 之后是纯 `"`，但内联 JS 仍可能
+        从别处拿到裸引号，所以两侧都处理）；
+      · `<` 转成 `\\x3c` —— 这一条是**防提前闭合 script/属性**的兜底，
+        顺便让 JSON 风格的 `</script>` 无法生效；
+      · U+2028/U+2029 是 JS 的行终止符，字符串里出现就是语法错误。
+    """
+    out = []
+    for ch in str(s):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "'":
+            out.append("\\'")
+        elif ch == "<":
+            out.append("\\x3c")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\u2028":
+            out.append("\\u2028")
+        elif ch == "\u2029":
+            out.append("\\u2029")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def build_sessions_page(hist: Path) -> str:
     """历史场次列表页。空状态要说清为什么空、以及怎么让它有数据。"""
     import html as _html
@@ -8016,8 +8127,18 @@ def build_sessions_page(hist: Path) -> str:
 
     rows = []
     for s in sessions:
-        disp = s.get("display_name") or s["circuit"]
-        disp_attr = disp.replace('"', "&quot;")
+        # 🔴 三类注入面全在这里，一个都不能漏（P1-1）：
+        #    ① 文本节点：自定义名 / 赛道名 / 车型 —— `_html.escape`。
+        #    ② URL 属性：`?file=` —— 必须 quote，`&` 会截断查询串，
+        #       空格会让属性值提前结束。
+        #    ③ **内联 JS 字面量**：`onclick="sessRen('...')"` —— HTML 转义
+        #       在这里救不了，JS 的元字符是 `'` 和 `\`，必须单独做 JS 转义。
+        #    历史包袱：原来有 `disp_attr = disp.replace('"', "&quot;")` 这一行
+        #    算完却没用（作者本来想转义，写了一半），改名注入就此长期成立。
+        disp = _html.escape(s.get("display_name") or s["circuit"], quote=True)
+        fname = s["file"]
+        f_url = quote(fname, safe="")        # 用于 href / 路径段
+        f_js = _js_str(fname)                # 用于内联 JS 字符串字面量
         star = ' <span style="color:#d4a017">★</span>' if s["favorite"] else ""
         anom = s.get("anomalous")
         badge = ' <span class="anom-badge">异常</span>' if anom else ""
@@ -8031,8 +8152,8 @@ def build_sessions_page(hist: Path) -> str:
             car_cell += (' <span class="grp-badge">'
                          + _html.escape(s['car_group']) + '</span>')
         rows.append(
-            f"""<tr data-fav="{'1' if s['favorite'] else '0'}" data-anom="{'1' if anom else '0'}" data-file="{s['file']}">
-      <td><b><a href="/session?file={s['file']}"
+            f"""<tr data-fav="{'1' if s['favorite'] else '0'}" data-anom="{'1' if anom else '0'}" data-file="{_html.escape(fname, quote=True)}">
+      <td><b><a href="/session?file={f_url}"
          style="color:var(--accent)">{disp}</a></b>{star}{badge}</td>
       <td style="font-size:12.5px">{car_cell
           }{'<span class="dim"> · ' + _html.escape(s['track_name']) + '</span>' if s.get('track_name') else ''}</td>
@@ -8041,13 +8162,13 @@ def build_sessions_page(hist: Path) -> str:
       <td style="font-size:12.5px">{_html.escape(s.get('track_name') or '未知赛道')}</td>
       <td class="num">
         <button class="sbtn" title="收藏"
-          onclick="sessPost('{s['file']}','favorite',{str(not s['favorite']).lower()})">{'★' if s['favorite'] else '☆'}</button>
+          onclick="sessPost(&quot;{f_js}&quot;,&quot;favorite&quot;,{str(not s['favorite']).lower()})">{'★' if s['favorite'] else '☆'}</button>
         <button class="sbtn" title="改名"
-          onclick="sessRen('{s['file']}')">✎</button>
+          onclick="sessRen(&quot;{f_js}&quot;)">✎</button>
         <button class="sbtn" title="删除"
-          onclick="sessDel('{s['file']}')">🗑</button>
+          onclick="sessDel(&quot;{f_js}&quot;)">🗑</button>
         <button class="sbtn" title="下载原始数据"
-          onclick="location.href='/api/v1/sessions/{s['file']}/download'">⬇</button>
+          onclick="location.href='/api/v1/sessions/{f_url}/download'">⬇</button>
       </td>
     </tr>"""
         )
@@ -8455,13 +8576,15 @@ drawAllTracks();
 
 
 def build_trash_view_page(hist: Path, name: str) -> str:
-    """回收站场次的轻量查看页：摘要 + 轨迹缩略图，方便判断要不要删除。"""
+    """回收站场次的轻量查看页：摘要 + 轨迹缩略图，方便判断要不要删除。
+
+    🔴 边界判断用 `_safe_session(trash, ...)` 而不是 `startswith(trash)`：
+       `_trash` 只是个普通目录名，兄弟目录 `_trash_evil` 一样能前缀命中。
+    """
     import html as _html
     trash = hist / "_trash"
-    target = (trash / Path(name).name).resolve()
-    target = resolve_session(target)
-    if (not str(target).startswith(str(trash)) or not target.exists()
-            or not is_session_file(target)):
+    target = _safe_session(trash, name)
+    if target is None:
         return _page_shell("回收站查看",
             '<div class="card"><h2>文件不存在或已清理</h2>'
             '<p><a href="/sessions">返回历史场次</a></p></div>')
@@ -10870,11 +10993,63 @@ ggLoop();                 // 启动 G 力球动画（自带 requestAnimationFram
 //    并且允许点一下卡片上的提示就地改地址、记住。
 const COACH_KEY = 'gt7_coach_url';
 const COACH_POLL_MS = 200;
+
+// 🔴 `?coach=` 是**可被任何链接控制的输入**：别人发一个
+//    `http://你的仪表盘:8787/?coach=http://evil.example` 过来，点开就
+//    把这一页的所有教练取数（/state、/config）指向那台机器。
+//    危害不在"跨域读数据"（同源策略挡住了读），而在两处：
+//      ① 那台机器回的内容会被渲染进这张卡 —— 本轮已全部改成
+//         textContent / coachEsc，但"只靠一处没写错"不是防线；
+//      ② 页面上会显示"赛道工程师：evil.example"，用户以为在连自己的教练。
+//    所以：**同源（含同主机的其他端口）静默接受**，跨源必须用户确认一次
+//    并记住（存 localStorage）；用户拒绝就回落默认值。
+//    注意这里只做"要不要连"的判断，不改变 fetch 的同源策略。
+function coachOriginOf(url){
+  try { return new URL(url).origin; } catch (e) { return null; }
+}
+// 同源白名单：本页 origin 本身 + 「同主机、换端口」的常见部署
+// （仪表盘在服务器 :8787、教练在玩家机 :8788 那种不在此列 —— 那属于跨源，
+//  要确认；这里放行的是同一台机器上换端口的本地部署）。
+function coachIsSameHost(url){
+  let u;
+  try { u = new URL(url); } catch (e) { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (u.protocol !== location.protocol) return false;
+  return u.hostname === location.hostname;
+}
+
+function coachAcceptUrl(raw){
+  const url = String(raw || '').trim().replace(/\/+$/, '');
+  if (!url) return null;
+  if (!/^https?:\/\//i.test(url)) return null;
+  if (!coachIsSameHost(url)) {
+    // 跨源：必须用户明确同意。confirm 里把完整地址写出来，
+    // 别只说"另一个地址"——用户要能看见到底连去哪。
+    const ok = window.confirm(
+      '这页被要求连接另一台机器上的赛道工程师：\n\n' + url +
+      '\n\n只在你确认这是自己的机器时才继续。');
+    if (!ok) return null;
+  }
+  return url;
+}
+
 let coachUrl = (function(){
   const q = new URLSearchParams(location.search).get('coach');
-  if (q) return q.replace(/\/+$/, '');
-  try { const v = localStorage.getItem(COACH_KEY); if (v) return v.replace(/\/+$/, ''); }
-  catch (e) { /* 隐私模式下 localStorage 会抛，忽略 */ }
+  if (q) {
+    const ok = coachAcceptUrl(q);
+    if (ok) {
+      // 从 URL 来的也记下来：下次不带参数打开还是这台
+      try { localStorage.setItem(COACH_KEY, ok); } catch (e) { /* 忽略 */ }
+      return ok;
+    }
+    // 被拒 → 落到后面的默认值，不采用这个参数
+  }
+  try {
+    const v = localStorage.getItem(COACH_KEY);
+    // 🔴 localStorage 里的值也要过一遍：它是**上次**写进去的，
+    //    而"上次"可能是旧版本（当时没有白名单）留下的跨源地址。
+    if (v) { const ok = coachAcceptUrl(v); if (ok) return ok; }
+  } catch (e) { /* 隐私模式下 localStorage 会抛，忽略 */ }
   if (!location.hostname) return 'http://127.0.0.1:8788';
   return location.protocol + '//' + location.hostname + ':8788';
 })();
@@ -10960,19 +11135,36 @@ function loadCoachPanel(silent){
     });
 }
 
+// —— HTML 转义（coach 区域用）——
+// 🔴 为什么需要：这一段的数据全部来自**教练服务端**（/state、/config），
+//    而教练地址是用户随便填的（askCoachUrl 允许任意 http(s) 源）。
+//    直接拼 innerHTML = 让"我连了哪个服务"决定"我的页面执行什么脚本"。
+//    注意与 `_js_str`（Python 侧，内联 JS 字面量）不是一回事：
+//    这里要防的是 HTML 上下文，元字符是 < > & " '。
+function coachEsc(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#x27;');
+}
+
 function coachPanelRowHtml(g){
   const on = !g.muted;
-  return '<div class="cp-row' + (on ? '' : ' off') + '" data-id="' + g.id + '">'
-    + '<input type="checkbox" id="cp-' + g.id + '"' + (on ? ' checked' : '')
-    + '><label for="cp-' + g.id + '">' + g.label
-    + '<span class="cp-desc"> · ' + (g.desc || '') + '</span></label>'
-    + '<span class="cp-n" title="最近播报条数">' + (g.recent || 0) + '</span></div>'
+  // 🔴 g.id 会进三个地方：data-id 属性、input 的 id、label 的 for。
+  //    三处都必须转义 —— 只转显示文本是不够的：
+  //    一个带 `" onfocus=alert(1) x="` 的 id 能直接注入属性。
+  const gid = coachEsc(g.id);
+  return '<div class="cp-row' + (on ? '' : ' off') + '" data-id="' + gid + '">'
+    + '<input type="checkbox" id="cp-' + gid + '"' + (on ? ' checked' : '')
+    + '><label for="cp-' + gid + '">' + coachEsc(g.label)
+    + '<span class="cp-desc"> · ' + coachEsc(g.desc) + '</span></label>'
+    + '<span class="cp-n" title="最近播报条数">' + coachEsc(g.recent || 0) + '</span></div>'
     // #G：分组下的细分开关（id 直接用教练端 RuleConfig 字段名）
     + (g.subs || []).map(function(s){
+        const sid = coachEsc(s.id);
         return '<div class="cp-sub' + (s.on ? '' : ' off')
-          + '" data-sub="' + s.id + '" data-group="' + g.id + '">'
-          + '<input type="checkbox" id="cs-' + s.id + '"' + (s.on ? ' checked' : '')
-          + '><label for="cs-' + s.id + '">' + (s.label || s.id) + '</label></div>';
+          + '" data-sub="' + sid + '" data-group="' + gid + '">'
+          + '<input type="checkbox" id="cs-' + sid + '"' + (s.on ? ' checked' : '')
+          + '><label for="cs-' + sid + '">' + coachEsc(s.label || s.id) + '</label></div>';
       }).join('');
 }
 
@@ -11031,7 +11223,15 @@ function renderCoachPanel(d){
     return;
   }
   coachPanelGroups.forEach(function(g){
-    const row = box.querySelector('.cp-row[data-id="' + g.id + '"]');
+    // 🔴 回查必须用 `data-id` 的**属性值**去匹配，不能拼进选择器字符串：
+    //    属性值经 coachEsc 转义后，`g.id` 里的引号会变成 `&quot;`，
+    //    '.cp-row[data-id="' + g.id + '"]' 不但匹配不到，遇到带引号的 id
+    //    还会让 querySelector **抛 SyntaxError** —— 而它在 forEach 里，
+    //    一抛就整个面板更新中断（后面的行永远停在上一次的状态）。
+    //    改成遍历 + dataset 比对，空值安全、不涉及选择器语法。
+    const row = Array.prototype.find.call(
+      box.querySelectorAll('.cp-row'),
+      function(x){ return x.dataset && x.dataset.id === String(g.id); });
     if (!row) return;
     row.className = 'cp-row' + (g.muted ? ' off' : '');
     const cb = row.querySelector('input');
@@ -11040,7 +11240,9 @@ function renderCoachPanel(d){
     if (n) n.textContent = String(g.recent || 0);
     // #G：细分开关就地更新（同样只在状态真变了才动，避免抢用户刚点的）
     (g.subs || []).forEach(function(s){
-      const sub = box.querySelector('.cp-sub[data-sub="' + s.id + '"]');
+      const sub = Array.prototype.find.call(
+        box.querySelectorAll('.cp-sub'),
+        function(x){ return x.dataset && x.dataset.sub === String(s.id); });
       if (!sub) return;
       sub.className = 'cp-sub' + (s.on ? '' : ' off');
       const scb = sub.querySelector('input');
@@ -11596,9 +11798,21 @@ function renderCoach(d){
     box.textContent = last || '目前没有要提醒的';
   }
 
-  $('coHist').innerHTML = (d.spoken || []).slice(0, 8).map(function(h){
-    return '<div><i>' + (h.key || '').split('@')[0] + '</i>' + h.text + '</div>';
-  }).join('');
+  $('coHist').innerHTML = '';
+  (d.spoken || []).slice(0, 8).forEach(function(h){
+    // 🔴 用 createElement + textContent，**不拼 HTML 字符串**（P1-5）。
+    //    这里的内容（h.key / h.text）来自**教练服务端**，而教练地址是用户
+    //    可以随便填的（见 askCoachUrl，能指向任意 host）。拼 innerHTML
+    //    等于让"我连哪个服务"决定"我的仪表盘执行什么脚本" ——
+    //    同源策略在这里救不了，因为脚本是在**仪表盘自己的源**里跑。
+    //    h.key 形如 "tyre_temp@T3"，@ 前是规则名，保持原样显示。
+    const row = document.createElement('div');
+    const tag = document.createElement('i');
+    tag.textContent = String(h.key || '').split('@')[0];
+    row.appendChild(tag);
+    row.appendChild(document.createTextNode(String(h.text == null ? '' : h.text)));
+    $('coHist').appendChild(row);
+  });
   // 面板开着时顺路刷新"最近播报条数"（关着时这行什么都不做）
   coachPanelMaybeRefresh();
   coachTyreMaybeRefresh();
@@ -11629,8 +11843,13 @@ function renderCoachOff(){
 function askCoachUrl(){
   const v = prompt('赛道工程师的地址（通常跑在玩家电脑上）：', coachUrl);
   if (!v) return;
-  const url = v.trim().replace(/\/+$/, '');
-  if (!/^https?:\/\//.test(url)) { alert('要带 http:// 或 https://'); return; }
+  if (!/^https?:\/\//i.test(v.trim())) { alert('要带 http:// 或 https://'); return; }
+  // 🔴 手填这条路也走同一个白名单（coachAcceptUrl）：
+  //    只给 `?coach=` 加校验、放过 prompt，等于门锁了一半。
+  //    这里用户是**主动输入的**，所以跨源时只提示、不再确认（confirm 会
+  //    显得像在问"你确定你刚输入的地址吗"），但仍要拦掉非 http(s)。
+  const url = coachAcceptUrl(v);
+  if (!url) { alert('地址不可用'); return; }
   coachUrl = url;
   try { localStorage.setItem(COACH_KEY, url); } catch (e) { /* 忽略 */ }
   coachRetry = COACH_POLL_MS;

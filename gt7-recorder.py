@@ -1032,6 +1032,10 @@ class Recorder:
         last_active = 0.0
         last_hb = time.time()      # 上次发心跳的时间
         hb_count = 0# 已发送心跳次数
+        # 上次 touch status.json 的 mtime（供 Docker HEALTHCHECK 判活）。
+        # 初值取 0 而不是 now：启动后立刻 touch 一次，让 HEALTHCHECK 的
+        # start-period 一过就能拿到新鲜 mtime，不用等 20 秒。
+        last_status_touch = 0.0
         batch: list[tuple[bytes, float]] = []   # (原始包, 到达时刻)
         batch_addr = "0.0.0.0"
 
@@ -1157,6 +1161,32 @@ class Recorder:
                         " —— 缺少它 PS5 会停止发遥测",
                         force=True,
                     )
+
+            # —— 状态文件保活（仅 touch mtime，**不改内容**）——
+            #
+            # 🔴 这是 Docker HEALTHCHECK 能成立的前提，别删。
+            #
+            # 背景：_write_status() 只在 _handle_sample() 里调用，也就是
+            # **只有收到遥测包才会刷新 status.json**。而 PS5 关机 / 退回主菜单
+            # 不玩的时候，一个包都不来 → 文件 mtime 就冻在最后一次收包的时刻。
+            # 于是 HEALTHCHECK（查 mtime 新鲜度）会在 PS5 关机期间报 unhealthy。
+            #
+            # 而 HEALTHCHECK 要回答的是"**recorder 这个进程还活着吗**"，
+            # 不是"PS5 开机了吗"。这两件事必须分开：
+            #   · 进程活着  → 容器 healthy（本条保活保证）
+            #   · 在收数据   → 看 status.json 的 `t` 字段 / 帧计数
+            # 混在一起的后果：PS5 一关机，监控就一片红，久了没人看 ——
+            # 真出事时这个检查已经被训练成"狼来了"。
+            #
+            # 为什么只 touch 不重写内容：
+            #   重写会把 `t` 改成当前时刻，等于**伪造"刚刚还在收包"**，
+            #   仪表盘那侧靠 `t` 判 connected 的逻辑会永远显示"采集中"。
+            #   touch 只动 mtime，`t` 保持不变 —— 两个语义各管各的。
+            #
+            # 20 秒一次，比 HEALTHCHECK 的 120 秒阈值密 6 倍，留足余量。
+            if self.args.status_file and time.time() - last_status_touch >= 20.0:
+                last_status_touch = time.time()
+                self._touch_status_alive()
 
             # —— 场次边界（一）：离开赛道够久 → 结束本场 ——
             # 🔴 这是场次切分的主要依据。GT7 退回菜单/结算后仍持续发遥测，
@@ -1466,6 +1496,44 @@ class Recorder:
             self._gg_last_t = now
             if len(self._gg) > self.gg_cap:
                 del self._gg[: len(self._gg) - self.gg_cap]
+
+    def _touch_status_alive(self) -> None:
+        """刷新 status.json 的 mtime，但**不改内容** —— 只用来证明进程还活着。
+
+        🔴 为什么需要它：`_write_status()` 只在收到遥测包时调用。PS5 关机
+           或停在主菜单时一个包都不来，status.json 的 mtime 就冻住了，
+           Docker HEALTHCHECK（查 mtime 新鲜度）会一直报 unhealthy ——
+           但 recorder 进程其实好好的。
+
+        🔴 为什么**不重写**内容：重写会把 payload["t"] 改成当前时刻，
+           而仪表盘判 connected 用的正是 `t`（见 TelemetryHub.refresh 里的
+           `stale = time.time() - payload["t"] > 5`）。那样等于**伪造在收包**，
+           PS5 关机时仪表盘会永远显示"采集中"。mtime 与 t 必须各管一件事：
+             · mtime    → 进程活着吗（本方法负责）
+             · payload.t → 在收包吗（_write_status 负责）
+
+        文件还不存在时（从没收到过包）建一个最小骨架，让 HEALTHCHECK
+        在 PS5 一直没开机的场景下也有新鲜 mtime。骨架故意**不带 frame**，
+        这样 TelemetryHub.refresh 走到 `if not frame: return` 会原样忽略它，
+        不会误报 connected。
+        """
+        p = self.args.status_file
+        if not p:
+            return
+        try:
+            if os.path.exists(p):
+                os.utime(p, None)
+                return
+            # 建骨架：只在"从没收到过包"时执行一次，_write_status 一旦跑过
+            # 就会把它覆盖成真正的状态。
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"t": 0, "alive": True,
+                           "frames_total": 0, "session_start": 0.0},
+                          f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, p)
+        except OSError:
+            pass
 
     def _write_status(self, sample: TelemetrySample, now: float) -> None:
         """

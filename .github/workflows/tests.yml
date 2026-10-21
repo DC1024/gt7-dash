@@ -1,9 +1,18 @@
 name: Tests
 
+# 🔴 这个 workflow 既自己跑，也被 release-exe.yml / docker.yml **调用**。
+#    加 `workflow_call` 就是为了后者 —— 跨 workflow 的 `needs:` 在
+#    GitHub Actions 里**不存在**（`workflow_run` 只能拿到上一次运行的结果，
+#    且要等整条 workflow 结束，时序不可控）。唯一可靠的"先测后发"是把
+#    测试做成可复用 workflow，让发布 job `needs` 它。
 on:
   push:
     branches: [main]
+    # tag 也要跑：发版时打的 tag 往往不在 main 的最新提交上，
+    # 只监听 branches 等于「发版那次代码没被测过」。
+    tags: ['v*']
   pull_request:
+  workflow_call:
 
 jobs:
   pytest:

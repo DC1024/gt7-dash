@@ -11,7 +11,13 @@ permissions:
   packages: write
 
 jobs:
+  # 与 release-exe.yml 同样的道理：镜像推送也要先过测试。
+  # 见那边关于 `uses:` vs `needs:` 的说明。
+  test:
+    uses: ./.github/workflows/tests.yml
+
   build:
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

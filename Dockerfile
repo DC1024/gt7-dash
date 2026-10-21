@@ -35,8 +35,11 @@ COPY gt7-recorder.py gt7-dashboard.py gt7analysis.py gt7-event-detector.py gt7-o
 #   我试过两版都算不出正确密钥流），所以用 Go 的标准库编译成静态二进制。
 #   交叉编译时必须显式设 GOOS/GOARCH，否则会出 PE 格式无法在 Linux 运行。
 COPY gt7-decrypt/gt7-decrypt-linux-amd64 /app/gt7-decrypt
-RUN chmod 755 /app/gt7-decrypt && /app/gt7-decrypt -selftest || \
-    echo "(自检提示：真实包解密已在部署时验证过)"
+# 🔴 自检失败必须让**构建失败**，不能 `|| echo "提示"` 吞掉。
+#    原来那行 `|| echo "(自检提示：真实包解密已在部署时验证过)"` 等于：
+#    "必需组件测了，但测不过也照样发布" —— 那这个检查就没有任何意义，
+#    反而给人"已经验证过"的错觉。宁可构建红，也不要静默出一个解不开包的镜像。
+RUN chmod 755 /app/gt7-decrypt && /app/gt7-decrypt -selftest
 
 # 数据目录（用 volume 挂到宿主机，容器重建不丢数据）
 RUN mkdir -p /data && chmod 777 /data
@@ -46,9 +49,28 @@ RUN useradd --uid 10001 --create-home gt7 \
     && chown -R gt7:gt7 /app /data
 USER gt7
 
-# 健康检查：UDP 端口无连接状态可查，所以用「进程是否活着」+ 目录可写
-HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import os,sys; sys.exit(0 if os.access('/data', os.W_OK) else 1)"
+# 健康检查：查 status.json 的 **mtime**，用它回答"recorder 进程还活着吗"。
+#
+# 🔴 这条检查**不是**"PS5 在发数据吗"，两件事必须分开（混过一次，见下）：
+#    · mtime 新鲜  → recorder 主循环还在跑（本检查）
+#    · 真的在收包   → `/api/health` 的 `last_packet_age` 或 status.json 的 `t`
+#
+#    为此 recorder 主循环里加了 `_touch_status_alive()`：每 20 秒 touch
+#    一次 mtime。**没有它这条检查根本不成立** —— `_write_status()` 只在
+#    收到遥测包时被调用，PS5 一关机 mtime 就冻住，容器会在 PS5 停机
+#    期间一直 unhealthy。而 HEALTHCHECK 要报的是"我的进程死了没有"，
+#    不是"用户开没开游戏机"；后者天天红，久了就没人看了。
+#    （这一条在计划文档里写反了，实测确认后才纠正过来。）
+#
+# 为什么用 mtime 而不是 `os.access('/data', W_OK)`：
+#    原来只判目录可写 —— 那个属性**在容器整个生命周期内都不会变**，
+#    等于一个永远健康的常量，测不出任何东西。mtime 至少能发现
+#    "主循环卡死 / 进程被杀"。
+#
+# 120 秒阈值 vs 20 秒 touch 间隔：留 6 倍余量，避免磁盘抖动造成假红。
+HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os,sys,time; p='/data/status.json'; \
+        sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)"
 
 # 说明：真正的端口在 compose 里由 host 网络直接占用，这里仅作文档
 EXPOSE 33739/udp

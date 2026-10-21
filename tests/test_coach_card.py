@@ -371,6 +371,19 @@ class TestRuleSubToggles:
         assert "closest('.cp-sub')" in blk
 
     def test_sub_rows_updated_in_place(self, page):
-        """周期刷新就地改子开关，不重写骨架（否则冲掉用户正点的复选框）。"""
+        """周期刷新就地改子开关，不重写骨架（否则冲掉用户正点的复选框）。
+
+        🔴 这条断言原先锁的是 `cp-sub[data-sub=` 这个**选择器字符串写法**。
+           但那正是 P1-5 修掉的注入面：`'.cp-sub[data-sub="' + s.id + '"]'`
+           里 s.id 来自教练服务端，含引号时会拼出非法选择器 → 抛
+           SyntaxError → 整个 forEach 中断。改成按 dataset 比对后，
+           测试也跟着改成锁**语义**（就地更新、按 data 值匹配、不重画骨架），
+           而不是锁某一种实现写法。
+        """
         blk = page[page.index("function renderCoachPanel("):][:1600]
-        assert "cp-sub[data-sub=" in blk
+        # 就地更新：只改 className / checked，不重写 innerHTML
+        assert "sub.className = 'cp-sub'" in blk
+        assert "innerHTML" not in blk.split("coachPanelGroups.forEach")[1][:900]
+        # 按 dataset 值匹配（不是把值拼进选择器字符串）
+        assert ".cp-sub" in blk
+        assert "dataset.sub === String(s.id)" in blk
