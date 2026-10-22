@@ -3585,6 +3585,23 @@ PAGE = ""  # 由 build_page() 填充
 # 公开 API v1 —— 稳定接口，给第三方程序读取解密后的遥测
 # ---------------------------------------------------------------------------
 
+def _steer_deg(latest: dict[str, Any]) -> float | None:
+    """前轮平均转角（度，正 = 左转）。格式 A/B/~ 没有该字段 → None。
+
+    🔴 必须用 `is None` 判断，不能写 `a or b`：转角 0.0（直道）是**合法值**，
+       用 or 会把 0.0 当假值丢掉，于是直道上反而变成 null。
+    """
+    left = latest.get("steer_angle_l")
+    right = latest.get("steer_angle_r")
+    if left is None and right is None:
+        return None
+    if left is None:
+        left = right
+    if right is None:
+        right = left
+    return round((left + right) / 2 * 180 / math.pi, 2)
+
+
 def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
     """把内部 snapshot 映射成对外稳定结构。
 
@@ -3640,6 +3657,14 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
             "velocity_ms": L.get("velocity", [0.0, 0.0, 0.0]),
             "g_force": {"longitudinal": gl, "lateral": gt_,
                         "magnitude": round(math.hypot(gl, gt_), 3)},
+            # —— 前轮转角（**格式 C 独有**，A/B/~ 时为 null）——
+            # 单位是**度**，正 = 左转。符号约定来自实测：corr(转角, 横摆角速度)
+            # = +0.85，且 GT7 为右手系 → 正角速度 = 左转。见
+            # tools/analyze_capture_c.py。Ackermann 差异很小，给平均值即可，
+            # 左右轮原值仍可从场次 jsonl 的 steer_angle_l / steer_angle_r 取。
+            "steer_angle_deg": _steer_deg(L),
+            "wheel_base_m": L.get("wheel_base"),
+            "car_category": L.get("car_category"),
             "fuel_pct": L.get("gas_level", 0.0),
             "fuel_capacity_l": L.get("gas_capacity", 0.0),
             # —— 动力类型与能量（新增，稳定承诺）——
@@ -3900,6 +3925,9 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `g_force.longitudinal` | g | 纵向：正值加速、负值刹车 |
 | `g_force.lateral` | g | 横向：**正值右转、负值左转** |
 | `g_force.magnitude` | g | 合力大小 |
+| `steer_angle_deg` | 度 | 前轮平均转角，**正 = 左转**。**仅格式 C 有**，A/B/~ 为 `null` |
+| `wheel_base_m` | 米 | 轴距。**仅格式 C 有**，其余为 `null` |
+| `car_category` | string | GT7 组别串（如 `GR1`）。**仅格式 C 有**，其余为 `null` |
 | `fuel_pct` | 0~100 | 剩余油量百分比；**纯电车时是剩余电量 kWh**（看 `powertrain`） |
 | `fuel_capacity_l` | 升 | 油箱容量（纯电为 0） |
 | `powertrain` | 枚举 | 动力类型：`fuel`（燃油/混动）/ `electric`（纯电）/ `kart` |
@@ -4480,7 +4508,7 @@ t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这�
 | `speed_kph` / `throttle` / `brake` / `t_rel_s` / `glat` / `glon` | 与 `grid_m` **一一对齐**的通道 |
 | `pt.x` / `pt.z` | 同一网格上的几何折线，消费方用它做实时最近点定位；本圈无坐标时为空数组 |
 | `markers.brake_in[]` | 刹车入点：`s_in_m` / `s_out_m` / `speed_in_kph` / `peak_brake` / `duration_s` / `v_min_kph` |
-| `markers.apex[]` | 弯心：`s_m` / `speed_kph` / `glat` / `radius_m` / `turn`（左/右）。半径由 `κ = G_lat·g/v²` 反推 —— 协议里**没有转向角** |
+| `markers.apex[]` | 弯心：`s_m` / `speed_kph` / `glat` / `radius_m` / `turn`（左/右）。半径由 `κ = G_lat·g/v²` 反推 —— 格式 A/B/~ **没有转向角**（格式 C 从 v1.7.0 起有 `steer_angle_l/r`，但本接口仍用曲率，好让 C 包场次与历史 A 包场次口径一致） |
 | `markers.throttle_on[]` | 出弯给油点：`s_m` / `speed_kph` / `after_apex_m` |
 | `markers.peak[]` / `markers.valley[]` | 原始速度极值点（峰/谷交替） |
 | `warnings[]` | 降级与口径提示。**空数组才是干净的**，非空必须往界面上显 |
@@ -10203,6 +10231,15 @@ b, output, td.num { font-variant-numeric:tabular-nums; }
 .fill.fuel { background:linear-gradient(90deg,var(--accent),rgba(var(--accent-rgb),.55)); }
 .fill.fuel.low { background:var(--bad); }
 .fill.turbo { background:#20c997; }
+/* 前轮转角：**以中点为零**的双向条（油门/刹车那种从左边长的条没法表示左右）。
+   中点那条竖线是零位参考；填充往哪边长由 JS 按符号决定。 */
+.track.steer { position:relative; }
+.track.steer::after { content:''; position:absolute; left:50%; top:0; bottom:0;
+  width:1px; background:rgba(128,128,128,.6); }
+.track.steer .fill { position:absolute; top:0; bottom:0; width:0;
+  transition:width .08s linear, left .08s linear; }
+.fill.steer { background:#7c5cff; }
+#oSteer { width:58px; }
 .shiftlamp { display:flex; gap:5px; justify-content:center; margin:9px 0 2px; }
 .shiftlamp i { width:15px; height:7px; border-radius:3px;
   background:rgba(128,128,128,.28); transition:background .05s; }
@@ -10556,6 +10593,16 @@ th { color:var(--muted); font-weight:500; }
         <p class="dim">横向 G 带符号：<b>正值 = 右转</b>，负值 = 左转；
            纵向 G 正值 = 加速、负值 = 刹车。所以 G-G 图上左右两半
            分别对应左弯和右弯，正常跑一圈应该两边都有点。</p>
+      </section>
+      <section>
+        <h4>前轮转角</h4>
+        <p>两只前轮<b>相对车身</b>的转角（左右取平均）。注意它<b>不是方向盘转角</b>：
+           方向盘打 90° 时前轮往往只转了 6°，中间隔着一整套转向齿比。</p>
+        <p class="dim">条以中点为零位：往<b>左</b>长 = 左转，往<b>右</b>长 = 右转，
+           满量程 ±12°（实测前轮很少超过 ±10°）。
+           它和 G 力球方向相反是正常的 —— G 力球画的是<b>人被甩出去</b>的方向（离心），
+           前轮转角画的是<b>车实际往哪转</b>。这个字段只有<b>格式 C</b> 的遥测包才有，
+           用 A/B/~ 包时整行不显示。</p>
       </section>
       <section>
         <h4>行车轨迹的着色</h4>
@@ -10988,6 +11035,11 @@ th { color:var(--muted); font-weight:500; }
       <div class="bar-row"><label>纵向 G</label>
         <div class="track"><div class="fill lon" id="fLon" style="width:0"></div></div>
         <output id="oLon">0.00</output></div>
+      <!-- 前轮转角（格式 C 独有）：A/B/~ 包没有这个字段，整行隐藏 -->
+      <div class="bar-row" id="steerRow" style="display:none">
+        <label>前轮转角</label>
+        <div class="track steer"><div class="fill steer" id="fSteer"></div></div>
+        <output id="oSteer">--</output></div>
       <div class="ptrace-wrap">
         <div class="ptrace-lgd">
           <span><i style="background:var(--ok)"></i>油门</span>
@@ -11450,6 +11502,31 @@ function render(s) {
   $('oLat').textContent = lat.toFixed(2);
   $('fLon').style.width = Math.min(100, Math.abs(lon) / 2 * 100) + '%';
   $('oLon').textContent = lon.toFixed(2);
+
+  // 前轮转角（**格式 C 独有**，A/B/~ 包里没有 → 整行隐藏）
+  //
+  // 符号约定（实测，见 tools/analyze_capture_c.py）：
+  //   corr(steer_l, ω_y) = +0.85，而 corr(dθ/dt, ω_y) = −0.93
+  //   → GT7 是右手系（y 向上），正横摆角速度 = 逆时针俯视 = **左转**，
+  //   所以 **转角为正 = 左转**。填条也就往中点左边长。
+  // 幅度：实测前轮 ±0.17 rad ≈ ±10°，量程取 12° 留点余量。
+  const STEER_MAX_DEG = 12;
+  const stL = (L.steer_angle_l == null) ? null : L.steer_angle_l;
+  const stR = (L.steer_angle_r == null) ? null : L.steer_angle_r;
+  const stAvg = (stL != null && stR != null) ? (stL + stR) / 2
+              : (stL != null ? stL : stR);
+  if (stAvg == null) {
+    $('steerRow').style.display = 'none';
+  } else {
+    $('steerRow').style.display = '';
+    const deg = stAvg * 180 / Math.PI;
+    const w = Math.min(50, Math.abs(deg) / STEER_MAX_DEG * 50);
+    const fs = $('fSteer');
+    fs.style.left = (deg >= 0 ? 50 - w : 50) + '%';
+    fs.style.width = w + '%';
+    $('oSteer').textContent = (Math.abs(deg) < 0.05) ? '0.0°'
+      : (deg > 0 ? 'L ' : 'R ') + Math.abs(deg).toFixed(1) + '°';
+  }
 
   // 四轮温度：按**所选胎种**的工作窗口三色着色（到位绿 / 不足黄 / 超出红）。
   // 🔴 窗口来自教练的 tyre_compounds，这里不写死温度；没选胎种则退回

@@ -7,7 +7,19 @@
 ![GHCR](https://img.shields.io/badge/镜像-ghcr.io-blue)
 ![License](https://img.shields.io/badge/许可-MIT-green)
 
-> **当前版本：v1.7.0**（以 `gt7_version.py` 为唯一版本源）—— **默认包类型从 A 换成 C**。
+> **当前版本：v1.8.0**（以 `gt7_version.py` 为唯一版本源）—— **实时界面画出前轮转角**。
+>
+> v1.7.0 起默认请求格式 C，它比 A 包多出三样 A 包完全没有的东西：
+> **真实转向角** `wheelSteeringAngle[2]`、**轴距** `wheelBase`、**组别** `carCategory`。
+> 本版把转向角接到界面上：「踏板与 G 力」卡片多一条**以中点为基准的双向条**，
+> 读数按 `L 6.2°` / `R 3.1°` 显示。A/B/~ 包没有这个字段 → 整行隐藏，不假装是 0。
+>
+> 符号约定不是猜的（10749 帧真实 C 包，`tools/analyze_capture_c.py`）：
+> `corr(转角, 横摆角速度) = +0.85`，而 `corr(dθ/dt, ω_y) = −0.93` 说明 GT7 是右手系
+> → **正角 = 左转**；独立物理验证（左转时右侧轮走外圈、轮速更快）给出同向结论 `+0.45`。
+>
+> `/api/v1/live` 同步新增 `steer_angle_deg` / `wheel_base_m` / `car_category`
+> 三个字段（A/B/~ 包时为 `null`）。
 >
 > 用 10146 帧真实 C 包逐字段验证后确认：**C 包是 A 包的超集**。
 >
@@ -19,8 +31,7 @@
 > | 车辆 | car_code / 水温 / 油温 / 油压 | 2181 / 85°C / 110°C / 3~7 |
 > | 圈速 | best_lap / last_lap | 132162 ms |
 >
-> 额外多出三样 A 包完全没有的：**真实转向角** `wheelSteeringAngle[2]`、
-> **轴距** `wheelBase`、**组别** `carCategory`。代价只有带宽（296→368 字节）。
+> 代价只有带宽（296→368 字节）。
 >
 > 切回 A 的兜底仍然保留（GT7 < 1.68 用不了 C）：
 > `GT7_PACKET_TYPE=A docker compose up -d --no-deps gt7-recorder`

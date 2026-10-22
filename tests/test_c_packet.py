@@ -194,3 +194,49 @@ class TestDefaultIsC:
         assert "请求的包类型是" in text, (
             "没有包类型不符的警告 —— 切换失败会静默录一场没有转向角的数据")
         assert "_layout_warn_t" in text, "警告没有限流，会刷屏"
+
+
+class TestSteerAngleApi:
+    """`/api/v1/live` 里的转向角：符号约定与 null 语义。
+
+    符号是实测出来的（tools/analyze_capture_c.py，10749 帧真实 C 包）：
+      · corr(steer_l, ω_y) = +0.85，corr(dθ/dt, ω_y) = −0.93 → 右手系，
+        正横摆角速度 = 左转 → **转角为正 = 左转**
+      · 独立物理验证（不依赖坐标系假设）：corr(转角, 右轮速−左轮速) = +0.45，
+        左转时右侧走外圈、轮速更快 —— 与上面一致
+    """
+
+    def test_正值是左转_负值是右转(self, dash):
+        f = dash._steer_deg({"steer_angle_l": 0.10, "steer_angle_r": 0.08})
+        assert f is not None and f > 0, "正转角应保持正号（左转）"
+        assert f == pytest.approx(0.09 * 180 / 3.141592653589793, abs=0.01)
+        assert dash._steer_deg(
+            {"steer_angle_l": -0.10, "steer_angle_r": -0.10}) < 0
+
+    def test_直道_0_度不能被当成缺失(self, dash):
+        """0.0 是合法值。写成 `a or b` 会把直道判成 null，整行消失。"""
+        assert dash._steer_deg(
+            {"steer_angle_l": 0.0, "steer_angle_r": 0.0}) == 0.0
+
+    def test_只有一只轮有值时也能用(self, dash):
+        assert dash._steer_deg({"steer_angle_l": 0.05}) is not None
+        assert dash._steer_deg({"steer_angle_r": 0.05}) is not None
+
+    def test_A_包没有转角时返回_None(self, dash):
+        """A/B/~ 包必须给 null，前端据此隐藏整行 —— 不能假装是 0。"""
+        assert dash._steer_deg({"speed_kph": 120.0}) is None
+
+    def test_live_接口带三个_C_字段(self, dash):
+        snap = {"latest": {"steer_angle_l": 0.12, "steer_angle_r": 0.10,
+                           "wheel_base": 2.895, "car_category": "GR1"}}
+        car = dash._v1_live(snap)["car"]
+        assert car["steer_angle_deg"] == pytest.approx(6.31, abs=0.05)
+        assert car["wheel_base_m"] == 2.895
+        assert car["car_category"] == "GR1"
+
+    def test_A_包场次的_live_三个字段是_null(self, dash):
+        car = dash._v1_live({"latest": {"speed_kph": 100.0}})["car"]
+        assert car["steer_angle_deg"] is None
+        assert car["wheel_base_m"] is None
+        assert car["car_category"] is None
+

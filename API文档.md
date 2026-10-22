@@ -194,6 +194,9 @@
 | `g_force.longitudinal` | g | 纵向：正值加速、负值刹车 |
 | `g_force.lateral` | g | 横向：**正值右转、负值左转** |
 | `g_force.magnitude` | g | 合力大小 |
+| `steer_angle_deg` | 度 | 前轮平均转角，**正 = 左转**。**仅格式 C 有**，A/B/~ 为 `null` |
+| `wheel_base_m` | 米 | 轴距。**仅格式 C 有**，其余为 `null` |
+| `car_category` | string | GT7 组别串（如 `GR1`）。**仅格式 C 有**，其余为 `null` |
 | `fuel_pct` | 0~100 | 剩余油量百分比；**纯电车时是剩余电量 kWh**（看 `powertrain`） |
 | `fuel_capacity_l` | 升 | 油箱容量（纯电为 0） |
 | `powertrain` | 枚举 | 动力类型：`fuel`（燃油/混动）/ `electric`（纯电）/ `kart` |
@@ -774,7 +777,7 @@ t_video   = t_session − offset_s                  ← ffmpeg -ss 要的是这�
 | `speed_kph` / `throttle` / `brake` / `t_rel_s` / `glat` / `glon` | 与 `grid_m` **一一对齐**的通道 |
 | `pt.x` / `pt.z` | 同一网格上的几何折线，消费方用它做实时最近点定位；本圈无坐标时为空数组 |
 | `markers.brake_in[]` | 刹车入点：`s_in_m` / `s_out_m` / `speed_in_kph` / `peak_brake` / `duration_s` / `v_min_kph` |
-| `markers.apex[]` | 弯心：`s_m` / `speed_kph` / `glat` / `radius_m` / `turn`（左/右）。半径由 `κ = G_lat·g/v²` 反推 —— 协议里**没有转向角** |
+| `markers.apex[]` | 弯心：`s_m` / `speed_kph` / `glat` / `radius_m` / `turn`（左/右）。半径由 `κ = G_lat·g/v²` 反推 —— 格式 A/B/~ **没有转向角**（格式 C 从 v1.7.0 起有 `steer_angle_l/r`，但本接口仍用曲率，好让 C 包场次与历史 A 包场次口径一致） |
 | `markers.throttle_on[]` | 出弯给油点：`s_m` / `speed_kph` / `after_apex_m` |
 | `markers.peak[]` / `markers.valley[]` | 原始速度极值点（峰/谷交替） |
 | `warnings[]` | 降级与口径提示。**空数组才是干净的**，非空必须往界面上显 |
