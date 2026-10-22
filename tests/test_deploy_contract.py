@@ -155,8 +155,22 @@ class TestDockerfileIsSelfContained:
         # 那边查"有没有吞错误"，这边查"改成多阶段/多分支后有没有被跳过"。
         text = _read("Dockerfile")
         assert "-selftest" in text
-        assert "gt7-decrypt/gt7-decrypt-linux-amd64" in text, (
-            "解密器二进制没被拷进镜像")
+
+    def test_Go_源码改了会进镜像(self):
+        """有 main.go 就必须在镜像里编译，不能 COPY 预编译二进制。
+
+        🔴 真实事故：Dockerfile 原本是 COPY 仓库里的 gt7-decrypt-linux-amd64，
+           改 main.go（C 包的 0xDEADBEEF mask）之后 CI 全绿、镜像推送成功、
+           部署成功、版本号也对 —— 但 C 包一个都解不开，因为镜像里还是
+           上周那个二进制。这种"改了源码但产物没变"在 CI 上完全看不出来。
+        """
+        text = _read("Dockerfile")
+        assert "FROM golang" in text, (
+            "Dockerfile 没有 Go 构建阶段 —— 改了 main.go 不会进镜像")
+        assert "--from=gobuild" in text, (
+            "解密器不是从构建阶段取的，改了 .go 不会生效")
+        assert not (ROOT / "gt7-decrypt" / "gt7-decrypt-linux-amd64").exists(), (
+            "仓库里还留着预编译二进制 —— 它会让人以为改 .go 有用")
 
 
 class TestCompose:
