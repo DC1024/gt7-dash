@@ -180,3 +180,31 @@ class TestMetricsEndpoint:
         _, body = metrics
         assert "gt7_connected" not in body, (
             "把「游戏在不在跑」做成 0/1 指标，会让告警在正常关机时天天响")
+
+
+class TestSubprocessEncoding:
+    """`gen_changelog.py` 的 git 调用必须显式 UTF-8。
+
+    🔴 真事故：Windows 上 `text=True` 用系统代码页（简中 = cp936），
+       而 git 输出是 UTF-8。中文提交信息里只要出现 cp936 没有的字节，
+       整个生成就抛 UnicodeDecodeError —— CI 的 windows-exe job 在
+       「生成发行说明」那一步炸了，而 Linux 上永远测不出来。
+    """
+
+    def test_所有_subprocess_都指定_encoding(self):
+        text = _read("tools/gen_changelog.py")
+        # 找出每个 subprocess.run(...) 调用块，逐块检查
+        blocks = text.split("subprocess.run(")[1:]
+        assert blocks, "没找到 subprocess.run —— 脚本结构变了？"
+        bad = []
+        for blk in blocks:
+            head = blk[:400]              # 参数都在开头
+            # 只要求「会读输出」的调用：不 capture_output 的（如
+            # `merge-base --is-ancestor` 只看返回码）没有解码问题。
+            if "capture_output=True" not in head and "text=True" not in head:
+                continue
+            if "encoding=" not in head:
+                bad.append(head.splitlines()[0][:60])
+        assert not bad, (
+            f"这些 subprocess.run 没指定 encoding：{bad}\n"
+            "Windows 上会用 cp936 解码 UTF-8 输出，中文提交信息直接崩")

@@ -37,8 +37,13 @@ TYPE_RE = re.compile(r"^(\w+)(?:\(([^)]*)\))?!?:\s*(.+)$")
 
 
 def _git(*args: str) -> str:
+    # 🔴 必须显式 `encoding="utf-8"`：Windows 上 `text=True` 用的是**系统
+    #    代码页**（简中 = cp936），而 git 输出是 UTF-8。中文提交信息里只要
+    #    出现 cp936 没有的字节（如 0x81），整个生成就抛 UnicodeDecodeError。
+    #    Linux 默认就是 UTF-8，所以本地永远测不出来 —— CI 的 windows-exe
+    #    job 第一次跑就炸在「生成发行说明」这一步。
     return subprocess.run(["git", *args], cwd=ROOT, capture_output=True,
-                          text=True).stdout
+                          encoding="utf-8", errors="replace").stdout
 
 
 def _tags() -> list[tuple[str, str]]:
@@ -143,7 +148,8 @@ def _is_ancestor(maybe_ancestor: str, sha: str) -> bool:
 def _version_at(sha: str) -> str | None:
     """读某个提交里 gt7_version.py 的版本号；文件不存在返回 None。"""
     out = subprocess.run(["git", "show", f"{sha}:gt7_version.py"], cwd=ROOT,
-                         capture_output=True, text=True)
+                         capture_output=True, encoding="utf-8",
+                         errors="replace")
     if out.returncode != 0:
         return None
     m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', out.stdout, re.M)
