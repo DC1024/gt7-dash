@@ -40,6 +40,13 @@ services:
       - /data
       - --status-file
       - /data/status.json
+      # 包类型：A = 296B（基础，最稳）；C = 368B（多真实转向角/轴距/组别，
+      # 需 GT7 1.68+）。实测 C **包含 A 的全部字段**，所以能用 C 就用 C。
+      # 🔴 改这个必须**重启容器 + 重进赛道**才生效：GT7 在「进入赛道」那一刻
+      #    确定包类型，中途改心跳完全不理会（实测踩过）。
+      # 切换：GT7_PACKET_TYPE=C docker compose up -d --no-deps gt7-recorder
+      - --packet-type
+      - ${GT7_PACKET_TYPE:-A}
       # --ps5 auto   ← 默认自动发现 PS5；网络环境复杂时可锁定 IP：
       # --ps5 192.168.x.x
       - --verbose
