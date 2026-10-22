@@ -1484,6 +1484,98 @@ def _first_car_code(path: Path) -> int:
 _BEST_LAP_CACHE: dict[tuple[float, int], float | None] = {}
 
 
+# —— 场次索引：把「最快圈」落盘，跨重启复用 ——
+#
+# 🔴 为什么必须落盘：列表页要为每个场次显示「最快圈」，而最快圈可能在
+#    任意一帧 —— `_best_lap_of` 只能把整个 jsonl 解析一遍。实测服务器上
+#    72 个场次 / 520MB，冷启动 **25 秒**；而 `_BEST_LAP_CACHE` 是进程内的，
+#    容器一重启就全丢 —— 于是每次部署/重启后第一次点「历史场次」都要
+#    白屏转圈 25 秒（用户报的就是这个现象）。
+#
+#    按 (mtime, size) 把结果存进 data/session_index.json：文件没变就直接
+#    查表，变了才重算。索引本身几十 KB，读写都是一次性的小 JSON。
+_SESSION_INDEX_NAME = "session_index.json"
+_INDEX_LOCK = threading.RLock()
+_INDEX_MEM: dict[Path, dict[str, dict[str, Any]]] = {}
+
+
+def _index_of(history_dir: Path) -> dict[str, dict[str, Any]]:
+    """取某目录的场次索引（懒加载 + 进程内缓存）。"""
+    try:
+        key = history_dir.resolve()
+    except OSError:
+        key = history_dir
+    with _INDEX_LOCK:
+        got = _INDEX_MEM.get(key)
+        if got is not None:
+            return got
+        raw = _read_json(key / _SESSION_INDEX_NAME, {})
+        rows = raw.get("sessions") if isinstance(raw, dict) else None
+        _INDEX_MEM[key] = rows if isinstance(rows, dict) else {}
+        return _INDEX_MEM[key]
+
+
+def _index_put(path: Path, best: float | None) -> None:
+    """记一条并落盘。写失败不影响功能（下次重算而已），所以静默。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    hist = path.parent
+    # 🔴 写盘必须留在锁内：早先把 snapshot 取出来、锁外写，两个线程交错时
+    #    「先取到少条目的那个」后落盘，会把另一个线程刚算好的条目覆盖掉
+    #    （下次重算，但预热就白做了）。索引只有几十 KB，锁内写代价可忽略。
+    with _INDEX_LOCK:
+        rows = _index_of(hist)
+        rows[path.name] = {
+            "m": round(st.st_mtime, 3), "s": st.st_size, "best": best,
+        }
+        try:
+            _atomic_write_json(hist / _SESSION_INDEX_NAME,
+                               {"schema": 1, "sessions": dict(rows)})
+        except OSError:
+            pass
+
+
+def _index_lookup(path: Path, st: Any) -> tuple[bool, float | None]:
+    """索引里有没有这个文件的当前版本。返回 (命中?, best)。"""
+    hist = path.parent
+    try:
+        rows = _index_of(hist)
+    except OSError:
+        return False, None
+    row = rows.get(path.name)
+    if not isinstance(row, dict):
+        return False, None
+    # 🔴 用 mtime + size 双判据：只看 mtime 会被「同一秒内改写」骗过，
+    #    只看 size 会被「等长覆盖」骗过。活场文件还在增长，两个都会变。
+    if row.get("m") != round(st.st_mtime, 3) or row.get("s") != st.st_size:
+        return False, None
+    best = row.get("best")
+    if best is not None and not isinstance(best, (int, float)):
+        return False, None
+    return True, best
+
+
+def warm_session_index(history_dir: Path, limit: int = 300) -> None:
+    """后台把索引补齐 —— 部署后第一次点列表页不该再转圈。
+
+    命中索引时 `_best_lap_of` 只是一次字典查表，所以这个循环对已算过的
+    场次几乎零成本；只有新场次才会真正解析。每场之间让出 20ms，
+    避免和正在进行的录制抢 IO。
+    """
+    try:
+        files = glob_sessions(history_dir)[:limit]
+    except OSError:
+        return
+    for f in files:
+        try:
+            _best_lap_of(f)
+        except Exception:
+            continue
+        time.sleep(0.02)
+
+
 def _best_lap_of(path: Path) -> float | None:
     """场次的最快有效圈（秒，圈跨度 ≥20s 才算，口径同 analyze_session）。"""
     try:
@@ -1494,6 +1586,12 @@ def _best_lap_of(path: Path) -> float | None:
     with _CACHE_LOCK:
         if key in _BEST_LAP_CACHE:
             return _BEST_LAP_CACHE[key]
+    # 跨重启的持久化索引（见 _index_of 的说明）
+    hit, cached = _index_lookup(path, st)
+    if hit:
+        with _CACHE_LOCK:
+            _BEST_LAP_CACHE[key] = cached
+        return cached
     best: float | None = None
     cur: int | None = None
     t0 = t_prev = 0.0
@@ -1536,6 +1634,7 @@ def _best_lap_of(path: Path) -> float | None:
         best = round(min(official.values()), 3)
     with _CACHE_LOCK:
         _BEST_LAP_CACHE[key] = best
+    _index_put(path, best)
     return best
 
 
@@ -12970,6 +13069,13 @@ def main() -> int:
     HUB = TelemetryHub(status_path)
     # 后台按 10Hz 刷新：增量协议下，慢速 API 消费者也能拿到完整窗口
     HUB.start_background_refresh()
+
+    # 后台预热场次索引（把每个场次的「最快圈」算一遍并落盘）。
+    # 🔴 不预热的话，容器重启后**第一次**打开「历史场次」要把 72 个场次、
+    #    520MB 全部解析一遍 —— 实测 25 秒白屏转圈。预热在后台慢慢做，
+    #    用户点进去时索引已经就绪。
+    threading.Thread(target=warm_session_index, args=(hist,),
+                     daemon=True, name="warm-index").start()
 
     class Handler(DashboardHandler):
         pass
