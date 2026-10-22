@@ -9,6 +9,7 @@
 ### 修复
 - 场次索引落盘，修复「历史场次」页冷启动转圈 25 秒（`sessions`）
 - gen_changelog 在 Windows 上用 cp936 解码 UTF-8，中文提交直接崩（`release`）
+- stdout 在 Windows 上是 cp1252，print 中文直接抛异常（`release`）
 
 ## v1.4.2
 
