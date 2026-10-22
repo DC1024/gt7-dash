@@ -280,3 +280,123 @@ class TestTracksPageUi:
         assert summary["n_laps"] == 3
         assert "pts" not in summary, "摘要里不该带点列"
         assert dash._ref_line_summary({}, 1) is None
+
+
+class TestSessionDedup:
+    """同一场次的 `.jsonl` 与 `.jsonl.gz` 两个键不能算两场。
+
+    🔴 真实数据踩到：服务器上赛道 41 有 8 个 sessions 键，实际只有 6 个场次
+       （归档前后各注册过一次）。后果是「N 场」翻倍，参考走线把同一场算两遍
+       —— 中位数被它拉偏，而且看不出来（统计里只有数字）。
+    """
+
+    def _lib(self, keys: dict) -> dict:
+        return {"next_id": 2,
+                "tracks": [{"id": 1, "name": "T"}],
+                "sessions": {k: {"track_id": 1, "dist": 0.01} for k in keys}}
+
+    def test_同一场次两个键只算一场(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl": 1,
+                         "20260101_120000_a.jsonl.gz": 1})
+        assert dash._track_session_counts(lib)[1] == 1
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl"]
+
+    def test_优先保留未压缩名(self, dash):
+        # 顺序反过来也要选 .jsonl
+        lib = self._lib({"20260101_120000_a.jsonl.gz": 1,
+                         "20260101_120000_a.jsonl": 1})
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl"]
+
+    def test_只有压缩版时用它(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl.gz": 1})
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl.gz"]
+
+    def test_不同场次都保留且新的在前(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl": 1,
+                         "20260102_120000_b.jsonl": 1,
+                         "20260102_120000_b.jsonl.gz": 1,
+                         "20260103_120000_c.jsonl": 1})
+        assert dash._track_session_counts(lib)[1] == 3
+        assert dash._unique_track_sessions(lib, 1) == [
+            "20260103_120000_c.jsonl",
+            "20260102_120000_b.jsonl",
+            "20260101_120000_a.jsonl"]
+
+    def test_别的赛道不受影响(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl": 1})
+        lib["sessions"]["20260101_130000_x.jsonl"] = {"track_id": 2}
+        assert dash._track_session_counts(lib) == {1: 1, 2: 1}
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl"]
+
+    def test_生成参考走线不重复算同一场(self, site):
+        """tracks.json 里塞一份 .gz 别名，n_laps 不该变成 6。"""
+        hist = site["hist"]
+        lib = json.loads((hist / "tracks.json").read_text(encoding="utf-8"))
+        # 给第一场加一个 .gz 别名（模拟归档前后各注册一次）
+        alias = site["names"][0].replace(".jsonl", ".jsonl.gz")
+        lib["sessions"][alias] = {"track_id": 1, "dist": 0.006}
+        (hist / "tracks.json").write_text(json.dumps(lib), encoding="utf-8")
+        _, d = _call(site["base"], "POST", "/api/v1/tracks/1/ref-line")
+        assert d["n_laps"] == 3, f"别名被算成独立场次了：{d['n_laps']}"
+        names = [s["session"] for s in d["sources"]]
+        assert len(set(names)) == 3, f"同一场出现两次：{names}"
+
+
+class TestSessionDedup:
+    """同一场次的 `.jsonl` 与 `.jsonl.gz` 两个键不能算两场。
+
+    🔴 真实数据踩到：服务器上赛道 41 有 8 个 sessions 键，实际只有 6 个场次
+       （归档前后各注册过一次）。后果是「N 场」翻倍，参考走线把同一场算两遍
+       —— 中位数被它拉偏，而且看不出来（统计里只有数字）。
+    """
+
+    def _lib(self, keys: dict) -> dict:
+        return {"next_id": 2,
+                "tracks": [{"id": 1, "name": "T"}],
+                "sessions": {k: {"track_id": 1, "dist": 0.01} for k in keys}}
+
+    def test_同一场次两个键只算一场(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl": 1,
+                         "20260101_120000_a.jsonl.gz": 1})
+        assert dash._track_session_counts(lib)[1] == 1
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl"]
+
+    def test_优先保留未压缩名(self, dash):
+        # 顺序反过来也要选 .jsonl
+        lib = self._lib({"20260101_120000_a.jsonl.gz": 1,
+                         "20260101_120000_a.jsonl": 1})
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl"]
+
+    def test_只有压缩版时用它(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl.gz": 1})
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl.gz"]
+
+    def test_不同场次都保留且新的在前(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl": 1,
+                         "20260102_120000_b.jsonl": 1,
+                         "20260102_120000_b.jsonl.gz": 1,
+                         "20260103_120000_c.jsonl": 1})
+        assert dash._track_session_counts(lib)[1] == 3
+        assert dash._unique_track_sessions(lib, 1) == [
+            "20260103_120000_c.jsonl",
+            "20260102_120000_b.jsonl",
+            "20260101_120000_a.jsonl"]
+
+    def test_别的赛道不受影响(self, dash):
+        lib = self._lib({"20260101_120000_a.jsonl": 1})
+        lib["sessions"]["20260101_130000_x.jsonl"] = {"track_id": 2}
+        assert dash._track_session_counts(lib) == {1: 1, 2: 1}
+        assert dash._unique_track_sessions(lib, 1) == ["20260101_120000_a.jsonl"]
+
+    def test_生成参考走线不重复算同一场(self, site):
+        """tracks.json 里塞一份 .gz 别名，n_laps 不该变成 6。"""
+        hist = site["hist"]
+        lib = json.loads((hist / "tracks.json").read_text(encoding="utf-8"))
+        # 给第一场加一个 .gz 别名（模拟归档前后各注册一次）
+        alias = site["names"][0].replace(".jsonl", ".jsonl.gz")
+        lib["sessions"][alias] = {"track_id": 1, "dist": 0.006}
+        (hist / "tracks.json").write_text(json.dumps(lib), encoding="utf-8")
+        _, d = _call(site["base"], "POST", "/api/v1/tracks/1/ref-line")
+        assert d["n_laps"] == 3, f"别名被算成独立场次了：{d['n_laps']}"
+        names = [s["session"] for s in d["sources"]]
+        assert len(set(names)) == 3, f"同一场出现两次：{names}"

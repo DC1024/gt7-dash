@@ -2366,6 +2366,39 @@ def save_ref_lines(hist: Path, data: dict[str, Any]) -> None:
                            {"schema": 1, "tracks": data})
 
 
+def _unique_track_sessions(lib: dict[str, Any],
+                           track_id: int) -> list[str]:
+    """该赛道挂靠的场次名，**按场次去重**，新的在前。
+
+    🔴 必须去重：`tracks.json` 的 sessions 里，同一个场次可能同时有
+       `X.jsonl` 和 `X.jsonl.gz` 两个键（归档前后各注册过一次）。
+       不去重的后果：
+         · `/api/v1/tracks` 的「N 场」翻倍（实测 8 个键只有 6 个场次）；
+         · 参考走线把同一场算两遍，中位数被它拉偏。
+       去重后保留**未压缩**的那个名字（能直接读，不用解压）。
+    """
+    best: dict[str, str] = {}
+    for name, meta in (lib.get("sessions") or {}).items():
+        if meta.get("track_id") != track_id:
+            continue
+        stem = session_stem(name)
+        # 优先未压缩名（读起来快，且 _safe_session 能直接定位）
+        if stem not in best or name.endswith(".jsonl"):
+            best[stem] = name
+    return sorted(best.values(), reverse=True)
+
+
+def _track_session_counts(lib: dict[str, Any]) -> dict[int, int]:
+    """每条赛道的**去重后**场次数。"""
+    seen: dict[int, set[str]] = {}
+    for name, meta in (lib.get("sessions") or {}).items():
+        tid = meta.get("track_id")
+        if tid is None:
+            continue
+        seen.setdefault(int(tid), set()).add(session_stem(name))
+    return {tid: len(v) for tid, v in seen.items()}
+
+
 def _ref_line_summary(refs: dict[str, Any], track_id: int) -> dict | None:
     """参考走线的轻量摘要（给列表用）。没有就返回 None。"""
     r = refs.get(str(track_id))
@@ -2378,12 +2411,9 @@ def _ref_line_summary(refs: dict[str, Any], track_id: int) -> dict | None:
 
 
 def _track_sessions(hist: Path, track_id: int) -> list[str]:
-    """该赛道挂靠的场次文件名（新的在前）。"""
-    lib = load_tracks(hist)
-    names = [n for n, s in (lib.get("sessions") or {}).items()
-             if s.get("track_id") == track_id]
+    """该赛道挂靠的场次文件名（**去重**，新的在前）。"""
     # 文件名以时间戳开头，倒序 = 最新在前。新的数据更可信（车/胎/驾驶风格更接近）。
-    return sorted(names, reverse=True)
+    return _unique_track_sessions(load_tracks(hist), track_id)
 
 
 def build_reference_line(hist: Path, track_id: int,
@@ -5667,11 +5697,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 lib = load_tracks(hist)
                 refs = load_ref_lines(hist)
-                cnt: dict[int, int] = {}
-                for s in lib["sessions"].values():
-                    tid = s.get("track_id")
-                    if tid is not None:
-                        cnt[tid] = cnt.get(tid, 0) + 1
+                # 去重：同一场次的 .jsonl 与 .jsonl.gz 两个键只算一场
+                cnt = _track_session_counts(lib)
                 tracks = [{
                     "id": t["id"], "name": t.get("name") or "",
                     "ref_len_m": t.get("ref_len_m"),
@@ -9661,11 +9688,8 @@ def build_tracks_page(hist: Path) -> str:
     import html as _html
     lib = load_tracks(hist)
     refs = load_ref_lines(hist)
-    cnt: dict[int, int] = {}
-    for s in lib["sessions"].values():
-        tid = s.get("track_id")
-        if tid is not None:
-            cnt[tid] = cnt.get(tid, 0) + 1
+    # 去重：同一场次的 .jsonl 与 .jsonl.gz 两个键只算一场
+    cnt = _track_session_counts(lib)
     frozen = bool(lib.get("frozen"))
     # 官方赛道 logo 是可选素材（helper/download_track_logos.py 拉取）。
     # 目录不存在 = 用户没拉过，走"只画形状"的分支，不是错误。
