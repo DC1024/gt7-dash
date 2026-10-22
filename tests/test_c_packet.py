@@ -195,6 +195,22 @@ class TestDefaultIsC:
             "没有包类型不符的警告 —— 切换失败会静默录一场没有转向角的数据")
         assert "_layout_warn_t" in text, "警告没有限流，会刷屏"
 
+    def test_选波浪号包时启动就说明解不开(self):
+        """`~`（344B）实测换了 key/nonce，解不开。
+
+        不写进启动横幅的话，用户切到 ~ 只会看到「等待 PS5 进入赛道…」，
+        永远不知道是自己选错了 —— 这种"静默死路"最难查。
+        """
+        text = (ROOT / "gt7-recorder.py").read_text(encoding="utf-8")
+        assert 'self.args.packet_type == "~"' in text, "没有针对 ~ 包的分支"
+        assert "目前解不开" in text, "~ 包解不开这件事没在启动横幅里说"
+
+    def test_选_B_包时说明字段未解码(self):
+        """B 包只是包变长，多出的 5 个 float 还没解码 —— 别让人以为赚到了。"""
+        text = (ROOT / "gt7-recorder.py").read_text(encoding="utf-8")
+        assert 'self.args.packet_type == "B"' in text
+        assert "未解码" in text
+
 
 class TestSteerAngleApi:
     """`/api/v1/live` 里的转向角：符号约定与 null 语义。

@@ -772,7 +772,7 @@ class Decoder:
             car_on_track = bool(flags & 0x01)
 
             # 包类型按**实际长度**推断，而不是一律记 "A"。
-            # 心跳切到 B / ~ 后包会变长（316 / 332），状态文件里显示真实类型
+            # 心跳切到 B / ~ 后包会变长（316 / 344），状态文件里显示真实类型
             # 便于确认 PS5 是否真的按我们请求的类型发包（协议改动排查用）。
             # 🔴 C 包（368B）必须**先判**：368 >= 0x148(328)，否则会被当成 `~`，
             #    然后按 ~ 的偏移去读 energy_recovery / throttleFiltered ——
@@ -852,10 +852,15 @@ class Decoder:
                 #      0x148 unknown(f32)
                 #    默认心跳是 "A"→ 这段恒为 0；只有显式 --packet-type ~ 才有值。
                 #
-                # TODO(A8): 以上三个字段**没有用真机数据验证过**。
-                #   两个待解的分歧：① 扩展段布局两来源差 4 字节；
-                #   ② 本文件注释写 ~ 包 332B，社区文档普遍写 344B，差 12 字节
-                #   无人解释。启用 --packet-type ~ 之前必须抓一次包核对。
+                # TODO(A8): 以上三个字段**没有用真机数据验证过**，而且现在看
+                #   基本用不上了 —— 2026-10-22 抓到 11945 个真实 `~` 包：
+                #     · 长度确认是 **344B**（本文件早先写 332 是错的）；
+                #     · 但用任何已知 nonce 规则都**解不开**（见 tools/brute_tilde.py：
+                #       IV 偏移 0…336 × 16 个 mask × 两种 nonce 顺序 × 密文起始
+                #       0/4/8 全扫，magic 零命中）。它换了 key 或 nonce 来源。
+                #     · 收益只有 energyRecovery（混动/电车才非 0）+ throttleFiltered，
+                #       实测那台 GR1 燃油车全程恒 0 → 不值得继续啃。
+                #   所以 `--packet-type ~` 目前等于「收得到、解不开」，别指望有数。
                 energy_recovery=f32(0x144) if n >= 0x148 else 0.0,
                 # —— 格式 C 独有（368B）——
                 # 用包长守门：A/B/~ 包读到的是别的字段，绝不能张冠李戴。
@@ -1089,6 +1094,15 @@ class Recorder:
               flush=True)
         print(f"  场次切分: 离开赛道 {self.args.off_track_timeout:.0f} 秒算一场结束"
               f"（兜底：{self.args.session_gap:.0f} 秒无包）", flush=True)
+        # 🔴 包类型的「已知坑」必须在启动横幅里说清楚，否则用户切了类型、
+        #    界面一直"等待 PS5 进入赛道"，根本不知道是自己选错了。
+        if self.args.packet_type == "~":
+            print("  ⚠️  已选格式 ~（344B）：**目前解不开**（换了 key/nonce，"
+                  "见 README「`~` 包」一节）——\n"
+                  "     会一直收不到数据，请改回 C（默认）或 A。", flush=True)
+        elif self.args.packet_type == "B":
+            print("  ⚠️  已选格式 B（316B）：多出的 5 个 float（sway/heave/surge）"
+                  "**本版未解码**，\n     基础字段与 A 包一致。", flush=True)
         print("  等待 PS5 进入赛道…", flush=True)
         print("=" * 66, flush=True)
 
@@ -1242,12 +1256,11 @@ class Recorder:
                 for tgt_ip, tgt_port in targets:
                     try:
                         # 心跳字符决定 PS5 回哪种包：
-                        #   "A" → 296 字节基础包（默认）
-                        #   "B" → 316 字节（+运动数据）  "~" → 扩展包（+能量回收）
-                        # TODO(A7): "C" → 368 字节（GT7 1.68+），独有
-                        #   wheelSteeringAngle[2] / wheelBase / surfaceType[4] /
-                        #   currentLap / carCategory。本版未支持，解码代码也没有。
-                        #   要做得先有一次真机抓包验证偏移（见项目状态盘点 第 4 批）。
+                        #   "A" → 296 字节基础包
+                        #   "B" → 316 字节（+5 个 float 运动数据，**本版未解码**）
+                        #   "C" → 368 字节（GT7 1.68+，**v1.7.0 起默认**），独有
+                        #         wheelSteeringAngle[2] / wheelBase / carCategory
+                        #   "~" → 344 字节，**解不开**（换了 key/nonce，见 README）
                         s1.sendto(self.args.packet_type.encode("ascii"),
                                   (tgt_ip, tgt_port))
                     except OSError:

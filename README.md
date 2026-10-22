@@ -7,7 +7,7 @@
 ![GHCR](https://img.shields.io/badge/镜像-ghcr.io-blue)
 ![License](https://img.shields.io/badge/许可-MIT-green)
 
-> **当前版本：v1.8.0**（以 `gt7_version.py` 为唯一版本源）—— **实时界面画出前轮转角**。
+> **当前版本：v1.8.1**（以 `gt7_version.py` 为唯一版本源）—— **实时界面画出前轮转角**。
 >
 > v1.7.0 起默认请求格式 C，它比 A 包多出三样 A 包完全没有的东西：
 > **真实转向角** `wheelSteeringAngle[2]`、**轴距** `wheelBase`、**组别** `carCategory`。
@@ -20,6 +20,10 @@
 >
 > `/api/v1/live` 同步新增 `steer_angle_deg` / `wheel_base_m` / `car_category`
 > 三个字段（A/B/~ 包时为 `null`）。
+>
+> **v1.8.1**：`~`（344B）包已确认存在但**解不开**（换了 key/nonce，见下文），
+> 所以选 `--packet-type ~` 时启动横幅会直接警告；选 `B` 也会说明多出的
+> 5 个 float 尚未解码。
 >
 > 用 10146 帧真实 C 包逐字段验证后确认：**C 包是 A 包的超集**。
 >
@@ -337,7 +341,17 @@ GT7_PACKET_TYPE=A docker compose up -d --no-deps gt7-recorder
 顺带一个解密上的坑：**C 包的 IV mask 是 `0xDEADBEEF`，A 包是 `0xDEADBEAF`**——
 就差一个字母。解密器现在两个都试，靠 magic 自己判断。
 
-支持 C 包已列入待办，需要一次真机抓包验证偏移（见项目状态盘点文档）。
+### `~` 包（344 B）：**确认存在，但解不开 —— 暂不支持**
+
+那次抓包顺手留了 11945 个 `~` 包（发往 33739，60 Hz，长度恒定 344），
+确认了社区文档的 344 才对（本文件早先按 332 写是错的）。但它**用任何已知规则
+都解不开**：`tools/brute_tilde.py` 把「IV 偏移 0…336 × 16 个 mask ×
+nonce 两种顺序 × 密文起始 0/4/8」全扫了一遍，magic 一次都没命中
+——说明它换了 key，或换了 nonce 的来源，不是改个常量就能对齐的。
+
+值不值得继续啃：`~` 相比 A **只多 `energyRecovery`（和 `throttleFiltered`）**，
+而 `energyRecovery` 只有混动/电车非 0。实测这台车是 GR1 燃油车，全程恒 0。
+所以这条先挂着，等真有人要用混动数据再说。
 
 ## 🙏 致谢
 
