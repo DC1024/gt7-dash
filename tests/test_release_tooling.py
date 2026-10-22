@@ -43,7 +43,13 @@ class TestChangelog:
         import gen_changelog
         cur = _read("CHANGELOG.md")
         assert cur == gen_changelog.build(), (
-            "CHANGELOG.md 落后于 git 历史，跑 `python tools/gen_changelog.py`")
+            "CHANGELOG.md 落后于 git 历史。\n"
+            "🔴 **顺序必须是「先提交代码，再生成 CHANGELOG」**：\n"
+            "   1. git commit -m '你的改动'        # 代码先落地\n"
+            "   2. python tools/gen_changelog.py   # 这时才看得到刚才那次提交\n"
+            "   3. git add CHANGELOG.md && git commit -m 'docs(changelog): 同步'\n"
+            "顺序反了（先生成、再和代码一起提交）会**永远落后一个提交**：\n"
+            "生成那一刻这次提交还不在 git 历史里，提交完就立刻落后。")
 
     def test_每个发过的版本都有段落(self):
         """段落以 `gt7_version.py` 的版本变更为准，不是 tag。
