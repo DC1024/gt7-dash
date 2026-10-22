@@ -35,11 +35,24 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
 
+      # 版本号从唯一真源读（gt7_version.py），烧进 Go 解密器
+      - name: 读版本号
+        id: ver
+        run: |
+          V=$(python3 -c 'from gt7_version import __version__; print(__version__)')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "版本 = $V"
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 🔴 把版本号烧进 Go 解密器（`gt7-decrypt --version`）。
+          #    不传的话 Dockerfile 里的 `ARG VERSION=dev` 会生效，
+          #    镜像里的解密器永远显示 "dev" —— 排查时认不出是哪一版。
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
