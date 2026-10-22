@@ -34,6 +34,30 @@
 #    查当前 digest：
 #      docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}'
 ARG BASE_IMAGE=python:3.12-slim@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
+
+# ---------------------------------------------------------------- 阶段 1
+# 编译 Go 解密器。
+#
+# 🔴 必须**在镜像里编译**，不能 COPY 仓库里的预编译二进制（以前就是那样，
+#    一个手工编译的 1.6MB 文件躺在 gt7-decrypt/ 下）。后果：
+#    改了 main.go（C 包的 0xDEADBEEF mask）→ CI 全绿 → 部署成功 →
+#    C 包一个都解不开，因为镜像里还是上周那个二进制。
+#    这种"改了代码但产物没变"的问题在 CI 上完全看不出来。
+#
+#    多阶段构建后：代码改动必然进镜像，仓库里也不再需要二进制产物。
+ARG VERSION=dev
+FROM golang:1.22-alpine AS gobuild
+WORKDIR /src
+# 先只拷 go.mod/go.sum 再 download：改 main.go 时这一层能命中缓存
+COPY gt7-decrypt/go.mod gt7-decrypt/go.sum ./
+RUN go mod download
+COPY gt7-decrypt/main.go ./
+# -trimpath 去掉本机路径；-s -w 去符号表；-X main.version 烧版本号
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /gt7-decrypt .
+
+# ---------------------------------------------------------------- 阶段 2
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="gt7-recorder" \
@@ -61,7 +85,7 @@ COPY gt7-recorder.py gt7-dashboard.py gt7analysis.py gt7_version.py gt7-event-de
 #   自己手写Salsa20 极易出错（nonce 布局、轮函数顺序都可能错，
 #   我试过两版都算不出正确密钥流），所以用 Go 的标准库编译成静态二进制。
 #   交叉编译时必须显式设 GOOS/GOARCH，否则会出 PE 格式无法在 Linux 运行。
-COPY gt7-decrypt/gt7-decrypt-linux-amd64 /app/gt7-decrypt
+COPY --from=gobuild /gt7-decrypt /app/gt7-decrypt
 # 🔴 自检失败必须让**构建失败**，不能 `|| echo "提示"` 吞掉。
 #    原来那行 `|| echo "(自检提示：真实包解密已在部署时验证过)"` 等于：
 #    "必需组件测了，但测不过也照样发布" —— 那这个检查就没有任何意义，

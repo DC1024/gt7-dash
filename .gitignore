@@ -39,3 +39,6 @@ _lint_js/
 
 # 抓包产物（第 4 批协议探针，数据量大不入库）
 capture_*.jsonl
+
+# Go 解密器的预编译产物（改由 Dockerfile 多阶段构建现场编译）
+gt7-decrypt/gt7-decrypt-*
