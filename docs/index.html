@@ -165,8 +165,16 @@
     <p>走线偏差给出相对参考圈的逐米横向偏移热力图；滑移检测由四轮角速度
        自标定轮胎半径，识别空转与抱死。</p></div>
   <div class="feat"><div class="ic">🎬</div><h3>事件时间线 · 集锦高光</h3>
-    <p>打滑 / 碰撞 / 极限刹车 / 出界自动打点；集锦按「置信度 × 类型权重」
-       排序，直接给出可喂 ffmpeg 的起止时间，剪视频不用自己找点。</p></div>
+    <p><b>9 类</b>事件自动打点：打滑 / 碰撞 / 极限刹车 / 出界 / 轮胎滥用 /
+       大油门出弯 / <b>超车·被超</b> / <b>进站</b> / <b>最快圈</b>。
+       集锦按「置信度 × 类型权重」排序，直接给出可喂 ffmpeg 的起止时间，
+       剪视频不用自己找点。</p></div>
+  <div class="feat"><div class="ic">🏁</div><h3>比赛语义：超车 / 进站 / 最快圈</h3>
+    <p>全部来自遥测，<b>不需要截图识别</b>。名次用协议里的 <code>0x84</code>
+       ——它在比赛中就是<b>当前名次</b>（社区文档写成"发车位"是错的，14 场
+       真实数据验证过）；进站靠"油量上升"强判据 + "长时间低速"弱判据，
+       并且会区分「暂停」和「维修区通行」；最快圈用官方
+       <code>last_lap_ms</code>，不是自己积分。</p></div>
   <div class="feat"><div class="ic">🔍</div><h3>逐帧可查可导</h3>
     <p>全通道时序曲线带十字光标读数、逐帧原始数据表可翻页，
        按整场或单圈导出 CSV（带 BOM，Excel 不乱码）。</p></div>
@@ -177,6 +185,16 @@
   <div class="feat"><div class="ic">🎨</div><h3>10 套主题 · 布局自定义</h3>
     <p>含新「座舱」主题（近黑底＋电光蓝，副屏仪表向）。卡片可拖拽排序、
        隐藏、半宽整行，多套布局保存切换。</p></div>
+  <div class="feat"><div class="ic">🛞</div><h3>轮胎参考 · BoP 档位</h3>
+    <p>GT7 <b>不广播</b>胎压、胎温、磨损，也不给赛道名和 BoP —— 这些是协议层
+       的硬限制，不是没做。但社区实测的<b>各胎种寿命圈数</b>、湿地胎特性
+       做成了参考表（<code>/api/v1/tyres</code>），赛道页给标注过的赛道
+       打 <b>BoP 档位徽章</b>，一眼看出这台车在这条道上被压了多少。</p></div>
+  <div class="feat"><div class="ic">🎚️</div><h3>事件阈值可调</h3>
+    <p>打滑 G 值、进站限速、名次稳定时长……9 个常用阈值在事件卡里直接改，
+       不用改源码重启。改完缓存自动失效，下次展开按新阈值重算；
+       一键恢复默认。不同车型/赛道的判据差别很大，锁死在作者的默认值上
+       是不合理的。</p></div>
   <div class="feat"><div class="ic">🔌</div><h3>38 个公开 API 端点</h3>
     <p>实时 / 场次 / 逐帧与分析 / 赛道 / 回收站 / 设置全覆盖，
        带 CORS、字段与单位全部写进文档，版本化承诺只加不改。</p></div>
@@ -188,6 +206,12 @@
 <span class="c"># PS5 → 设置 → 网络 → 打开 GT7 遥测上传，然后：</span><br>
 mkdir gt7-dash <span class="k">&&</span> cd gt7-dash<br>
 curl -O https://raw.githubusercontent.com/DC1024/gt7-dash/main/docker-compose.yml<br>
+<br>
+<span class="c"># 先建 data 并交给容器用户（uid 10001）。这一步不能省：</span><br>
+<span class="c"># 镜像里的 chmod 会被 bind mount 遮住，不授权的话首次启动写不了文件</span><br>
+<span class="c"># —— status.json 静默失败、录制器打不开 jsonl 会直接退出。</span><br>
+mkdir -p data <span class="k">&&</span> sudo chown 10001:10001 data<br>
+<br>
 docker compose up -d<br><br>
 <span class="c"># 打开 http://&lt;本机IP&gt;:8787 —— 跑起来就有数据</span>
 </div>
@@ -261,7 +285,7 @@ python -m gt7coach serve --dash http://&lt;本机IP&gt;:8787
 </div><!-- /.wrap —— 这个闭合标签原本就漏了，导致 footer 被包进内容区 -->
 
 <footer><div class="wrap">
-  GT7 Dash v1.4.3 · MIT License · 数据本地处理，不上传任何云端<br><br>
+  GT7 Dash v1.5.0 · MIT License · 数据本地处理，不上传任何云端<br><br>
   <a href="https://github.com/DC1024/gt7-dash" target="_blank">GitHub 仓库</a> ·
   <a href="https://github.com/DC1024/gt7-dash/blob/main/API文档.md" target="_blank">API 文档</a> ·
   <a href="https://github.com/DC1024/gt7-coach" target="_blank">gt7-coach 赛道工程师</a> ·
