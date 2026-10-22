@@ -20,6 +20,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "CHANGELOG.md"
 
+# 🔴 Windows 的 stdout 用**系统代码页**（英文系统 = cp1252、简中 = cp936），
+#    编不了中文 —— `print()` 一个中文标题就直接抛 UnicodeEncodeError。
+#    CI 的 windows-exe job 用
+#        python tools/gen_changelog.py --version "$TAG" >> release-notes.md
+#    把输出写进发行说明，正好崩在 `print(m.group(1))` 那一行。
+#    Linux 默认 UTF-8，本地永远复现不了。
+#    reconfigure 是 Python 3.7+ 的官方做法；更老的版本忽略即可。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError, ValueError):   # pragma: no cover
+        pass
+
 # 提交类型 → 章节标题（顺序即展示顺序）
 SECTIONS: list[tuple[str, str]] = [
     ("feat", "新增"),

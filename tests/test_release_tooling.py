@@ -208,3 +208,34 @@ class TestSubprocessEncoding:
         assert not bad, (
             f"这些 subprocess.run 没指定 encoding：{bad}\n"
             "Windows 上会用 cp936 解码 UTF-8 输出，中文提交信息直接崩")
+
+
+class TestStdoutEncoding:
+    """脚本必须能在 cp1252 的 stdout 上打印中文。
+
+    🔴 真事故（第二次）：Windows runner 的系统代码页是 cp1252，
+       `print()` 一个中文标题就抛 UnicodeEncodeError，
+       Release 直接发不出去。Linux 默认 UTF-8，本地永远复现不了。
+       修法是在模块加载时把 stdout/stderr reconfigure 成 UTF-8。
+
+    这个用例真的用 cp1252 跑一个子进程 —— 比静态检查可靠：
+    静态检查只能看到「有 reconfigure」，看不到它是否在 print 之前生效。
+    """
+
+    def test_在_cp1252_下打印中文不崩(self):
+        import os
+        import subprocess
+        code = (
+            "import sys;"
+            f"sys.path.insert(0, {str(ROOT / 'tools')!r});"
+            "import gen_changelog;"           # 模块级 reconfigure 在此执行
+            "print('中文输出测试 · 全角字符「」');"
+            "print('第二行')"
+        )
+        env = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONUTF8="0")
+        r = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                           env=env, capture_output=True)
+        err = r.stderr.decode("utf-8", "replace")
+        assert r.returncode == 0, f"cp1252 下崩了：{err[-600:]}"
+        out = r.stdout.decode("utf-8", "replace")
+        assert "中文输出测试" in out, f"输出乱码：{out!r}"

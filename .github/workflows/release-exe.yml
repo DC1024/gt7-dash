@@ -194,6 +194,11 @@ jobs:
           TAG: ${{ github.ref_name }}
           PASSED: ${{ needs.test.outputs.passed }}
           VERSION: ${{ steps.ver.outputs.version }}
+          # 🔴 Windows runner 的 stdout 是 cp1252，`print()` 中文直接抛
+          #    UnicodeEncodeError。脚本内部已 reconfigure，这里再加一层：
+          #    重定向到文件时用的是 Python 自己的流编码，两层保险都要有。
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
         run: |
           set -euo pipefail
           {
