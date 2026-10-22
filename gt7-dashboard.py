@@ -2329,6 +2329,157 @@ def _valid_laps(path: Path) -> tuple[list[dict], dict, float]:
     return store.memo_compute("valid_laps", _compute)
 
 
+# —— 参考走线（E2）——
+#
+# 🔴 这不是「赛道中心线」。GT7 **不提供**中心线，我们能算出来的只有
+#    「你在这条赛道上历史最快圈的走线中位数」—— 它反映**你自己的跑法**，
+#    不是官方理想线。叫「中心线」会让人以为可以当标准答案（"我应该走这条"），
+#    而实际上如果你历史上一直在切某个弯，参考线就会鼓励你继续切。
+#
+#    所以命名、文档、UI 一律用「参考走线」，并且**始终显示样本数**——
+#    "来自 3 圈"和"来自 12 圈"的可信度完全不同。
+#
+# 为什么不塞进 tracks.json：那是元数据（收藏/改名时频繁读写），
+# 而参考线每条约 5KB。混在一起会让每次改名都序列化几百 KB。
+_REF_LINES_NAME = "ref_lines.json"
+_REF_LINES_LOCK = threading.RLock()
+_REF_LINES_MEM: dict[Path, dict[str, Any]] = {}
+
+
+def load_ref_lines(hist: Path) -> dict[str, Any]:
+    """读参考走线库（按赛道 id 索引）。懒加载 + 进程内缓存。"""
+    key = hist
+    with _REF_LINES_LOCK:
+        got = _REF_LINES_MEM.get(key)
+        if got is not None:
+            return got
+        raw = _read_json(key / _REF_LINES_NAME, {})
+        rows = raw.get("tracks") if isinstance(raw, dict) else None
+        _REF_LINES_MEM[key] = rows if isinstance(rows, dict) else {}
+        return _REF_LINES_MEM[key]
+
+
+def save_ref_lines(hist: Path, data: dict[str, Any]) -> None:
+    with _REF_LINES_LOCK:
+        _REF_LINES_MEM[hist] = data
+        _atomic_write_json(hist / _REF_LINES_NAME,
+                           {"schema": 1, "tracks": data})
+
+
+def _ref_line_summary(refs: dict[str, Any], track_id: int) -> dict | None:
+    """参考走线的轻量摘要（给列表用）。没有就返回 None。"""
+    r = refs.get(str(track_id))
+    if not isinstance(r, dict) or not r.get("pts"):
+        return None
+    return {"n_laps": r.get("n_laps"), "n_used": r.get("n_used"),
+            "n_points": r.get("n_points"), "len_m": r.get("len_m"),
+            "spread_m": r.get("spread_m"), "built": r.get("built"),
+            "source_note": r.get("source_note")}
+
+
+def _track_sessions(hist: Path, track_id: int) -> list[str]:
+    """该赛道挂靠的场次文件名（新的在前）。"""
+    lib = load_tracks(hist)
+    names = [n for n, s in (lib.get("sessions") or {}).items()
+             if s.get("track_id") == track_id]
+    # 文件名以时间戳开头，倒序 = 最新在前。新的数据更可信（车/胎/驾驶风格更接近）。
+    return sorted(names, reverse=True)
+
+
+def build_reference_line(hist: Path, track_id: int,
+                         max_sessions: int = 8) -> dict[str, Any]:
+    """读该赛道的历史场次，取每场最快圈 → 合成参考走线并落盘。
+
+    为什么取"每场最快圈"而不是"所有圈"：
+      · 所有圈里混着暖胎圈、失误圈、进站圈，中位数会被拉向"平均水平的错误"；
+      · 每场只取最快圈，等于"每场贡献一个最好的走法"，中位数代表
+        「你在状态好的时候通常怎么跑」—— 这正是要对比的基准。
+
+    `max_sessions` 限制读几场：每场都要完整解析 jsonl（70MB 量级），
+    读 8 场已经是几十秒。新的场次优先。
+    """
+    import gt7analysis
+
+    lib = load_tracks(hist)
+    track = next((t for t in lib.get("tracks") or []
+                  if t.get("id") == track_id), None)
+    if track is None:
+        return {"error": f"赛道 {track_id} 不存在"}
+
+    names = _track_sessions(hist, track_id)[:max_sessions]
+    if not names:
+        return {"error": "这条赛道还没有挂靠的场次 —— 先跑一场，让系统识别出赛道"}
+
+    lines: list[list] = []
+    used: list[dict] = []
+    skipped: list[dict] = []
+    t_start = time.time()
+    for name in names:
+        path = _safe_session(hist, name)
+        if path is None or not path.is_file():
+            skipped.append({"session": name, "why": "文件不存在"})
+            continue
+        try:
+            laps, grouped, _t0 = _valid_laps(path)
+        except Exception as e:            # 损坏文件不该让整个生成失败
+            skipped.append({"session": name, "why": f"解析失败：{e}"})
+            continue
+        if not laps:
+            skipped.append({"session": name, "why": "没有有效圈"})
+            continue
+        # 最快圈：优先官方圈速（与列表/详情同一口径）
+        best = min(laps, key=lambda x: float(x.get("dur") or 1e9))
+        frames = grouped.get(int(best.get("lap") or 0)) or []
+        if not frames:
+            skipped.append({"session": name, "why": "最快圈没有帧"})
+            continue
+        ln = gt7analysis.lap_line(frames)
+        if "error" in ln:
+            skipped.append({"session": name, "why": ln["error"]})
+            continue
+        lines.append(ln["pts"])
+        used.append({"session": name, "lap": int(best.get("lap") or 0),
+                     "lap_s": round(float(best.get("dur") or 0), 3),
+                     "time_source": best.get("time_source"),
+                     "len_m": ln["len_m"], "n_gaps": ln.get("n_gaps", 0)})
+
+    if not lines:
+        return {"error": "所有场次都没能提取出有效走线",
+                "skipped": skipped}
+
+    ref = gt7analysis.reference_line(lines)
+    if "error" in ref:
+        return {"error": ref["error"], "skipped": skipped}
+
+    payload = {
+        "track_id": track_id,
+        "track_name": track.get("name") or "",
+        "pts": ref["pts"],
+        "dist_m": ref["dist_m"],
+        "n_points": ref["n_points"],
+        "n_laps": ref["n_laps"],
+        "n_used": ref["n_used"],
+        "len_m": ref["len_m"],
+        "spread_m": ref["spread_m"],
+        "spread_p95_m": ref["spread_p95_m"],
+        "lap_len_cv": ref["lap_len_cv"],
+        "built": time.strftime("%Y-%m-%d %H:%M"),
+        "elapsed_s": round(time.time() - t_start, 1),
+        "sources": used,
+        "skipped": skipped,
+        # 采样来源的说明，给 UI 直接显示，避免有人把它当官方中心线
+        "source_note": "本车历史最快圈的中位数走线（非 GT7 官方中心线）",
+    }
+    try:
+        data = dict(load_ref_lines(hist))
+        data[str(track_id)] = payload
+        save_ref_lines(hist, data)
+    except OSError:
+        pass          # 写不进也照常返回（本次可用，下次重算）
+
+    return payload
+
+
 def _scope_t0(scope: list[dict], session_t0: float, lap_no: int | None) -> float:
     """时间基准：选了单圈就从**该圈起点**算，否则从场次起点算。
 
@@ -3594,6 +3745,8 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | POST | `/api/v1/tracks/<id>/rename` | body `{"value": "名"}`：赛道改名，同赛道所有场次一起生效 |
 | POST | `/api/v1/tracks/<id>/confirm` | body `{}`：确认该赛道名正确，清掉「自动识别」标记 |
 | POST | `/api/v1/tracks/register` | body `{"file": "<场次文件>", "name": "真实赛道名"}`：一键标注（补齐赛道库主入口） |
+| GET | `/api/v1/tracks/<id>/ref-line` | 该赛道的**参考走线**（已生成的缓存）。没生成过返回 404 + 提示，**不会**现场计算 |
+| POST | `/api/v1/tracks/<id>/ref-line` | body `{"max_sessions": 8}`（可选）：读该赛道历史场次、取每场最快圈、合成中位数走线并落盘。要几十秒 |
 
 ### 回收站与设置
 
@@ -3894,6 +4047,69 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
   ω 精确为 0）到 `+7.98`（低速全油门空转），阈值因此不敏感。
 - ⚠️ 曲线是抽稀的，**1~2 帧的尖峰会漏掉**（抱死常常就这么短）——
   峰值一律从 `worst[]` 读，别从曲线读。
+
+## 参考走线（不是「赛道中心线」）
+
+**先澄清命名**：GT7 **不提供**赛道中心线，任何声称有中心线的工具都是自己算的。
+这里提供的是「**你在这条赛道上历史最快圈的中位数走线**」—— 它反映**你自己的
+跑法**，不是官方理想线。
+
+这个区别不是抠字眼：如果你历史上一直在切某个弯，参考线就会鼓励你继续切。
+把它当"标准答案"会强化坏习惯；把它当"我平时怎么跑"才有意义（用来发现
+"今天这条线怎么偏了 3 米"）。
+
+### 生成
+
+```bash
+POST /api/v1/tracks/1/ref-line
+{"max_sessions": 8}        # 可选，默认 8，夹在 1~30
+```
+
+做的事：
+
+1. 取该赛道挂靠的场次（新的优先，最多 `max_sessions` 场）；
+2. 每场取**最快圈**（优先 GT7 官方 `last_lap_ms`，与列表/详情同一口径）；
+3. 每圈按弧长等距重采样成 120 点（5km 赛道约每 42m 一个点）；
+4. 先按圈长剔除偏离中位数 >3% 的走线（跑错路线/多绕一段）；
+5. 剩下的**逐点取中位数**（不是平均 —— 一场冲出赛道就会把平均整体拉偏）。
+
+返回：
+
+| 字段 | 说明 |
+|---|---|
+| `pts` | 120 个 `[x, z]`，**原始世界坐标**（不是归一化指纹） |
+| `dist_m` | 与 `pts` 一一对应的累计弧长（可直接喂给 `/deviation` 的 `ref_pts`） |
+| `n_laps` / `n_used` | 参与统计的圈数 / 剔除离群后实际用上的圈数 |
+| `len_m` | 参考线自身弧长 |
+| `spread_m` / `spread_p95_m` | 各圈到参考线的**平均 / p95 横向距离**。1~3m 正常（不同圈本来就有差异）；**超过 10m 说明这些圈根本不是同一条走线**（多半是赛道识别错了） |
+| `lap_len_cv` | 参与圈的圈长变异系数，万分之几是正常的 |
+| `sources[]` | 每场的贡献：场次名、圈号、圈速、时间来源、走线长度、跳变次数 |
+| `skipped[]` | 被跳过的场次及原因（解析失败 / 没有有效圈 / 坐标太少） |
+| `source_note` | 固定文案，说明这不是官方中心线 |
+
+### 读取
+
+```bash
+GET /api/v1/tracks/1/ref-line
+```
+
+**只读缓存**。没生成过返回 `404` 并提示用 POST 生成 —— 绝不会在 GET 里
+现场计算：读 8 场 × 70MB 要几十秒，浏览器/脚本会以为服务挂了。
+
+生成结果落在 `data/ref_lines.json`（**不塞进 `tracks.json`**：那是元数据，
+改名/收藏时频繁读写，5KB 的线混进去会让每次改名都序列化几百 KB）。
+
+### 一个实测样本
+
+两条同赛道场次（圈速 102.384s / 101.830s）合成后：
+
+```
+参考线 5019.5m  120 点  用了 2/2 条
+spread 1.07m (p95 2.49m)   圈长 CV 0.0004
+用其中一条对它算偏差：rms 1.02m  coverage 1.00
+```
+
+两圈走线平均差 1 米、圈长几乎完全一致 —— 这个量级说明算法是可信的。
 
 ## 走线偏差
 
@@ -4723,6 +4939,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             cors=False)
             return
 
+        # —— 参考走线：POST /api/v1/tracks/<id>/ref-line ——
+        # 读该赛道的历史场次，取每场最快圈，合成中位数走线并落盘。
+        # 显式触发而不是自动：读 8 场 × 70MB 要几十秒，不能挂在页面加载上。
+        if (parsed.path.startswith("/api/v1/tracks/")
+                and parsed.path.endswith("/ref-line")):
+            hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+            raw_id = parsed.path[len("/api/v1/tracks/"):-len("/ref-line")]
+            try:
+                tid = int(raw_id)
+            except ValueError:
+                self._send_json({"error": f"赛道 id 不合法：{raw_id}"},
+                                400, cors=False)
+                return
+            body = self._read_json_body()
+            try:
+                mx = int(body.get("max_sessions") or 8)
+            except (TypeError, ValueError):
+                mx = 8
+            mx = max(1, min(mx, 30))
+            res = build_reference_line(hist, tid, max_sessions=mx)
+            if "error" in res:
+                self._send_json(res, 400, cors=False)
+                return
+            self._send_json(res, cors=False)
+            return
+
         # —— 事件阈值：POST /api/v1/settings/event-thresholds ——
         # body: {"values": {"spin_lat_g": 1.2, ...}}，值为 null 表示恢复该键默认。
         if parsed.path == "/api/v1/settings/event-thresholds":
@@ -5396,10 +5638,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                  "data_dir": str(hist),
                                  "sessions": list_sessions(hist)}, cors=True)
 
+            elif (path.startswith("/api/v1/tracks/")
+                  and path.endswith("/ref-line")):
+                # 参考走线（E2）：该赛道历史最快圈的中位数走线。
+                # GET 只读**已生成**的缓存 —— 生成要完整解析多场 jsonl（几十秒），
+                # 绝不能挂在 GET 上（浏览器/脚本会以为服务挂了）。
+                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
+                raw_id = path[len("/api/v1/tracks/"):-len("/ref-line")]
+                try:
+                    tid = int(raw_id)
+                except ValueError:
+                    self._send_json({"error": f"赛道 id 不合法：{raw_id}"},
+                                    400, cors=True)
+                    return
+                data = load_ref_lines(hist).get(str(tid))
+                if not data:
+                    self._send_json({
+                        "error": "这条赛道还没有生成参考走线",
+                        "hint": "POST 同一个地址即可生成（会解析该赛道的历史场次，"
+                                "可能需要几十秒）",
+                        "track_id": tid,
+                    }, 404, cors=True)
+                    return
+                self._send_json({"meta": {"api_version": 1}, **data}, cors=True)
+
             elif path == "/api/v1/tracks":
                 # 赛道库清单：识别出的所有赛道 + 各自挂了多少场次
-                hist = Path(self.server.history_dir)  # type: ignore[attr-defined]
+                hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 lib = load_tracks(hist)
+                refs = load_ref_lines(hist)
                 cnt: dict[int, int] = {}
                 for s in lib["sessions"].values():
                     tid = s.get("track_id")
@@ -5428,6 +5695,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     # 官方 logo 的文件名主干（图是可选素材，可能根本没下载）；
                     # 有图时的完整地址是 /tracklogos/<logo>.png
                     "logo": _logo_for_track(t),
+                    # 参考走线摘要（E2）。**不含 pts** —— 每条约 5KB，
+                    # 塞进列表会让这个接口变重；要点线单独 GET .../ref-line。
+                    "ref_line": _ref_line_summary(refs, t["id"]),
                 } for t in lib["tracks"]]
                 self._send_json({"meta": {"api_version": 1},
                                  "match_tol": _TRACK_MATCH_TOL,
@@ -9070,6 +9340,11 @@ TRACKS_CSS = """<style>
   cursor:pointer;background:rgba(var(--accent-rgb),.08);color:var(--accent);
   border:1px solid rgba(var(--accent-rgb),.45)}
 .tk-cand:hover{background:rgba(var(--accent-rgb),.18)}
+/* E2 参考走线 */
+.tk-ref{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 8px;
+  font-size:12px;color:var(--muted)}
+.tk-ref.has .tk-ref-txt{color:var(--text)}
+.tk-refcv{display:block}
 /* B3 事件阈值面板 */
 .th-panel{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
 .th-panel>summary{cursor:pointer;font-size:13px;color:var(--muted);user-select:none}
@@ -9151,6 +9426,103 @@ function trackPick(btn){
   var acts = card.querySelector('.tk-acts');
   if (acts) acts.dataset.dirty = '1';
 }
+// ---------- E2：参考走线 ----------
+// 画的是**原始世界坐标**（后端给 pts），这里做 min-max 归一化。
+// z 轴翻转：游戏坐标 z 向上，canvas y 向下，不翻会上下颠倒。
+function refDraw(cv, pts){
+  var ctx = cv.getContext('2d');
+  var W = cv.width, H = cv.height, pad = 10;
+  ctx.clearRect(0, 0, W, H);
+  if (!pts || pts.length < 2) return;
+  var x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  pts.forEach(function(p){
+    if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+    if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1];
+  });
+  var sx = (x1 - x0) || 1, sz = (z1 - z0) || 1;
+  var sc = Math.min((W - 2 * pad) / sx, (H - 2 * pad) / sz);
+  var ox = pad + ((W - 2 * pad) - sx * sc) / 2;
+  var oz = pad + ((H - 2 * pad) - sz * sc) / 2;
+  function px(p){
+    return [ox + (p[0] - x0) * sc, oz + (z1 - p[1]) * sc];
+  }
+  ctx.beginPath();
+  pts.forEach(function(p, i){
+    var q = px(p);
+    if (i === 0) ctx.moveTo(q[0], q[1]); else ctx.lineTo(q[0], q[1]);
+  });
+  ctx.closePath();
+  var cs = getComputedStyle(document.documentElement);
+  ctx.strokeStyle = (cs.getPropertyValue('--accent') || '#4c9aff').trim();
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  // 起点（计时线附近）：画个点，方便认方向
+  var st = px(pts[0]);
+  ctx.beginPath();
+  ctx.arc(st[0], st[1], 3.5, 0, 7);
+  ctx.fillStyle = '#e0a030';
+  ctx.fill();
+}
+
+function refApply(card, d){
+  var box = card.querySelector('.tk-ref');
+  var cv = card.querySelector('.tk-refcv');
+  if (!box || !cv) return;
+  var txt = box.querySelector('.tk-ref-txt');
+  if (txt) {
+    txt.textContent = '参考走线：' + (d.n_used || 0) + '/' + (d.n_laps || 0)
+      + ' 圈 · ' + Math.round(d.len_m || 0) + ' m · 圈间差 '
+      + (d.spread_m || 0).toFixed(1) + ' m · ' + (d.built || '');
+  }
+  box.classList.add('has');
+  cv.hidden = false;
+  refDraw(cv, d.pts);
+  // 生成后把按钮换成「查看/重建」
+  if (!box.querySelector('[onclick*="refShow"]')) {
+    box.insertAdjacentHTML('beforeend',
+      '<button class="sbtn" onclick="refShow(this)">查看</button>');
+  }
+  var b = box.querySelector('[onclick*="refBuild"]');
+  if (b) b.textContent = '重建';
+}
+
+function refBuild(btn){
+  var card = btn.closest('.tk-card');
+  if (!card) return;
+  var old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '生成中…（可能要几十秒）';
+  fetch('/api/v1/tracks/' + card.dataset.id + '/ref-line', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}'
+  }).then(function(r){ return r.json(); }).then(function(d){
+    btn.disabled = false;
+    btn.textContent = old;
+    if (d.error) { alert('生成失败：' + d.error); return; }
+    refApply(card, d);
+    if (d.skipped && d.skipped.length) {
+      console.warn('跳过的场次：', d.skipped);
+    }
+  }).catch(function(){
+    btn.disabled = false;
+    btn.textContent = old;
+    alert('网络错误');
+  });
+}
+
+function refShow(btn){
+  var card = btn.closest('.tk-card');
+  if (!card) return;
+  fetch('/api/v1/tracks/' + card.dataset.id + '/ref-line')
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) { alert(d.error); return; }
+      refApply(card, d);
+    }).catch(function(){ alert('网络错误'); });
+}
+
 function trackSave(btn){
   var card=btn.closest('.tk-card'); if(!card) return;
   var id=card.getAttribute('data-id');
@@ -9288,6 +9660,7 @@ def build_tracks_page(hist: Path) -> str:
     """
     import html as _html
     lib = load_tracks(hist)
+    refs = load_ref_lines(hist)
     cnt: dict[int, int] = {}
     for s in lib["sessions"].values():
         tid = s.get("track_id")
@@ -9341,6 +9714,29 @@ def build_tracks_page(hist: Path) -> str:
                 for c in cands[:6])
             cands_html = (f'<div class="tk-cands"><span class="tk-cands-lbl">'
                           f'圈长相近，选一个：</span>{chips}</div>')
+        # 参考走线（E2）：显示摘要 + 生成/查看/重建按钮。
+        # 🔴 文案必须带「非官方中心线」的说明 —— 它是你自己的历史走线中位数，
+        #    不是 GT7 给的理想线。混淆这两者会让人以为"应该照这条开"。
+        rl = (refs.get(str(tid)) or {})
+        if rl.get("pts"):
+            ref_txt = (f'参考走线：{rl.get("n_used")}/{rl.get("n_laps")} 圈 · '
+                       f'{rl.get("len_m") or 0:.0f} m · 圈间差 '
+                       f'{rl.get("spread_m") or 0:.1f} m · {rl.get("built") or ""}')
+            ref_btns = ('<button class="sbtn" onclick="refShow(this)">查看</button>'
+                        '<button class="sbtn" onclick="refBuild(this)">重建</button>')
+            ref_cls = "tk-ref has"
+        else:
+            ref_txt = "参考走线：未生成"
+            ref_btns = ('<button class="sbtn" onclick="refBuild(this)" '
+                        'title="读这条赛道的历史场次，取每场最快圈合成中位数走线'
+                        '（可能需要几十秒）">生成</button>')
+            ref_cls = "tk-ref"
+        ref_html = (f'<div class="{ref_cls}"><span class="tk-ref-txt">{ref_txt}</span>'
+                    f'{ref_btns}</div>'
+                    f'<canvas class="tk-refcv" width="200" height="130" hidden '
+                    f'style="background:rgba(128,128,128,.06);border-radius:8px;'
+                    f'margin-top:6px"></canvas>')
+
         if archived:
             # 已归档赛道：只读展示 + 恢复/彻底删除，不进主网格
             arch_at = _html.escape(str(t.get("archived_at") or "-"))
@@ -9376,6 +9772,7 @@ def build_tracks_page(hist: Path) -> str:
         </div>
         <div class="tk-meta">圈长 {(ref or 0):.0f} m · {turns} · {sessions} 场{bop_html}</div>
         {cands_html}
+        {ref_html}
         <div class="tk-acts">
           <button class="sbtn" onclick="trackSave(this)">保存</button>
           <button class="sbtn" onclick="trackConfirm(this)">✓ 已记录</button>

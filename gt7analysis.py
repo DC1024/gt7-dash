@@ -2304,6 +2304,195 @@ def track_fingerprint(grouped: dict[int, list[dict]],
             "lap": lap_no, "n_laps": len(info), "n_full": len(full)}
 
 
+# —— 参考走线（E2）——
+#
+# 🔴 名字很重要：GT7 **不提供**赛道中心线。我们能算出来的只有「你在这条赛道上
+#    历史最快圈的走线中位数」—— 它反映的是**你自己的跑法**，不是官方理想线。
+#    叫「中心线」会让人以为可以当标准答案（"我应该走这条"），而实际上如果你
+#    历史上一直在切某个弯，参考线就会鼓励你继续切。
+#
+#    所以命名、文档、UI 一律用「参考走线」，并且**始终显示样本数**——
+#    "来自 3 圈的参考线"和"来自 12 圈的参考线"可信度完全不同。
+
+_REF_LINE_POINTS = 120      # 5km 赛道约每 42m 一个点，够画线也够算偏差
+_REF_LINE_MIN_PTS = 60      # 少于这个点数的圈不参与（坐标丢太多）
+
+
+def _median(vals: list[float]) -> float:
+    """中位数（不引入 statistics：这个模块刻意只依赖 math）。"""
+    v = sorted(vals)
+    n = len(v)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return v[mid] if n % 2 else (v[mid - 1] + v[mid]) / 2.0
+
+
+def _resample_gapped(pts: list[tuple[float, float]], n: int,
+                     gap_m: float):
+    """按**段内弧长**等距重采样，跳变处不累加长度。
+
+    🔴 为什么不能直接丢掉跳变后的点：早先的写法是「距离上一点 > gap 就
+       continue」，结果跳变之后**每一个点**都被跳掉（上一点一直停在跳变前
+       的位置）—— 一整圈只剩前半段。实测用例：两段各 99m，输出只有 98m。
+
+    也不能把跳变算进弧长：那会让后半段的点全部前移，参考线在跳变处打折。
+
+    正确做法：跳变处的累计弧长增量为 0，点保留。重采样落在零长度区间时
+    直接取后段的起点 —— 相当于「从断点继续」，视觉上是一段瞬移，
+    但两段的弧长各自正确。
+    """
+    cum = [0.0]
+    for i in range(1, len(pts)):
+        d = math.dist(pts[i - 1], pts[i])
+        cum.append(cum[-1] + (0.0 if d > gap_m else d))
+    total = cum[-1]
+    if total <= 0:
+        return None
+    out = []
+    j = 0
+    for k in range(n):
+        target = total * k / n
+        while j + 1 < len(cum) and cum[j + 1] < target:
+            j += 1
+        if j + 1 >= len(cum):
+            out.append(pts[-1])
+            continue
+        seg = cum[j + 1] - cum[j]
+        if seg <= 0:                 # 跳变：直接取后段起点
+            out.append(pts[j + 1])
+            continue
+        w = (target - cum[j]) / seg
+        (x0, z0), (x1, z1) = pts[j], pts[j + 1]
+        out.append((x0 + (x1 - x0) * w, z0 + (z1 - z0) * w))
+    return out
+
+
+def lap_line(frames: list[dict], n_points: int = _REF_LINE_POINTS,
+             gap_m: float = _LAP_GEO_GAP_M) -> dict:
+    """单圈走线 → 按**弧长等距**重采样成 n_points 个点（原始世界坐标）。
+
+    为什么按弧长而不是按帧：60Hz 下低速弯的帧密度是高速直道的几十倍，
+    按帧采样会让弯道占据绝大部分点数，直道被压成一条线。
+
+    🔴 坐标跳变（`> gap_m`，实测是主机休眠/瞬移）必须**同时跳过跳变的那一段**，
+       否则整条线的累计弧长被拉长，后面的点全部错位。
+
+    返回 `{"pts": [[x,z],...], "n_points", "len_m", "n_raw"}` 或 `{"error"}`。
+    """
+    try:
+        n_points = int(n_points)
+    except (TypeError, ValueError):
+        n_points = _REF_LINE_POINTS
+    n_points = max(_REF_LINE_MIN_PTS, min(n_points, 600))
+
+    pts: list[tuple[float, float]] = []
+    n_gap = 0
+    for f in frames or []:
+        x, z = f.get("car_x"), f.get("car_z")
+        if x is None or z is None:
+            continue
+        p = (float(x), float(z))
+        if pts and math.dist(pts[-1], p) > gap_m:
+            n_gap += 1               # 记一笔，但点**保留**（见 _resample_gapped）
+        pts.append(p)
+
+    if len(pts) < _REF_LINE_MIN_PTS:
+        return {"error": f"坐标点太少（{len(pts)} < {_REF_LINE_MIN_PTS}）",
+                "n_raw": len(pts)}
+
+    rs = _resample_gapped(pts, n_points, gap_m)
+    if not rs:
+        return {"error": "重采样失败（总弧长为 0）", "n_raw": len(pts)}
+
+    # 段内弧长（跳变不计）—— 这才是这一圈真正跑过的距离
+    ln = sum(math.dist(rs[i - 1], rs[i]) for i in range(1, len(rs))
+             if math.dist(rs[i - 1], rs[i]) <= gap_m)
+    return {"pts": [[round(x, 2), round(z, 2)] for x, z in rs],
+            "n_points": n_points, "len_m": round(ln, 1),
+            "n_raw": len(pts), "n_gaps": n_gap}
+
+
+def reference_line(lines: list[list], n_points: int = _REF_LINE_POINTS,
+                   len_tol: float = 0.03) -> dict:
+    """多条走线 → **逐点中位数**参考线。
+
+    为什么用中位数不用平均：某一场冲出赛道/打转，平均会被整体拉偏，
+    中位数不会。代价是极端情况下参考线会「取中间」——但这正是我们想要的：
+    它代表"你通常怎么跑"，而不是"你最好的一次怎么跑"。
+
+    `len_tol`：先按弧长过滤掉偏离中位数 >3% 的走线（跑错路线/多绕了一段）。
+    与 `sector_times` 的 dist_tol 同源——那种圈不能参与"典型走法"的统计。
+
+    返回 `{"pts", "n_points", "n_laps", "n_used", "len_m", "spread_m",
+           "spread_p95_m", "lap_len_cv"}` 或 `{"error"}`。
+    """
+    try:
+        n_points = int(n_points)
+    except (TypeError, ValueError):
+        n_points = _REF_LINE_POINTS
+    n_points = max(_REF_LINE_MIN_PTS, min(n_points, 600))
+
+    cand: list[tuple[list, float]] = []
+    for ln in lines or []:
+        if not ln or len(ln) != n_points:
+            continue
+        try:
+            pts = [(float(p[0]), float(p[1])) for p in ln]
+        except (TypeError, ValueError, IndexError):
+            continue
+        cand.append((pts, _fp_path_len(pts)))
+    if not cand:
+        return {"error": "没有可用的走线（点数不一致或为空）"}
+
+    lens = [c[1] for c in cand]
+    ref_len = _median(lens)
+    used = [c for c in cand if ref_len > 0 and abs(c[1] - ref_len) <= ref_len * len_tol]
+    if not used:
+        used = cand          # 全都偏离？宁可给一条（带 n_used 说明）也不返回空
+
+    ref: list[tuple[float, float]] = []
+    spread: list[float] = []
+    for i in range(n_points):
+        xs = [p[0][i][0] for p in used]
+        zs = [p[0][i][1] for p in used]
+        mx, mz = _median(xs), _median(zs)
+        ref.append((mx, mz))
+        if len(used) > 1:
+            spread.append(sum(math.dist(p[0][i], (mx, mz)) for p in used)
+                          / len(used))
+
+    # 累计弧长：`track_deviation` 的 ref_pts 要求带 `dist`（它用 R[-1][0]
+    # 当参考圈总长）。算一次一起返回，调用方不用再自己积。
+    dist_m = [0.0]
+    for i in range(1, len(ref)):
+        dist_m.append(dist_m[-1] + math.dist(ref[i - 1], ref[i]))
+
+    ref_len_out = _fp_path_len(ref)
+    cv = 0.0
+    if ref_len > 0 and len(used) > 1:
+        mean = sum(p[1] for p in used) / len(used)
+        var = sum((p[1] - mean) ** 2 for p in used) / len(used)
+        cv = (var ** 0.5) / mean if mean > 0 else 0.0
+
+    spread_sorted = sorted(spread)
+    p95 = (spread_sorted[int(len(spread_sorted) * 0.95)]
+           if spread_sorted else 0.0)
+    return {
+        "pts": [[round(x, 2), round(z, 2)] for x, z in ref],
+        "n_points": n_points,
+        "n_laps": len(cand),
+        "n_used": len(used),
+        "len_m": round(ref_len_out, 1),
+        "dist_m": [round(d, 1) for d in dist_m],
+        # 离散度：各圈到参考线的平均横向距离。1~3m 是正常（不同圈本来就有差异），
+        # 超过 10m 说明这些圈根本不是同一条走线（可能赛道识别错了）。
+        "spread_m": round(sum(spread) / len(spread), 2) if spread else 0.0,
+        "spread_p95_m": round(p95, 2),
+        "lap_len_cv": round(cv, 4),
+    }
+
+
 def fingerprint_distance(a: list, b: list) -> float:
     """两条指纹的逐点 RMS 距离（归一化坐标系，无量纲）。"""
     if not a or not b or len(a) != len(b):

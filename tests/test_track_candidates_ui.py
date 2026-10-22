@@ -64,8 +64,13 @@ class TestCandidatesReachFrontend:
         """名字是用户的决定：点候选只填进输入框，仍需按保存。"""
         html = dash.build_tracks_page(lib)
         assert "function trackPick" in html
-        pick = html[html.index("function trackPick"):]
-        pick = pick[:pick.index("function trackSave")]
+        # 🔴 切到**下一个顶层函数**为止，不能硬编码 `function trackSave`：
+        #    中间插进任何新函数（E2 的 refBuild/refShow 就带 fetch）都会
+        #    被算进 trackPick 的"函数体"，让这条断言假红。
+        i = html.index("function trackPick")
+        rest = html[i + len("function trackPick"):]
+        nxt = rest.find("\nfunction ")
+        pick = rest[:nxt] if nxt > 0 else rest
         assert "inp.value" in pick, "没有把候选填进输入框"
         assert "fetch(" not in pick, (
             "trackPick 里不该直接发请求 —— 点一下候选就改名，用户没有反悔机会")
