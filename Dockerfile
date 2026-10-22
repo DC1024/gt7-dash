@@ -46,7 +46,11 @@ ARG BASE_IMAGE=python:3.12-slim@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd
 #
 #    多阶段构建后：代码改动必然进镜像，仓库里也不再需要二进制产物。
 ARG VERSION=dev
-FROM golang:1.22-alpine AS gobuild
+# 🔴 版本必须 >= gt7-decrypt/go.mod 里 `go` 指令要求的版本。
+#    用低了会在 `go mod download` 阶段直接失败：
+#    "go.mod requires go >= 1.26.0 (running go 1.22.12)"。
+#    这条约束由 tests/test_deploy_contract.py 守着，改 go.mod 时不会忘。
+FROM golang:1.26-alpine AS gobuild
 WORKDIR /src
 # 先只拷 go.mod/go.sum 再 download：改 main.go 时这一层能命中缓存
 COPY gt7-decrypt/go.mod gt7-decrypt/go.sum ./

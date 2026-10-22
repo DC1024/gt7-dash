@@ -156,6 +156,28 @@ class TestDockerfileIsSelfContained:
         text = _read("Dockerfile")
         assert "-selftest" in text
 
+    def test_Dockerfile_的_Go_版本满足_go_mod(self):
+        """Dockerfile 的 golang 版本必须 >= go.mod 要求的版本。
+
+        🔴 真实事故：Dockerfile 写 golang:1.22，而 go.mod 是 `go 1.26.0`，
+           构建在 `go mod download` 阶段直接失败：
+           "go.mod requires go >= 1.26.0 (running go 1.22.12)"。
+           CI 的 release-exe.yml 用 go-version-file 自动跟随，Dockerfile 不会。
+        """
+        import re
+        mod = _read("gt7-decrypt/go.mod")
+        m = re.search(r"^go (\d+)\.(\d+)", mod, re.M)
+        assert m, "go.mod 里找不到 go 指令"
+        want = (int(m.group(1)), int(m.group(2)))
+
+        df = _read("Dockerfile")
+        g = re.search(r"FROM golang:(\d+)\.(\d+)", df)
+        assert g, "Dockerfile 里没有 golang 构建阶段"
+        got = (int(g.group(1)), int(g.group(2)))
+        assert got >= want, (
+            f"Dockerfile 用 Go {got[0]}.{got[1]}，go.mod 要求 "
+            f"{want[0]}.{want[1]} —— 构建会在 go mod download 阶段失败")
+
     def test_Go_源码改了会进镜像(self):
         """有 main.go 就必须在镜像里编译，不能 COPY 预编译二进制。
 
