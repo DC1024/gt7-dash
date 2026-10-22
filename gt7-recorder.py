@@ -256,6 +256,21 @@ class TelemetrySample:
     min_alert_rpm: float = 0.0    # 0x88
     max_alert_rpm: float = 0.0    # 0x8A
 
+    # —— 格式 C 独有（368B，GT7 1.68+）——
+    # 🔴 None = 这个包类型不提供该字段（A / B / ~ 都是 None），**不是读到 0**。
+    #    前端/分析必须区分"没有"和"是 0"——转向角为 0 是方向盘回正，
+    #    没有转向角是包类型不支持，两者含义完全不同。
+    #
+    # 偏移来自真机实测（GT7 ver.01.720，10783 帧，2026-10-22）：
+    #   · 0x160 / 0x164：与三点曲率反算的转向角**幅度**相关 r=0.789，
+    #     两者互相关 r=0.965（左右前轮，Ackermann 差异）。单位弧度，实测 ±0.17。
+    #   · 0x168：全程 2.891~2.906 m，符合轴距。
+    #   · 0x16C：4 字节 ASCII 组别名，实测 "GR1"。
+    steer_angle_l: float | None = None
+    steer_angle_r: float | None = None
+    wheel_base: float | None = None
+    car_category: str | None = None
+
     def to_json(self) -> dict[str, Any]:
         return {
             "t": round(self.t, 4),
@@ -298,6 +313,14 @@ class TelemetrySample:
             "powertrain": self.powertrain,
             "energy_recovery": round(self.energy_recovery, 3),
             "throttle_filtered": round(self.throttle_filtered, 3),
+            # 格式 C 独有字段：A/B/~ 包没有 → **不写**（而不是写 null）。
+            # 60Hz × 每帧多 4 个 null 字段 ≈ 每小时多 4MB，而它们永远是 null。
+            # 读的时候用 .get() 就行，缺字段和 null 在这里等价。
+            **({"steer_angle_l": round(self.steer_angle_l, 4),
+                "steer_angle_r": round(self.steer_angle_r, 4),
+                "wheel_base": round(self.wheel_base, 3),
+                "car_category": self.car_category}
+               if self.steer_angle_l is not None else {}),
             "brake_filtered": round(self.brake_filtered, 3),
             "car_code": self.car_code,
             "turbo_boost": round(self.turbo_boost, 3),
@@ -751,7 +774,13 @@ class Decoder:
             # 包类型按**实际长度**推断，而不是一律记 "A"。
             # 心跳切到 B / ~ 后包会变长（316 / 332），状态文件里显示真实类型
             # 便于确认 PS5 是否真的按我们请求的类型发包（协议改动排查用）。
-            if n >= 0x148:
+            # 🔴 C 包（368B）必须**先判**：368 >= 0x148(328)，否则会被当成 `~`，
+            #    然后按 ~ 的偏移去读 energy_recovery / throttleFiltered ——
+            #    那些偏移在 C 包里是完全不同的字段，会产出"看起来合理的假数字"，
+            #    而且 layout 显示成 "~"，一切正常，根本发现不了。
+            if n >= 0x170:              # 368 = 格式 C（GT7 1.68+）
+                pkt_layout = "C"
+            elif n >= 0x148:
                 pkt_layout = "~"
             elif n >= 0x130:
                 pkt_layout = "B"
@@ -828,6 +857,15 @@ class Decoder:
                 #   ② 本文件注释写 ~ 包 332B，社区文档普遍写 344B，差 12 字节
                 #   无人解释。启用 --packet-type ~ 之前必须抓一次包核对。
                 energy_recovery=f32(0x144) if n >= 0x148 else 0.0,
+                # —— 格式 C 独有（368B）——
+                # 用包长守门：A/B/~ 包读到的是别的字段，绝不能张冠李戴。
+                steer_angle_l=f32(0x160) if n >= 0x164 else None,
+                steer_angle_r=f32(0x164) if n >= 0x168 else None,
+                wheel_base=f32(0x168) if n >= 0x16C else None,
+                car_category=(
+                    (data[0x16C:0x170].split(b"\x00")[0]
+                     .decode("ascii", "replace") or None)
+                    if n >= 0x170 else None),
                 throttle_filtered=(data[0x13C] / 255.0) if n >= 0x13D else 0.0,
                 brake_filtered=(data[0x13D] / 255.0) if n >= 0x13E else 0.0,
                 car_code=u32(0x124) if n >= 0x128 else 0,
@@ -1965,12 +2003,15 @@ def main() -> int:
              "⚠️ 必须定期向 PS5 发 'A' 心跳，否则 PS5 会停止发送遥测",
     )
     p.add_argument(
-        "--packet-type", default="A", choices=["A", "B", "~"],
+        "--packet-type", default="A", choices=["A", "B", "~", "C"],
         help="请求的遥测包类型（改心跳字符），默认 A（296 字节，最稳）。"
+             "C = 格式 C（368 字节，GT7 1.68+）：多**真实转向角**/轴距/组别，"
+             "已在 GT7 1.72 实测验证；"
              "B = 运动数据（316 字节，多 sway/heave/surge，Sport 模式不可用）；"
-             "~ = 扩展数据（332 字节，多能量回收/滤波输入，回放不可用）。"
-             "⚠️ B/~ 的扩展段是社区逆向字段、仍在研究中，且非所有模式都支持；"
-             "普通使用保持 A 即可。纯电车电量在 A 包里就有，无需切包。",
+             "~ = 扩展数据（实测 344 字节，多能量回收，但本工具尚未能解密）。"
+             "⚠️ 普通使用保持 A 即可。"
+             "🔴 包类型在**进入赛道那一刻**确定 —— 改了心跳不重进赛道不生效；"
+             "而且 C 包与 A 包互斥（一次只能收一种）。",
     )
     p.add_argument(
         "--probe", action="store_true",

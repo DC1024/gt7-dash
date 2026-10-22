@@ -29,7 +29,13 @@ var key = [32]byte([]byte("Simulator Interface Packet GT7 ver 0.0"))
 
 const (
 	magicWanted = 0x47375330 // "GT7\0"
-	ivMask     = 0xDEADBEAF
+	ivMask      = 0xDEADBEAF // 格式 A / B / ~
+	// 🔴 格式 C（368B，GT7 1.68+）的 IV mask 是 **DEADBEEF**，不是 DEADBEAF。
+	//    就差这一个字母（AF → EF）。实测 GT7 ver.01.720：
+	//      · 用 ivMask  解 C 包 → 10783 个一个都解不开
+	//      · 用 ivMaskC 解 C 包 → 10783 个全部解开
+	//    密钥、IV 位置（0x40）、nonce 顺序、counter 起始值全都一样。
+	ivMaskC = 0xDEADBEEF
 )
 
 // decrypt 解一个包。返回明文，失败返回 nil。
@@ -37,20 +43,25 @@ func decrypt(dat []byte) []byte {
 	if len(dat) < 0x44+8 {
 		return nil
 	}
-	oiv := dat[0x40:0x44]
-	iv1 := binary.LittleEndian.Uint32(oiv)
-	iv2 := iv1 ^ ivMask
-	iv := make([]byte, 8)
-	binary.LittleEndian.PutUint32(iv, iv2)
-	binary.LittleEndian.PutUint32(iv[4:], iv1)
+	iv1 := binary.LittleEndian.Uint32(dat[0x40:0x44])
 
-	d := make([]byte, len(dat))
-	salsa20.XORKeyStream(d, dat, iv, &key)
+	// 两个 mask 都试，让 magic 自己说话。
+	// 🔴 不按包长判断用哪个：344B 的 `~` 包到底用哪个还没定论（两个都解不开），
+	//    按长度硬编码会在协议再变一次时静默失败。多试一次的代价可以忽略
+	//    （A 包命中第一个就返回；C 包多算一次 Salsa20，60Hz 下无感）。
+	for _, mask := range [2]uint32{ivMask, ivMaskC} {
+		iv2 := iv1 ^ mask
+		iv := make([]byte, 8)
+		binary.LittleEndian.PutUint32(iv, iv2)
+		binary.LittleEndian.PutUint32(iv[4:], iv1)
 
-	if binary.LittleEndian.Uint32(d[:4]) != magicWanted {
-		return nil
+		d := make([]byte, len(dat))
+		salsa20.XORKeyStream(d, dat, iv, &key)
+		if binary.LittleEndian.Uint32(d[:4]) == magicWanted {
+			return d
+		}
 	}
-	return d
+	return nil
 }
 
 func main() {
