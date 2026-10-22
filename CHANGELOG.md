@@ -8,6 +8,8 @@
 
 ### 修复
 - docker.yml 把版本号烧进 Go 解密器（`ci`）
+### 文档
+- 把 CHANGELOG 的正确提交顺序写进报错和手册
 ### 工程
 - v1.6.1 —— Dockerfile 多阶段构建修复（`release`）
 
