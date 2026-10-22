@@ -36,3 +36,6 @@ htmlcov/
 # 前端 lint（C2）：依赖与抽取产物都不入库
 node_modules/
 _lint_js/
+
+# 抓包产物（第 4 批协议探针，数据量大不入库）
+capture_*.jsonl
