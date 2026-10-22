@@ -152,3 +152,45 @@ class TestNoCFieldsOnOtherLayouts:
         d = dec._decode_plain(bytes(b), 1000.0).to_json()
         assert "steer_angle_l" in d
         assert d["steer_angle_l"] == 0.0
+
+
+class TestDefaultIsC:
+    """项目默认包类型必须是 C（2026-10-22 决定）。
+
+    理由：实测 C ⊃ A（基础/轮胎/悬挂/轮速/车型/圈速/引擎全部一致），
+    只多不少，代价只有带宽 296→368B。所以默认就该用 C。
+    这几条测试防的是"有人把默认值改回 A"——那会让转向角悄悄消失。
+    """
+
+    def test_recorder_默认包类型是_C(self):
+        import re
+        text = (ROOT / "gt7-recorder.py").read_text(encoding="utf-8")
+        m = re.search(r'"--packet-type",\s*default="(\w+)"', text)
+        assert m, "找不到 --packet-type 的默认值"
+        assert m.group(1) == "C", (
+            f"默认包类型是 {m.group(1)}，应为 C —— A 包没有转向角/轴距/组别")
+
+    def test_compose_默认包类型是_C(self):
+        text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        assert "${GT7_PACKET_TYPE:-C}" in text, (
+            "compose 里默认不是 C（应为 ${GT7_PACKET_TYPE:-C}）")
+
+    def test_仍可切回_A(self):
+        """兜底能力不能丢：GT7 < 1.68 或 C 出问题时必须能切回 A。"""
+        text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        assert "GT7_PACKET_TYPE=A" in text, "文档里没写怎么切回 A"
+        rec = (ROOT / "gt7-recorder.py").read_text(encoding="utf-8")
+        assert '"A", "B", "~", "C"' in rec, "--packet-type 的 choices 少了 A"
+
+    def test_帧存白名单含_C_字段(self, dash):
+        """不加白名单 = C 包数据被静默丢弃（存不进去，上层读到 None）。"""
+        for k in ("steer_angle_l", "steer_angle_r", "wheel_base",
+                  "car_category"):
+            assert k in dash._FRAME_COL_KIND, f"{k} 不在帧存白名单里"
+
+    def test_请求与实收不符时有警告(self):
+        """请求 C 却收到 A 时必须报警 —— 否则用户以为在录转向角。"""
+        text = (ROOT / "gt7-recorder.py").read_text(encoding="utf-8")
+        assert "请求的包类型是" in text, (
+            "没有包类型不符的警告 —— 切换失败会静默录一场没有转向角的数据")
+        assert "_layout_warn_t" in text, "警告没有限流，会刷屏"
