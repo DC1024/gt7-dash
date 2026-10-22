@@ -30,6 +30,15 @@ recorder 是"解析完再落盘"：字段没解码，抓下来就等于没抓。
    发心跳会让 PS5 收到两份，包序混乱、长度分布也看不准。工具启动时会检测
    33739 端口有没有别的进程在监听，有就拒绝启动。
 
+🔴 **包类型在「进入赛道」那一刻确定，中途改心跳完全无效**（实测，GT7 1.72）：
+
+   · 在赛道里跑着，依次换 A → ~ → B → C 各抓 90 秒
+     → **四段全是 296 字节的 A 包**，心跳字符等于没发
+   · 先发 `~` 心跳、再让玩家**退出赛道重新进入**
+     → 立刻变成 344 字节的 `~` 包
+
+   所以测每种包类型都要走一遍「退出 → 重进」。光换心跳是白费功夫。
+
 输出
 ----
 默认写到 `capture_<心跳>_<时间>.jsonl`，每行一个包：
@@ -44,7 +53,8 @@ recorder 是"解析完再落盘"：字段没解码，抓下来就等于没抓。
 结束时打印长度分布。三种典型结果：
 
   · 全是 296        → PS5 没按请求的包类型发（心跳没生效，或固件不支持）
-  · 出现 332 / 344  → ~ 包的真实长度，直接回答 A8 的第一个分歧
+  · 出现 332 / 344  → ~ 包的真实长度（**实测 GT7 1.72 = 344**，本仓库
+                      早先注释写 332 是错的）
   · 出现 368        → C 包可用，A7 有数据了
 """
 from __future__ import annotations
@@ -91,7 +101,11 @@ def capture(heartbeat: str, seconds: float, out_path: Path,
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         try:
             s.bind(("0.0.0.0", p))
-            s.settimeout(0.2)
+            # 🔴 非阻塞 + 内层 while：早先用 settimeout(0.2) 且每轮只收一个包，
+            #    结果每轮最多收 2 个（每个 socket 一个）就要等 0.4 秒超时 ——
+            #    实测 25 秒只收到 148 个包，而 60Hz 应该是 1500 个。
+            #    采样率掉到 6Hz 会让"验证偏移"这类统计完全不可靠。
+            s.setblocking(False)
             socks.append(s)
         except OSError as e:
             print(f"  ! 无法绑定 {p}: {e}")
@@ -122,35 +136,41 @@ def capture(heartbeat: str, seconds: float, out_path: Path,
                     except OSError:
                         pass
                 last_hb = now
+            got = False
             for s in socks:
-                try:
-                    data, _addr = s.recvfrom(4096)
-                except (socket.timeout, OSError):
-                    continue
-                n = len(data)
-                lens[n] += 1
-                dec = decrypt_packet(data)
-                src = f"{_addr[0]}:{_addr[1]}"
-                srcs[src] += 1
-                if dec is None:
-                    n_bad += 1
-                else:
-                    n_ok += 1
-                    gt7_srcs[src] += 1
-                out.write(json.dumps({
-                    "t": round(now - t0, 3),
-                    "n": n,
-                    "src": src,
-                    "enc": data.hex(),
-                    "dec": dec.hex() if dec is not None else None,
-                }, separators=(",", ":")) + "\n")
-                if verbose:
-                    print(f"  [{now - t0:6.2f}s] {n:3d}B "
-                          f"{'解密 OK' if dec is not None else '解不开'}")
+                # 一次把缓冲里积压的包**全收完**，再让出 CPU
+                while True:
+                    try:
+                        data, _addr = s.recvfrom(4096)
+                    except (BlockingIOError, socket.timeout, OSError):
+                        break
+                    got = True
+                    n = len(data)
+                    lens[n] += 1
+                    dec = decrypt_packet(data)
+                    src = f"{_addr[0]}:{_addr[1]}"
+                    srcs[src] += 1
+                    if dec is None:
+                        n_bad += 1
+                    else:
+                        n_ok += 1
+                        gt7_srcs[src] += 1
+                    out.write(json.dumps({
+                        "t": round(now - t0, 3),
+                        "n": n,
+                        "src": src,
+                        "enc": data.hex(),
+                        "dec": dec.hex() if dec is not None else None,
+                    }, separators=(",", ":")) + "\n")
+                    if verbose:
+                        print(f"  [{now - t0:6.2f}s] {n:3d}B "
+                              f"{'解密 OK' if dec is not None else '解不开'}")
             # 实时状态（同一行刷新）
             top = " ".join(f"{k}B×{v}" for k, v in lens.most_common(3))
             sys.stdout.write(f"\r  {n_ok + n_bad:5d} 包 / {now - t0:5.1f}s   {top}   ")
             sys.stdout.flush()
+            if not got:
+                time.sleep(0.002)
     finally:
         out.close()
         for s in socks:
