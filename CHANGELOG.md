@@ -6,6 +6,8 @@
 
 ## v1.6.1
 
+### 新增
+- 包类型可用 GT7_PACKET_TYPE 切换（默认 A）（`compose`）
 ### 修复
 - docker.yml 把版本号烧进 Go 解密器（`ci`）
 ### 文档
