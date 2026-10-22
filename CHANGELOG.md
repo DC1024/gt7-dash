@@ -10,6 +10,7 @@
 - 格式 C（368B）解密 + 三个新字段 —— 根因是 mask 差一个字母（`A7`）
 ### 修复
 - Dockerfile 改为镜像内编译 Go —— 之前改了 .go 完全不生效（`build`）
+- Dockerfile 用 Go 1.26（go.mod 要求），并加测试防脱节（`build`）
 
 ## v1.5.2
 
