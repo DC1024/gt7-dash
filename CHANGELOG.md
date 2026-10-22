@@ -4,6 +4,11 @@
 > 提交信息遵循 `type(scope): 描述`，脚本按 type 分组。
 > 分段依据是 `gt7_version.py` 的版本变更（不是 tag —— tag 各机器不一致）。
 
+## v1.5.2
+
+### 修复
+- 同一场次的 .jsonl 与 .jsonl.gz 被算成两场（`tracks`）
+
 ## v1.5.1
 
 ### 新增
