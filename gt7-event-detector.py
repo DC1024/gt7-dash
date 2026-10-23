@@ -93,6 +93,13 @@ class Sample:
     circuit: str | None = None
     car_name: str | None = None
 
+    # 四轮路面材质（**格式 C 独有**）：4 个字符，顺序 FL/FR/RL/RR。
+    #   T = 铺装  C = 路肩（红白牙条）  G = 草地（已出界）
+    # 空串 = 这个包类型没有该字段（A/B/~ 包），**不是"全是铺装"**。
+    # 🔴 判事件前必须区分这两种情况，否则 A 包场次会一条压路肩事件都不报，
+    #    看起来像"开得很好"，其实是没数据。
+    surface: str = ""
+
 
 # ---------------------------------------------------------------------------
 # 事件定义
@@ -109,9 +116,7 @@ class EventType(str, Enum):
     PIT_LIKE = "pit_like"               # 进站（行为推断，B4b）
     HEAVY_THROTTLE = "heavy_throttle"   # 大油门出弯
     OFF_TRACK = "off_track"             # 出界
-    TANK_SLAP = "tank_slap"             # 压路肩石/草地（未实现）
-    # TODO(B4c): 需要 C 包的 surfaceType[4] 才能判断"压到什么"；
-    #   依赖 TODO(A7)。现在的 OFFTrack 只能靠走线偏差近似。
+    TANK_SLAP = "tank_slap"             # 压路肩石（B4c，靠格式 C 的 surfaceType）
 
 
 @dataclass
@@ -150,6 +155,12 @@ class Thresholds:
     # 出界：低速 + 大量滑移
     offtrack_max_speed: float = 70.0
     offtrack_slip: float = 0.22
+
+    # —— 压路肩（B4c）：靠格式 C 的 surfaceType 逐轮判定 ——
+    # 高速压路肩才是"切弯吃到牙条"；低速（进出维修区、回场圈）压上去
+    # 没有意义，报出来只会淹没时间线。
+    curb_min_speed: float = 30.0      # km/h
+    curb_min_duration: float = 0.20   # 秒（60Hz ≈ 12 帧），压一下就走的抖动不算
 
     # 轮胎打滑：单轮转速显著高于其他
     wheel_slip_delta: float = 0.18
@@ -598,6 +609,60 @@ class EventDetector:
             )
         return out
 
+    def detect_curb(self, samples: list[Sample]) -> list[Event]:
+        """压路肩（B4c）：靠格式 C 的 surfaceType 逐轮判定。
+
+        `surface` 是 4 个字符（FL/FR/RL/RR）：`T` 铺装 / `C` 路肩 / `G` 草地。
+
+        🔴 三种情况必须分开，别混成一种：
+          · 整场都没有 surface（A/B/~ 包）→ **一条都不报**。不能把它
+            当成"没压过路肩"——那会让 A 包场次看起来开得很干净。
+          · 只有 `G` 没有 `C` → 那是出界，交给 OFF_TRACK，这里不重复报。
+          · `C` 与 `G` 混着 → 报压路肩，并在证据里标"同时压到草地"。
+
+        判据：连续 ≥ `curb_min_duration` 且车速 ≥ `curb_min_speed`，
+        且至少一轮压在路肩上。低速（回场圈/维修区）压上去不算。
+        """
+        if not any(s.surface for s in samples):
+            return []                    # 这个包类型没有路面数据
+        out = []
+        runs = filter_sustained(
+            samples,
+            lambda s: (bool(s.surface) and "C" in s.surface
+                       and s.speed_kph >= self.th.curb_min_speed),
+            min_duration=self.th.curb_min_duration,
+            sample_hz=self.th.sample_hz,
+        )
+        for a, b in runs:
+            seg = samples[a : b + 1]
+            # 最"深"的那一帧：压在路肩上的轮子最多
+            worst = max(seg, key=lambda s: s.surface.count("C"))
+            n_curb = worst.surface.count("C")
+            dur = samples[b].t - samples[a].t
+            mean_spd = sum(s.speed_kph for s in seg) / len(seg)
+            # 置信度：压的轮子越多、压得越久越可信。压一下就走的抖动
+            # 大约落在 0.5，四轮齐上且持续半秒以上才接近 1。
+            conf = min(1.0, 0.45 + 0.12 * n_curb + 0.25 * dur)
+            out.append(
+                Event(
+                    t_start=samples[a].t,
+                    t_end=samples[b].t,
+                    type=EventType.TANK_SLAP,
+                    confidence=conf,
+                    lap=worst.lap_count,
+                    evidence={
+                        "压路肩轮数": n_curb,
+                        "路面": worst.surface,
+                        "持续_s": round(dur, 2),
+                        "均速_kph": round(mean_spd, 1),
+                        **({"同时压到草地": True}
+                           if any("G" in s.surface for s in seg) else {}),
+                    },
+                    comment_hint="车辆切上了路肩（红白牙条），注意轮胎与底盘负荷",
+                )
+            )
+        return out
+
     def detect_heavy_throttle(self, samples: list[Sample]) -> list[Event]:
         """大油门出弯：出弯速度区间内的持续全油门。
 
@@ -853,6 +918,7 @@ class EventDetector:
         events += self.detect_spin(samples)
         events += self.detect_hard_braking(samples)
         events += self.detect_offtrack(samples)
+        events += self.detect_curb(samples)
         events += self.detect_tyre_abuse(samples)
         events += self.detect_heavy_throttle(samples)
         pits = self.detect_pit_like(samples)
@@ -874,6 +940,9 @@ class EventDetector:
             EventType.PIT_LIKE: 6,
             EventType.HEAVY_THROTTLE: 4,
             EventType.HARD_BRAKING: 3,
+            # 压路肩是"过程"不是"事故"：它值得记录（轮胎/底盘负荷、
+            # 复盘切弯线路），但不该盖过刹车点或打滑。
+            EventType.TANK_SLAP: 2,
         }
         events.sort(key=lambda e: (e.t_start, -priority.get(e.type, 1)))
         return events
@@ -1134,6 +1203,7 @@ def export_report(
                 "hard_braking": "极限刹车",
                 "off_track": "出界",
                 "heavy_throttle": "大油门",
+                "tank_slap": "压路肩",
             }.get(e.type.value, e.type.value),
             "score": round(score(e), 2),
             "evidence": e.evidence,

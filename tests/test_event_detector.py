@@ -195,3 +195,79 @@ def test_run_all_priority_table_has_tyre_abuse():
     d = det.EventDetector(radii=(R, R))
     evs = d.run_all(s)
     assert any(e.type is det.EventType.TYRE_ABUSE for e in evs)
+
+
+# ---------------------------------------------------------------------------
+# 5. 压路肩（B4c）：靠格式 C 的 surfaceType 逐轮判定
+# ---------------------------------------------------------------------------
+
+
+def _curb_samples(seq, speed=120.0):
+    """按给定路面字符序列造帧（其余量保持"在跑"的状态）。"""
+    out = []
+    for i, surf in enumerate(seq):
+        s = _mk(i, speed_kph=speed)
+        s.surface = surf
+        out.append(s)
+    return out
+
+
+class TestCurbSlap:
+    """`surface` 是 4 个字符（FL/FR/RL/RR）：T 铺装 / C 路肩 / G 草地。
+
+    实测 21175 帧真实 C 包：TTTT 90.2% / GGGG 5.5% / TCTC 1.5% /
+    CTCT 1.0% / CCCC 0.2%，TCTC 与 CTCT 成对出现（压右/压左路肩）。
+    """
+
+    def test_压一下就走的抖动不报(self):
+        """连续不足 curb_min_duration（0.2s ≈ 12 帧）不算一次压路肩。"""
+        seq = ["TTTT"] * 30 + ["TCTC"] * 5 + ["TTTT"] * 30
+        assert det.EventDetector().detect_curb(_curb_samples(seq)) == []
+
+    def test_持续压路肩报一次(self):
+        seq = ["TTTT"] * 30 + ["TCTC"] * 40 + ["TTTT"] * 30
+        evs = det.EventDetector().detect_curb(_curb_samples(seq))
+        assert len(evs) == 1
+        e = evs[0]
+        assert e.type == det.EventType.TANK_SLAP
+        assert e.evidence["压路肩轮数"] == 2
+        assert e.evidence["路面"] == "TCTC"
+        assert e.duration > 0.5
+
+    def test_四轮齐上置信度更高(self):
+        one = det.EventDetector().detect_curb(
+            _curb_samples(["TTTT"] * 20 + ["TCTT"] * 30 + ["TTTT"] * 20))[0]
+        four = det.EventDetector().detect_curb(
+            _curb_samples(["TTTT"] * 20 + ["CCCC"] * 30 + ["TTTT"] * 20))[0]
+        assert four.confidence > one.confidence
+        assert four.evidence["压路肩轮数"] == 4
+
+    def test_低速压路肩不算(self):
+        """回场圈/维修区压上去没有意义，报出来只会淹没时间线。"""
+        seq = ["TTTT"] * 20 + ["TCTC"] * 40 + ["TTTT"] * 20
+        assert det.EventDetector().detect_curb(
+            _curb_samples(seq, speed=10.0)) == []
+
+    def test_只有草地时不报压路肩(self):
+        """纯出界交给 OFF_TRACK，别在这里重复报一遍。"""
+        seq = ["TTTT"] * 20 + ["GGGG"] * 40 + ["TTTT"] * 20
+        assert det.EventDetector().detect_curb(_curb_samples(seq)) == []
+
+    def test_路肩混草地会标注(self):
+        seq = ["TTTT"] * 20 + ["CGCG"] * 40 + ["TTTT"] * 20
+        evs = det.EventDetector().detect_curb(_curb_samples(seq))
+        assert len(evs) == 1
+        assert evs[0].evidence.get("同时压到草地") is True
+
+    def test_A_包没有路面数据时一条都不报(self):
+        """🔴 关键：没有数据 ≠ 没压过。
+
+        A/B/~ 包不带 surface，必须返回空列表；如果这里改成"默认 TTTT"，
+        A 包场次会永远显示"零次压路肩"，把没数据伪装成开得干净。
+        """
+        assert det.EventDetector().detect_curb(_run(120)) == []
+
+    def test_run_all_里会跑(self):
+        seq = ["TTTT"] * 30 + ["TCTC"] * 40 + ["TTTT"] * 30
+        types = {e.type for e in det.EventDetector().run_all(_curb_samples(seq))}
+        assert det.EventType.TANK_SLAP in types

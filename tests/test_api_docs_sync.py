@@ -111,7 +111,7 @@ def test_track_identify_rows_in_both(embedded, doc_file):
 
 def test_events_row_in_both_tables(embedded, doc_file):
     row = ("| `GET /api/v1/sessions/<文件名>/events?lap=N` | "
-           "**驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；"
+           "**驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界 / 压路肩；"
            "`lap` 缺省 = 全部圈 |")
     assert row in embedded, "内嵌文档缺 /events 表格行"
     assert row in doc_file, "API文档.md 缺 /events 表格行"

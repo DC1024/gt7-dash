@@ -3015,6 +3015,8 @@ _EVENT_TYPE_NAMES: dict[str, str] = {
     "off_track": "出界",
     # v1.4.0 补齐的三类
     "overtake": "超车 / 被超", "pit_like": "进站", "lap_record": "最快圈",
+    # v1.9.1：靠格式 C 的 surfaceType 逐轮判定
+    "tank_slap": "压路肩",
 }
 
 
@@ -3116,6 +3118,10 @@ def _frame_to_sample(det, f, i: int):
         num_cars=int(f.get("num_cars") or 0),
         gas_level=f.get("gas_level") or 0.0,
         gas_capacity=f.get("gas_capacity") or 0.0,
+        # 四轮路面材质（格式 C 独有）：压路肩事件唯一的数据源。
+        # A/B/~ 包没有该字段 → 空串，检测器据此**不报**压路肩，
+        # 而不是把"没数据"当成"没压过"。
+        surface=f.get("surface") or "",
     )
 
 
@@ -3226,6 +3232,7 @@ def _events_compute(det, path: Path, grouped: dict, store: "FrameStore",
                + detector.detect_hard_braking(samples)
                + detector.detect_tyre_abuse(samples)
                + detector.detect_heavy_throttle(samples)
+               + detector.detect_curb(samples)
                + pit_evs
                + detector.detect_position_changes(
                    samples,
@@ -3337,6 +3344,8 @@ _HIGHLIGHT_WEIGHT: dict[str, float] = {
     "tyre_abuse": 5.0, "heavy_throttle": 4.0, "hard_braking": 3.0,
     # v1.4.0 新增：超车是比赛里最值得回看的事；进站偏"过程"而非"高光"。
     "overtake": 6.0, "pit_like": 2.0, "lap_record": 6.5,
+    # 压路肩：复盘切弯线路有用，但不是高光，权重压到最低一档。
+    "tank_slap": 1.5,
 }
 _DEFAULT_WEIGHT = 1.0
 
@@ -4030,7 +4039,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
-| `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
+| `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界 / 压路肩；`lap` 缺省 = 全部圈 |
 | `GET /api/v1/sessions/<文件名>/highlights?top=10&pad_before=2&pad_after=1.5&min_score=0&types=&lap=` | **集锦剪辑时间轴**：事件按 `置信度×类型权重` 排序，每段给出可直接喂 ffmpeg 的 `clip_start` / `duration`（含前后留白）。`top=0` = 不限；`types` 逗号分隔过滤 |
 | `GET /api/v1/sessions/<文件名>/video` | **录像↔遥测锚点**：读取当前绑定（文件 / `offset_s` / 换算好的起止时刻） |
 | `POST /api/v1/sessions/<文件名>/video` | **绑定录像**：body 给 `{file, offset_s}` 或 `{file, video_lead_s}` 或 `{file, video_start_iso}` 或 `{file, video_start_epoch}` 或 `{file, probe:true}`；`{clear:true}` 解绑 |
@@ -4388,7 +4397,7 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 | `available` | 检测器文件缺失 / 无帧时为 `false`，`reason` 写明原因 |
 | `calibration` | 前后轴标定半径（与 `/slip` 共用同一次标定）；`available=false` 时滑移用兜底半径 |
 | `events[]` | `{lap, t_rel, t_end_rel, type, confidence, evidence, hint, src}`，按 (圈, 圈内秒) 排序 |
-| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界）/ `overtake`（超车·被超）/ `pit_like`（进站）/ `lap_record`（最快圈） |
+| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界）/ `overtake`（超车·被超）/ `pit_like`（进站）/ `lap_record`（最快圈）/ `tank_slap`（压路肩，需格式 C） |
 | `t_rel` / `t_end_rel` | 事件起止相对**该圈起点**的秒数（与 `/series?lap=N` 同一时间基准） |
 | `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底）/ `lap_time`（官方圈速，用于 `lap_record`） |
 | `laps` / `lap_scope` | 本次覆盖的圈号清单 / `?lap=N` 的筛选值（0 = 全场） |

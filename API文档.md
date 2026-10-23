@@ -281,7 +281,7 @@
 | `GET /api/v1/sessions/<文件名>/sectors?n=4` | **分段计时 + 理论最快圈**；`n` = 段数（2~10，缺省 4） |
 | `GET /api/v1/sessions/<文件名>/slip?max_points=120` | **轮胎滑移**：空转 / 抱死检测；每圈曲线最多 `max_points` 点 |
 | `GET /api/v1/sessions/<文件名>/deviation?ref_lap=&cmp_lap=&step=5` | **走线偏差**：本圈相对参考圈的逐米横向偏移热力图；`ref_lap` 缺省 = 最快圈，`cmp_lap` 缺省 = 最后一圈 |
-| `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界；`lap` 缺省 = 全部圈 |
+| `GET /api/v1/sessions/<文件名>/events?lap=N` | **驾驶事件时间线**：打滑 / 碰撞 / 极限刹车 / 轮胎滥用 / 大油门 / 出界 / 压路肩；`lap` 缺省 = 全部圈 |
 | `GET /api/v1/sessions/<文件名>/highlights?top=10&pad_before=2&pad_after=1.5&min_score=0&types=&lap=` | **集锦剪辑时间轴**：事件按 `置信度×类型权重` 排序，每段给出可直接喂 ffmpeg 的 `clip_start` / `duration`（含前后留白）。`top=0` = 不限；`types` 逗号分隔过滤 |
 | `GET /api/v1/sessions/<文件名>/video` | **录像↔遥测锚点**：读取当前绑定（文件 / `offset_s` / 换算好的起止时刻） |
 | `POST /api/v1/sessions/<文件名>/video` | **绑定录像**：body 给 `{file, offset_s}` 或 `{file, video_lead_s}` 或 `{file, video_start_iso}` 或 `{file, video_start_epoch}` 或 `{file, probe:true}`；`{clear:true}` 解绑 |
@@ -639,7 +639,7 @@ RMS 距离 ~0.006，最近的不同赛道 ~0.24（7 场实测，间隔 43 倍）
 | `available` | 检测器文件缺失 / 无帧时为 `false`，`reason` 写明原因 |
 | `calibration` | 前后轴标定半径（与 `/slip` 共用同一次标定）；`available=false` 时滑移用兜底半径 |
 | `events[]` | `{lap, t_rel, t_end_rel, type, confidence, evidence, hint, src}`，按 (圈, 圈内秒) 排序 |
-| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界）/ `overtake`（超车·被超）/ `pit_like`（进站）/ `lap_record`（最快圈） |
+| `type` | `spin`（打滑/失控）/ `collision`（碰撞）/ `hard_braking`（极限刹车）/ `tyre_abuse`（轮胎滥用）/ `heavy_throttle`（大油门出弯）/ `off_track`（出界）/ `overtake`（超车·被超）/ `pit_like`（进站）/ `lap_record`（最快圈）/ `tank_slap`（压路肩，需格式 C） |
 | `t_rel` / `t_end_rel` | 事件起止相对**该圈起点**的秒数（与 `/series?lap=N` 同一时间基准） |
 | `src` | 事件来源：`telemetry`（检测器）/ `geometry`（走线偏差出界）/ `slip`（出界的滑移兜底）/ `lap_time`（官方圈速，用于 `lap_record`） |
 | `laps` / `lap_scope` | 本次覆盖的圈号清单 / `?lap=N` 的筛选值（0 = 全场） |
