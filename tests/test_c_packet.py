@@ -284,6 +284,23 @@ class TestDirectAcceleration:
         s = dec._decode_plain(_c_frame(), 1000.0)
         assert s.g_force != [0.0, 0.0, 0.0]
 
+    def test_横向正号是左转_球画在右边(self, dec, dash):
+        """符号链必须钉死：sway 正 = 右转 → g_force[1] 取负 → **正 = 左转**。
+
+        G 力球把正值画在右边（`cx + ggBall.x * sc`），画的是**离心方向**，
+        所以「左转时球往右漂」是**有意的**（2026-10-24 用户确认保留）。
+        这条测试防的是有人看到球往反方向跑就去翻符号 —— 一翻，
+        G-G 图、事件里的曲率、方向盘转角的符号会跟着全错。
+        """
+        smp = dec._decode_plain(_c_frame(), 1000.0)
+        assert smp.sway == pytest.approx(-6.0)      # 造包时给的是"左转"
+        assert smp.g_force[1] > 0, "sway 为负（左转）时横向 G 必须为正"
+
+        src = (ROOT / "gt7-dashboard.py").read_text(encoding="utf-8")
+        assert "正值左转" in src or "正值 = 左转" in src
+        assert "正值右转" not in src, "文档里还写着「正值右转」—— 与实测相反"
+        assert "cx + ggBall.x * sc" in src, "G 力球把正横向 G 画在右边"
+
     def test_白名单含新字段(self, dash):
         for k in ("surface", "sway", "surge", "steer_wheel"):
             assert k in dash._FRAME_COL_KIND, f"{k} 不在帧存白名单里"

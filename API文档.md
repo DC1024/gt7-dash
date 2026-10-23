@@ -192,7 +192,7 @@
 | `position_m` | 米 | 车辆世界坐标 x/y/z（y 为高度） |
 | `velocity_ms` | m/s | 速度矢量（模长 ≈ speed_kph/3.6） |
 | `g_force.longitudinal` | g | 纵向：正值加速、负值刹车 |
-| `g_force.lateral` | g | 横向：**正值右转、负值左转** |
+| `g_force.lateral` | g | 横向：**正值左转、负值右转**（GT7 右手系，实测：正横向 G 时右侧轮更快）。注意 G 力球把正值画在**右边**（离心方向），所以左转时球往右漂 |
 | `g_force.magnitude` | g | 合力大小 |
 | `steer_angle_deg` | 度 | 前轮平均转角，**正 = 左转**。**仅格式 C 有**，A/B/~ 为 `null` |
 | `wheel_base_m` | 米 | 轴距。**仅格式 C 有**，其余为 `null` |
