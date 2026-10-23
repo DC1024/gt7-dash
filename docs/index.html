@@ -95,6 +95,7 @@
 <header><div class="wrap">
   <span class="logo">GT7 <b>Dash</b></span>
   <a href="#features">特性</a>
+  <a href="#protocol">协议</a>
   <a href="#deploy">部署</a>
   <a href="#api">API</a>
   <a href="#coach">副驾</a>
@@ -105,6 +106,7 @@
 <section class="hero"><div class="wrap">
   <h1>把 GT7 的遥测数据<br>装进<span>你自己的仪表盘</span></h1>
   <p>PS5 官方 UDP 遥测 · 本地 Salsa20 解密 · 60Hz 实时渲染 · 零第三方依赖。<br>
+     连<b>每只轮子压在什么路面</b>上、<b>前轮实际转了几度</b>都有。<br>
      一条 docker compose 命令，跑起来就有。</p>
   <div class="btns">
     <a class="btn pri" href="#deploy">3 分钟部署</a>
@@ -113,8 +115,8 @@
   <div class="strip">
     <div><b>60Hz</b>实时帧率</div>
     <div><b>0</b>第三方依赖</div>
-    <div><b>296B</b>逐包解密</div>
-    <div><b>38</b>公开API端点</div>
+    <div><b>368B</b>逐包解密</div>
+    <div><b>40</b>公开API端点</div>
   </div>
 </div></section>
 
@@ -165,10 +167,18 @@
     <p>走线偏差给出相对参考圈的逐米横向偏移热力图；滑移检测由四轮角速度
        自标定轮胎半径，识别空转与抱死。</p></div>
   <div class="feat"><div class="ic">🎬</div><h3>事件时间线 · 集锦高光</h3>
-    <p><b>9 类</b>事件自动打点：打滑 / 碰撞 / 极限刹车 / 出界 / 轮胎滥用 /
-       大油门出弯 / <b>超车·被超</b> / <b>进站</b> / <b>最快圈</b>。
+    <p><b>10 类</b>事件自动打点：打滑 / 碰撞 / 极限刹车 / 出界 / 轮胎滥用 /
+       大油门出弯 / 超车·被超 / 进站 / 最快圈 / <b>压路肩</b>。
        集锦按「置信度 × 类型权重」排序，直接给出可喂 ffmpeg 的起止时间，
        剪视频不用自己找点。</p></div>
+  <div class="feat"><div class="ic">🛞</div><h3>前轮转角与逐轮路面 <span style="color:var(--accent2)">新</span></h3>
+    <p>格式 C 的遥测里藏着<b>每只轮子压在什么上</b>（铺装 / 路肩 / 草地 / 砂石）
+       和<b>前轮实际转角</b>。界面上画成四小格 + 一条以中点为基准的双向条，
+       一眼看出「只有右前轮压上牙条」这种细节 —— 出界和切弯终于不用靠猜。</p></div>
+  <div class="feat"><div class="ic">📐</div><h3>G 力不再靠差分 <span style="color:var(--accent2)">新</span></h3>
+    <p>以前用「速度矢量差分 ÷ dt」算加速度：速度量化 0.1 m/s、16ms 一帧，
+       噪声有 0.6g，只能低通压、压完必然滞后。现在直接用游戏下发的
+       <code>sway</code> / <code>surge</code>，第一帧就是准的。</p></div>
   <div class="feat"><div class="ic">🏁</div><h3>比赛语义：超车 / 进站 / 最快圈</h3>
     <p>全部来自遥测，<b>不需要截图识别</b>。名次用协议里的 <code>0x84</code>
        ——它在比赛中就是<b>当前名次</b>（社区文档写成"发车位"是错的，14 场
@@ -195,9 +205,34 @@
        不用改源码重启。改完缓存自动失效，下次展开按新阈值重算；
        一键恢复默认。不同车型/赛道的判据差别很大，锁死在作者的默认值上
        是不合理的。</p></div>
-  <div class="feat"><div class="ic">🔌</div><h3>38 个公开 API 端点</h3>
+  <div class="feat"><div class="ic">🔌</div><h3>40 个公开 API 端点</h3>
     <p>实时 / 场次 / 逐帧与分析 / 赛道 / 回收站 / 设置全覆盖，
        带 CORS、字段与单位全部写进文档，版本化承诺只加不改。</p></div>
+</div>
+
+<h2 class="sec" id="protocol">协议是我们一帧一帧挖出来的</h2>
+<p class="sub">GT7 的 UDP 遥测没有官方文档。社区文档有三处是错的 —— 我们拿真机抓包对出来了。</p>
+<div class="feats">
+  <div class="feat"><div class="ic">🔤</div><h3>路面类型是「字符」不是「整数」</h3>
+    <p>社区文档写 <code>surfaceType[4]</code> 是 <code>int32[4]</code>，按整数扫全包
+       永远找不到 —— 这就是"路面字段全程为 0"这个结论的来源。实际是
+       <b>4 个 ASCII 字符</b>：<code>T</code> 铺装 <code>C</code> 路肩
+       <code>G</code> 草地 <code>s</code> 砂石。实测 21175 帧里
+       <code>TCTC</code> 与 <code>CTCT</code> 成对出现，正好是「压右 / 压左路肩」。</p></div>
+  <div class="feat"><div class="ic">🔑</div><h3>解密 mask 差一个字母</h3>
+    <p>A / B / <code>~</code> 包用 <code>0xDEADBEAF</code>，
+       <b>格式 C 用 <code>0xDEADBEEF</code></b> —— 就差 <code>AF</code> 和
+       <code>EF</code>。用 A 的规则去解 C 包，10783 个一个都解不开；
+       换一个字母，全部解开。</p></div>
+  <div class="feat"><div class="ic">📦</div><h3>C 包是 A 和 B 的超集</h3>
+    <p>想拿三轴加速度不必切到 B 包 —— B 独有的那 5 个 float 在 C 里也有
+       （11436 帧 B 与 21175 帧 C 对拍）。切 B 反而会丢掉路面和前轮转角。
+       所以本项目默认请求 C。</p></div>
+  <div class="feat"><div class="ic">🚫</div><h3>该说不的地方就说不知道</h3>
+    <p><code>~</code> 包（344B）确认存在，但换了 key / nonce，全扫零命中 ——
+       于是标成"解不开"，而不是编一组看起来合理的数字。
+       <code>0x134</code> 疑似垂向加速度，但和横摆角速度相关 0.95、
+       压路肩反而变小，含义未定 —— <b>不导出</b>。宁可没有，也不要假的。</p></div>
 </div>
 
 <h2 class="sec" id="deploy">三分钟部署</h2>
@@ -249,13 +284,15 @@ docker compose up -d<br><br>
 &nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"g_force"</span>: {<br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"longitudinal"</span>: -0.87,<br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"lateral"</span>: 1.93 },<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"steer_angle_deg"</span>: 6.19,&nbsp;&nbsp;<span class="c">// 前轮，正 = 左转</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"surface"</span>: <span style="color:#a5d6a7">"TCTC"</span>,&nbsp;&nbsp;<span class="c">// 四轮路面：右前/右后在路肩</span><br>
 &nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"fuel_pct"</span>: 62.5,<br>
 &nbsp;&nbsp;&nbsp;&nbsp;<span class="k">"tyre_temp_c"</span>: [78,77,84,83] },<br>
 &nbsp;&nbsp;<span class="k">"timing"</span>: { <span class="k">"best_lap_ms"</span>: 120762 }<br>
 }
 </div>
 </div>
-<p class="sub" style="margin-top:24px">共 <b>38 个端点</b>，完整字段与单位说明见
+<p class="sub" style="margin-top:24px">共 <b>40 个端点</b>，完整字段与单位说明见
   <a href="https://github.com/DC1024/gt7-dash/blob/main/API文档.md" target="_blank"
      style="color:var(--accent)">API文档.md</a>，
   或直接访问运行中的 <code>/api/v1/docs</code>。</p>

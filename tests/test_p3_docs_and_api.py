@@ -204,10 +204,15 @@ class TestLandingPage:
             "部署步骤缺 chown —— 容器以 uid 10001 运行，bind mount 会遮住"
             "镜像里的 chmod，新人照抄会首次启动就写不了文件")
 
-    def test_事件卡写的是_9_类(self):
+    def test_事件卡写的是_10_类(self):
+        """类数直接从 EventType 枚举数出来 —— 以后加事件忘了改宣传站会红。"""
+        from conftest import load_module
+        det = load_module("ev_for_landing", "gt7-event-detector.py")
+        n = len(list(det.EventType))
         text = _read("docs/index.html")
-        assert "9 类" in text or "9类" in text, "事件卡还写着旧的 4 类"
-        for ev in ("超车", "进站", "最快圈"):
+        assert f"{n} 类" in text or f"{n}类" in text, (
+            f"宣传站写的事件数与实际不符（实际 {n} 类）")
+        for ev in ("超车", "进站", "最快圈", "压路肩"):
             assert ev in text, f"宣传站没提 {ev} 事件"
 
     def test_提到轮胎与_BoP(self):
