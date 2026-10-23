@@ -21,7 +21,9 @@ REQUIRED = [
 # （60Hz × 4 个 null 字段 ≈ 每小时多 4MB，而它们永远是 null）。
 # 所以这条契约要分两步守：默认构造时不要求有 key，但**有值时必须写出来**。
 _CONDITIONAL_FIELDS = {"steer_angle_l", "steer_angle_r",
-                       "wheel_base", "car_category"}
+                       "wheel_base", "car_category",
+                       # 格式 B/C 共有；surface 只有 C 有
+                       "sway", "surge", "steer_wheel", "surface"}
 
 
 def test_every_dataclass_field_is_persisted(rec):
@@ -36,12 +38,14 @@ def test_conditional_fields_are_written_when_present(rec):
     """有值时**必须**写出来 —— 这才是契约真正要防的"数据凭空消失"。"""
     s = rec.TelemetrySample(t=1.0, seq=1, steer_angle_l=0.05,
                             steer_angle_r=0.03, wheel_base=2.9,
-                            car_category="GR1")
+                            car_category="GR1", sway=-6.0, surge=4.0,
+                            steer_wheel=0.8, surface="TCTC")
     d = s.to_json()
     missing = [f for f in _CONDITIONAL_FIELDS if f not in d]
     assert not missing, f"这些字段有值却没落盘: {missing}"
     assert d["steer_angle_l"] == 0.05
     assert d["car_category"] == "GR1"
+    assert d["surface"] == "TCTC"
 
 
 def test_conditional_fields_absent_when_none(rec):

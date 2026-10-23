@@ -516,6 +516,16 @@ _FRAME_COL_KIND: dict[str, str] = {
     "steer_angle_r": "n",
     "wheel_base": "n",
     "car_category": "s",
+    # —— 格式 B/C 共有 ——
+    # 游戏直接给的加速度（m/s²）与方向盘转角（rad）。g_force 已经用它们
+    # 代替了速度差分，但原值也要留着：复盘时想区分「游戏算的」和
+    # 「我们差分出来的」只有原值能对账。
+    "sway": "n",
+    "surge": "n",
+    "steer_wheel": "n",
+    # —— 格式 C 独有：四轮路面材质（"TTTT" / "TCTC" / "GGGG"）——
+    # 压路肩/出界事件全靠它，丢了就等于没有这个能力。
+    "surface": "s",
     "has_coords": "b",
     "layout": "s",
 }
@@ -3665,6 +3675,14 @@ def _v1_live(snap: dict[str, Any]) -> dict[str, Any]:
             "steer_angle_deg": _steer_deg(L),
             "wheel_base_m": L.get("wheel_base"),
             "car_category": L.get("car_category"),
+            # 四轮路面材质（**格式 C 独有**，A/B/~ 为 null）：
+            # 4 个字符，顺序 FL/FR/RL/RR。T=铺装 C=路肩 G=草地。
+            "surface": L.get("surface"),
+            # 游戏直接给的加速度（m/s²，格式 B/C 才有）。`g_force` 就是由它们
+            # 换算的；这里给原值是为了对账 —— 用 A 包时 g_force 退回速度差分，
+            # 这两个是 null，一眼能看出当前是哪种来源。
+            "sway_ms2": L.get("sway"),
+            "surge_ms2": L.get("surge"),
             "fuel_pct": L.get("gas_level", 0.0),
             "fuel_capacity_l": L.get("gas_capacity", 0.0),
             # —— 动力类型与能量（新增，稳定承诺）——
@@ -3928,6 +3946,9 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `steer_angle_deg` | 度 | 前轮平均转角，**正 = 左转**。**仅格式 C 有**，A/B/~ 为 `null` |
 | `wheel_base_m` | 米 | 轴距。**仅格式 C 有**，其余为 `null` |
 | `car_category` | string | GT7 组别串（如 `GR1`）。**仅格式 C 有**，其余为 `null` |
+| `surface` | string | 四轮路面材质，4 个字符（FL/FR/RL/RR）：`T`=铺装 `C`=路肩 `G`=草地，如 `TCTC`。**仅格式 C 有**，其余为 `null` |
+| `sway_ms2` | m/s² | 游戏直接给的**横向**加速度，**正 = 右转**。**仅格式 B/C 有** |
+| `surge_ms2` | m/s² | 游戏直接给的**纵向**加速度，正 = 加速、负 = 刹车。**仅格式 B/C 有** |
 | `fuel_pct` | 0~100 | 剩余油量百分比；**纯电车时是剩余电量 kWh**（看 `powertrain`） |
 | `fuel_capacity_l` | 升 | 油箱容量（纯电为 0） |
 | `powertrain` | 枚举 | 动力类型：`fuel`（燃油/混动）/ `electric`（纯电）/ `kart` |
@@ -10240,6 +10261,14 @@ b, output, td.num { font-variant-numeric:tabular-nums; }
   transition:width .08s linear, left .08s linear; }
 .fill.steer { background:#7c5cff; }
 #oSteer { width:58px; }
+/* 四轮路面材质：一格一轮（FL/FR/RL/RR），颜色区分铺装/路肩/草地 */
+.surf { flex:1; display:flex; gap:4px; }
+.surf i { width:18px; height:13px; border-radius:3px; font-style:normal;
+  font-family:var(--mono); font-size:9px; line-height:13px; text-align:center;
+  background:rgba(128,128,128,.22); color:var(--muted); }
+.surf i.c { background:var(--accent); color:#fff; }
+.surf i.g { background:var(--warn); color:#fff; }
+#oSurf { width:52px; }
 .shiftlamp { display:flex; gap:5px; justify-content:center; margin:9px 0 2px; }
 .shiftlamp i { width:15px; height:7px; border-radius:3px;
   background:rgba(128,128,128,.28); transition:background .05s; }
@@ -10603,6 +10632,15 @@ th { color:var(--muted); font-weight:500; }
            它和 G 力球方向相反是正常的 —— G 力球画的是<b>人被甩出去</b>的方向（离心），
            前轮转角画的是<b>车实际往哪转</b>。这个字段只有<b>格式 C</b> 的遥测包才有，
            用 A/B/~ 包时整行不显示。</p>
+      </section>
+      <section>
+        <h4>路面（四轮材质）</h4>
+        <p>四小格从左到右是<b>左前 / 右前 / 左后 / 右后</b>，颜色表示该轮压在什么上：
+           <span class="k">T</span> = 铺装路面 · <span class="k">C</span> = 路肩（红白牙条）
+           · <span class="k">G</span> = 草地（已经出界）。</p>
+        <p class="dim">GT7 是<b>逐轮</b>报的，所以能看出「只有右前轮压上路肩」这种细节
+           （显示为 <code>TCTC</code>）。右侧读数取最严重的那个：有草地说「出界」，
+           否则有路肩说「路肩」。这个字段只有<b>格式 C</b> 有。</p>
       </section>
       <section>
         <h4>行车轨迹的着色</h4>
@@ -11040,6 +11078,11 @@ th { color:var(--muted); font-weight:500; }
         <label>前轮转角</label>
         <div class="track steer"><div class="fill steer" id="fSteer"></div></div>
         <output id="oSteer">--</output></div>
+      <!-- 四轮路面材质（格式 C 独有）：T=铺装 C=路肩 G=草地 -->
+      <div class="bar-row" id="surfRow" style="display:none">
+        <label>路面</label>
+        <div class="surf" id="surfChars"></div>
+        <output id="oSurf">--</output></div>
       <div class="ptrace-wrap">
         <div class="ptrace-lgd">
           <span><i style="background:var(--ok)"></i>油门</span>
@@ -11526,6 +11569,25 @@ function render(s) {
     fs.style.width = w + '%';
     $('oSteer').textContent = (Math.abs(deg) < 0.05) ? '0.0°'
       : (deg > 0 ? 'L ' : 'R ') + Math.abs(deg).toFixed(1) + '°';
+  }
+
+  // 四轮路面材质（**格式 C 独有**）：4 个字符，顺序 FL/FR/RL/RR。
+  // T=铺装 C=路肩 G=草地。字符来自解密后的包，可能是任意字节，
+  // 所以只认 T/C/G 三种，其余一律当未知 —— 绝不要把原字符拼进 HTML。
+  const sf = L.surface;
+  if (typeof sf !== 'string' || sf.length !== 4) {
+    $('surfRow').style.display = 'none';
+  } else {
+    $('surfRow').style.display = '';
+    const box = $('surfChars');
+    if (box.dataset.v !== sf) {
+      box.dataset.v = sf;
+      box.innerHTML = sf.split('').map(c =>
+        '<i class="' + (c === 'C' ? 'c' : (c === 'G' ? 'g' : 't')) + '">' +
+        (/^[TCG]$/.test(c) ? c : '?') + '</i>').join('');
+    }
+    $('oSurf').textContent = sf.indexOf('G') >= 0 ? '出界'
+      : (sf.indexOf('C') >= 0 ? '路肩' : '铺装');
   }
 
   // 四轮温度：按**所选胎种**的工作窗口三色着色（到位绿 / 不足黄 / 超出红）。

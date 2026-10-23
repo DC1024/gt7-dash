@@ -47,6 +47,13 @@ def _c_frame(size: int = 368, **over) -> bytes:
         struct.pack_into("<f", b, 0x164, 0.032)      # steer_angle_r
         struct.pack_into("<f", b, 0x168, 2.90)       # wheel_base
         b[0x16C:0x170] = b"GR1\x00"                  # car_category
+    if size >= 0x15C:                # 四轮路面材质（C 独有）
+        b[0x158:0x15C] = b"TTTT"
+    if size >= 0x13C:                # B/C 共有：直接测得的加速度
+        struct.pack_into("<f", b, 0x130, -6.0)       # sway（负 = 左转）
+        struct.pack_into("<f", b, 0x138, 4.0)        # surge（正 = 加速）
+    if size >= 0x12C:                # B/C 共有：方向盘转角
+        struct.pack_into("<f", b, 0x128, 0.8)
     for k, v in over.items():
         off = int(k[1:], 16) if k.startswith("_") else None
         if off is not None:
@@ -210,6 +217,76 @@ class TestDefaultIsC:
         text = (ROOT / "gt7-recorder.py").read_text(encoding="utf-8")
         assert 'self.args.packet_type == "B"' in text
         assert "未解码" in text
+
+
+class TestSurface:
+    """四轮路面材质（`surface`，格式 C 独有）。
+
+    🔴 它是 **4 个 ASCII 字符**，不是社区文档写的 `int32[4]`。
+       正因为如此，之前按整数扫全包怎么都找不到（2026-10-22 记的
+       "surfaceType 全 0" 是找错了位置）。实测 21175 帧真实 C 包：
+       TTTT 90.2% / GGGG 5.5% / TCTC 1.5% / CTCT 1.0% / CCCC 0.2%，
+       TCTC 与 CTCT 成对出现，正好对应"压右/压左路肩"。
+    """
+
+    def test_C_包读得出路面(self, dec):
+        s = dec._decode_plain(_c_frame(), 1000.0)
+        assert s.surface == "TTTT"
+
+    def test_草地与路肩(self, dec):
+        for raw in (b"GGGG", b"TCTC", b"CTCT", b"CCCC"):
+            b = bytearray(_c_frame())
+            b[0x158:0x15C] = raw
+            s = dec._decode_plain(bytes(b), 1000.0)
+            assert s.surface == raw.decode("ascii")
+
+    def test_A_包没有路面字段(self, dec):
+        """A/B 包必须给 None —— 不能拿别的字段冒充，也不能给 "TTTT"。"""
+        assert dec._decode_plain(_c_frame(size=296), 1000.0).surface is None
+        assert dec._decode_plain(_c_frame(size=316), 1000.0).surface is None
+
+
+class TestDirectAcceleration:
+    """`sway` / `surge`（格式 B/C 共有）：比速度差分准得多。
+
+    实测（2026-10-23，11436 帧 B + 21175 帧 C）：
+      · sway  与横摆角速度相关 −0.92 → 横向加速度，**正 = 右转**
+      · surge 全油门 +4.4~5.2、刹车 −20~−21 → 纵向加速度，**正 = 加速**
+    C 包里也有这两个字段，所以**不必为了三轴加速度切 B 包**。
+    """
+
+    def test_C_包读出加速度(self, dec):
+        s = dec._decode_plain(_c_frame(), 1000.0)
+        assert s.sway == pytest.approx(-6.0)
+        assert s.surge == pytest.approx(4.0)
+
+    def test_B_包也有(self, dec):
+        """B（316B）也带这五个 float —— A3 不需要单独支持 B。"""
+        s = dec._decode_plain(_c_frame(size=316), 1000.0)
+        assert s.sway == pytest.approx(-6.0)
+        assert s.surge == pytest.approx(4.0)
+        assert s.steer_wheel == pytest.approx(0.8)
+        assert s.steer_angle_l is None      # 前轮转角是 C 独有
+
+    def test_A_包没有(self, dec):
+        s = dec._decode_plain(_c_frame(size=296), 1000.0)
+        assert s.sway is None and s.surge is None and s.steer_wheel is None
+
+    def test_有直接加速度时_G_力不再用差分(self, dec):
+        """sway/surge 直接换成 g，且符号要对齐既有口径（横向正 = 左转）。"""
+        s = dec._decode_plain(_c_frame(), 1000.0)
+        assert s.g_force[0] == pytest.approx(4.0 / 9.80665, abs=1e-3)
+        # sway = −6（左转）→ g_force[1] 应为正（左转）
+        assert s.g_force[1] == pytest.approx(6.0 / 9.80665, abs=1e-3)
+
+    def test_第一帧就用得上(self, dec):
+        """差分法第一帧必然给 0；有直接加速度时第一帧就该有值。"""
+        s = dec._decode_plain(_c_frame(), 1000.0)
+        assert s.g_force != [0.0, 0.0, 0.0]
+
+    def test_白名单含新字段(self, dash):
+        for k in ("surface", "sway", "surge", "steer_wheel"):
+            assert k in dash._FRAME_COL_KIND, f"{k} 不在帧存白名单里"
 
 
 class TestSteerAngleApi:

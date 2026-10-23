@@ -197,6 +197,9 @@
 | `steer_angle_deg` | 度 | 前轮平均转角，**正 = 左转**。**仅格式 C 有**，A/B/~ 为 `null` |
 | `wheel_base_m` | 米 | 轴距。**仅格式 C 有**，其余为 `null` |
 | `car_category` | string | GT7 组别串（如 `GR1`）。**仅格式 C 有**，其余为 `null` |
+| `surface` | string | 四轮路面材质，4 个字符（FL/FR/RL/RR）：`T`=铺装 `C`=路肩 `G`=草地，如 `TCTC`。**仅格式 C 有**，其余为 `null` |
+| `sway_ms2` | m/s² | 游戏直接给的**横向**加速度，**正 = 右转**。**仅格式 B/C 有** |
+| `surge_ms2` | m/s² | 游戏直接给的**纵向**加速度，正 = 加速、负 = 刹车。**仅格式 B/C 有** |
 | `fuel_pct` | 0~100 | 剩余油量百分比；**纯电车时是剩余电量 kWh**（看 `powertrain`） |
 | `fuel_capacity_l` | 升 | 油箱容量（纯电为 0） |
 | `powertrain` | 枚举 | 动力类型：`fuel`（燃油/混动）/ `electric`（纯电）/ `kart` |

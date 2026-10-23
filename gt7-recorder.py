@@ -271,6 +271,30 @@ class TelemetrySample:
     wheel_base: float | None = None
     car_category: str | None = None
 
+    # —— 格式 B/C 共有（B 从 316B 起就有，C 也有）——
+    # 实测 2026-10-23：11436 帧 B 包 + 21175 帧 C 包，两边的数值分布一致，
+    # 说明 C **包含** B 的这五个字段（C 是 B 的超集，不必为了三轴加速度切 B）。
+    #   · 0x130 sway  ：横向加速度，m/s²。与横摆角速度相关 **−0.92**
+    #                   → **正 = 右转**（与 g_force[1] 的「正 = 左转」相反！）
+    #   · 0x138 surge ：纵向加速度，m/s²。全油门均值 +4.4~+5.2、刹车 −20~−21
+    #                   → 正 = 加速、负 = 刹车，与 g_force[0] 同号
+    #   · 0x128 方向盘转角，rad。与横摆角速度相关 **+0.94**，峰值 ±2.6 rad（±150°）
+    #                   → 是**方向盘**而不是前轮（前轮见 0x160，只有 ±0.17）
+    #   · 0x12C 方向盘角速度 rad/s（与 0x128 的差分相关 +0.99），本版不落盘
+    #   · 0x134 疑似 heave：但与 angVel_x 相关 **+0.95**，且压路肩时反而**变小**
+    #                   → 含义未定，**不导出**（宁可没有，也不要一个假的垂向 G）
+    sway: float | None = None
+    surge: float | None = None
+    steer_wheel: float | None = None
+
+    # —— 格式 C 独有：四轮路面材质 ——
+    # 🔴 是 **4 个 ASCII 字符**，不是社区文档写的 `int32[4]`。这就是为什么
+    #    之前按整数扫全包扫不到（2026-10-22 记的"surfaceType 全 0"是找错了位置）。
+    #    实测 21175 帧：TTTT 90.2% / GGGG 5.5% / TCTC 1.5% / CTCT 1.0% /
+    #    CCCC 0.2%，TCTC 与 CTCT 成对出现，正好是"压右侧/压左侧路肩"。
+    #    顺序同胎温：FL / FR / RL / RR。取值：T=铺装 G=草地 C=路肩。
+    surface: str | None = None
+
     def to_json(self) -> dict[str, Any]:
         return {
             "t": round(self.t, 4),
@@ -321,6 +345,16 @@ class TelemetrySample:
                 "wheel_base": round(self.wheel_base, 3),
                 "car_category": self.car_category}
                if self.steer_angle_l is not None else {}),
+            # 格式 B/C 共有：直接测得的加速度与方向盘转角。
+            # 用 sway 判断而不是 steer_angle_l：B 包有 sway 没有转向角，
+            # 拿 C 独有字段当开关会让 B 包的 sway 也被丢掉。
+            **({"sway": round(self.sway, 3),
+                "surge": round(self.surge, 3)}
+               if self.sway is not None else {}),
+            **({"steer_wheel": round(self.steer_wheel, 4)}
+               if self.steer_wheel is not None else {}),
+            # 格式 C 独有：四轮路面材质（"TTTT" / "TCTC" / "GGGG" …）
+            **({"surface": self.surface} if self.surface is not None else {}),
             "brake_filtered": round(self.brake_filtered, 3),
             "car_code": self.car_code,
             "turbo_boost": round(self.turbo_boost, 3),
@@ -717,6 +751,14 @@ class Decoder:
             speed_ms = f32(0x4C)
             speed_kph = speed_ms * 3.6
 
+            # —— 游戏直接给的加速度（格式 B/C 才有，A 包没有）——
+            # 有就直接用，别再用差分：速度量化是 0.1 m/s，16ms 一帧，
+            # 差分出来的噪声有 6 m/s²（0.6g）量级，只能靠一阶低通压，
+            # 压完必然滞后。这两个是游戏算好的，没有这个问题。
+            sway = f32(0x130) if n >= 0x134 else None
+            surge = f32(0x138) if n >= 0x13C else None
+            steer_wheel = f32(0x128) if n >= 0x12C else None
+
             # G 力：格式 A 没有直接字段，用**速度矢量差分**算
             #
             # 原理：a = Δv / Δt，再按速度方向拆成纵向/横向：
@@ -727,7 +769,15 @@ class Decoder:
             #
             # 单位换算：m/s² ÷ 9.81 = g
             g_force = [0.0, 0.0, 0.0]
-            if self._last_vel is not None:
+            if sway is not None and surge is not None:
+                # 首选：游戏直接给的加速度。符号要对齐既有口径，否则 G 力球
+                # 会左右反着摇：
+                #   · surge 正 = 加速  → 与 g_force[0] 同号，直接用
+                #   · sway  正 = 右转  → g_force[1] 的口径是「正 = 左转」，取负
+                g_force = [round(surge / 9.80665, 3),
+                           round(-sway / 9.80665, 3), 0.0]
+                self._last_g = [g_force[0], g_force[1]]
+            elif self._last_vel is not None:
                 dt = recv_time - self._last_t
                 # 间隔要在合理范围：太短噪声大，太长（掉帧/暂停）无意义
                 if 0.001 < dt < 0.5:
@@ -835,12 +885,10 @@ class Decoder:
                 # 🔴 格式 A 的 0x128 之后就结束了（296 字节），按扩展偏移读 A 包
                 #    是越界；而 0x128.. 这段在 A 里是轮速/胎径等，语义完全不同，
                 #    绝不能张冠李戴。所以这里用包长严格守门：
-                #      A = 296B、B = 316B（+5 float 运动数据）、~ = 扩展包
-                # TODO(A3): B 包多出的 5 个 float 目前**完全没解码**
-                #   （wheelRotation / steeringAngularVelocity / sway / heave /
-                #   surge）。--packet-type B 现在只是让包变长，字段全丢。
-                #   价值：sway/heave/surge 是直接测得的车体三轴加速度，
-                #   可以替掉"速度差分算 G"（差分对时钟抖动敏感）。
+                #      A = 296B、B = 316B（+5 float 运动数据）、~ = 344B、C = 368B
+                # A3 已结案：B 包那 5 个 float 不用单独支持 —— **C 包里也有**
+                #   （11436 帧 B 与 21175 帧 C 对拍，数值分布一致）。
+                #   sway/surge 已在上面的 g_force 里用上了。
                 #
                 # ⚠️ 扩展段布局来自社区逆向，两大来源有 4 字节分歧
                 #    （MacManley/gt7-udp 有 torqueVectors，RaceCrewAI/gt-telem 没有），
@@ -871,6 +919,15 @@ class Decoder:
                     (data[0x16C:0x170].split(b"\x00")[0]
                      .decode("ascii", "replace") or None)
                     if n >= 0x170 else None),
+                # 0x158：四轮路面材质，**4 个 ASCII 字符**（FL/FR/RL/RR）。
+                # 社区文档写的是 int32[4]，照那个扫永远对不上 —— 见 dataclass 注释。
+                surface=(
+                    data[0x158:0x15C].decode("ascii", "replace")
+                    if n >= 0x15C else None),
+                # —— 格式 B/C 共有 ——
+                sway=sway,
+                surge=surge,
+                steer_wheel=steer_wheel,
                 throttle_filtered=(data[0x13C] / 255.0) if n >= 0x13D else 0.0,
                 brake_filtered=(data[0x13D] / 255.0) if n >= 0x13E else 0.0,
                 car_code=u32(0x124) if n >= 0x128 else 0,
