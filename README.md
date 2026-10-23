@@ -40,12 +40,16 @@
 
 | 文档 | 内容 |
 |---|---|
-| [wiki/协议与字段.md](wiki/协议与字段.md) | 四种包格式 / 解密规则 / **实测偏移表** / 字段是怎么挖出来的 |
-| [wiki/事件类型.md](wiki/事件类型.md) | 10 类事件的判据、证据、阈值怎么调 |
-| [wiki/部署与运维.md](wiki/部署与运维.md) | 部署 / 升级 / 回滚 / 排错 |
-| [wiki/FAQ.md](wiki/FAQ.md) | 常见问题（收不到数据 / 没转角 / 球往反方向漂） |
+| [Wiki · 协议与字段](https://github.com/DC1024/gt7-dash/wiki/协议与字段) | 四种包格式 / 解密规则 / **实测偏移表** / 字段是怎么挖出来的 |
+| [Wiki · 事件类型](https://github.com/DC1024/gt7-dash/wiki/事件类型) | 10 类事件的判据、证据、阈值怎么调 |
+| [Wiki · 部署与运维](https://github.com/DC1024/gt7-dash/wiki/部署与运维) | 部署 / 升级 / 回滚 / 排错 |
+| [Wiki · FAQ](https://github.com/DC1024/gt7-dash/wiki/FAQ) | 常见问题（收不到数据 / 没转角 / 球往反方向漂） |
 | [API文档.md](API文档.md) | 40 个端点的完整字段与单位（运行中也可 `GET /api/v1/docs`） |
 | [docs/架构与运维.md](docs/架构与运维.md) | 数据流 / 模块边界 / 故障排查 |
+
+> Wiki 的**源**在仓库 [`wiki/`](wiki) 里（版本化、可 review），改完跑
+> `python tools/sync_wiki.py` 再 push 就发布 —— 唯一的差别是 wiki 页面的链接
+> 不带 `.md`，脚本会替你改。
 
 ## ⬇️ 下载（Windows 免安装）
 
@@ -278,7 +282,8 @@ gt7-event-detector.py  事件检测（10 类：打滑 / 急刹 / 超车 / 进站
 API文档.md             公开 API 完整文档（= GET /api/v1/docs）
 docs/index.html        项目宣传页（GitHub Pages 源）
 docs/架构与运维.md      数据流 / 模块边界 / 故障排查 / 部署回滚
-wiki/                  协议与字段 / 事件类型 / 部署与运维 / FAQ
+wiki/                  Wiki 的源（协议与字段 / 事件类型 / 部署与运维 / FAQ）
+tools/sync_wiki.py     把 wiki/ 同步到 GitHub Wiki（改内部链接 + 增删页）
 wiki/                  协议与字段 / 事件类型 / 部署与运维 / FAQ
 tests/                 pytest 回归测试（828 项）
 tools/capture_raw.py   原始包抓包器（不解析，先拿到字节再说）
