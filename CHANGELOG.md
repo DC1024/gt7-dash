@@ -4,6 +4,11 @@
 > 提交信息遵循 `type(scope): 描述`，脚本按 type 分组。
 > 分段依据是 `gt7_version.py` 的版本变更（不是 tag —— tag 各机器不一致）。
 
+## v1.10.0
+
+### 新增
+- 压路肩事件（B4c）—— 靠格式 C 的 surfaceType 逐轮判定（`events`）
+
 ## v1.9.0
 
 ### 新增
