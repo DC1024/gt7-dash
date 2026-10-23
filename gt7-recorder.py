@@ -292,7 +292,9 @@ class TelemetrySample:
     #    之前按整数扫全包扫不到（2026-10-22 记的"surfaceType 全 0"是找错了位置）。
     #    实测 21175 帧：TTTT 90.2% / GGGG 5.5% / TCTC 1.5% / CTCT 1.0% /
     #    CCCC 0.2%，TCTC 与 CTCT 成对出现，正好是"压右侧/压左侧路肩"。
-    #    顺序同胎温：FL / FR / RL / RR。取值：T=铺装 G=草地 C=路肩。
+    #    顺序同胎温：FL / FR / RL / RR。取值：T=铺装 G=草地 C=路肩
+    #    **s=砂石/泥地（小写）** —— 2026-10-24 实测整场 19103 帧全是 ssss
+    #    （Gr.N 拉力车跑非铺装赛道）。字符是小写，别只按大写判断。
     surface: str | None = None
 
     def to_json(self) -> dict[str, Any]:

@@ -3955,7 +3955,7 @@ API_DOCS_MD = """# GT7 遥测公开 API v1
 | `steer_angle_deg` | 度 | 前轮平均转角，**正 = 左转**。**仅格式 C 有**，A/B/~ 为 `null` |
 | `wheel_base_m` | 米 | 轴距。**仅格式 C 有**，其余为 `null` |
 | `car_category` | string | GT7 组别串（如 `GR1`）。**仅格式 C 有**，其余为 `null` |
-| `surface` | string | 四轮路面材质，4 个字符（FL/FR/RL/RR）：`T`=铺装 `C`=路肩 `G`=草地，如 `TCTC`。**仅格式 C 有**，其余为 `null` |
+| `surface` | string | 四轮路面材质，4 个字符（FL/FR/RL/RR）：`T`=铺装 `C`=路肩 `G`=草地 `s`=砂石/泥地（小写），如 `TCTC`。没见过的字符照原样返回。**仅格式 C 有**，其余为 `null` |
 | `sway_ms2` | m/s² | 游戏直接给的**横向**加速度，**正 = 右转**。**仅格式 B/C 有** |
 | `surge_ms2` | m/s² | 游戏直接给的**纵向**加速度，正 = 加速、负 = 刹车。**仅格式 B/C 有** |
 | `fuel_pct` | 0~100 | 剩余油量百分比；**纯电车时是剩余电量 kWh**（看 `powertrain`） |
@@ -10277,6 +10277,7 @@ b, output, td.num { font-variant-numeric:tabular-nums; }
   background:rgba(128,128,128,.22); color:var(--muted); }
 .surf i.c { background:var(--accent); color:#fff; }
 .surf i.g { background:var(--warn); color:#fff; }
+.surf i.o { background:#8a6d3b; color:#fff; }   /* 砂石/泥地等非铺装 */
 #oSurf { width:52px; }
 .shiftlamp { display:flex; gap:5px; justify-content:center; margin:9px 0 2px; }
 .shiftlamp i { width:15px; height:7px; border-radius:3px;
@@ -10646,10 +10647,12 @@ th { color:var(--muted); font-weight:500; }
         <h4>路面（四轮材质）</h4>
         <p>四小格从左到右是<b>左前 / 右前 / 左后 / 右后</b>，颜色表示该轮压在什么上：
            <span class="k">T</span> = 铺装路面 · <span class="k">C</span> = 路肩（红白牙条）
-           · <span class="k">G</span> = 草地（已经出界）。</p>
+           · <span class="k">G</span> = 草地（已经出界）· <span class="k">s</span> = 砂石 / 泥地。</p>
         <p class="dim">GT7 是<b>逐轮</b>报的，所以能看出「只有右前轮压上路肩」这种细节
            （显示为 <code>TCTC</code>）。右侧读数取最严重的那个：有草地说「出界」，
-           否则有路肩说「路肩」。这个字段只有<b>格式 C</b> 有。</p>
+           否则有路肩说「路肩」，都不是铺装就说「非铺装」。
+           遇到没见过的字符会照原样显示（格子变棕色），不会变成问号。
+           这个字段只有<b>格式 C</b> 有。</p>
       </section>
       <section>
         <h4>行车轨迹的着色</h4>
@@ -11581,8 +11584,11 @@ function render(s) {
   }
 
   // 四轮路面材质（**格式 C 独有**）：4 个字符，顺序 FL/FR/RL/RR。
-  // T=铺装 C=路肩 G=草地。字符来自解密后的包，可能是任意字节，
-  // 所以只认 T/C/G 三种，其余一律当未知 —— 绝不要把原字符拼进 HTML。
+  // 已实测到的取值：T 铺装 / C 路肩 / G 草地 / s 砂石·泥地（整场都是 s 的
+  // 拉力赛道，GT7 用的是小写）。**没见过的字符照原样显示**，不要变成 '?' ——
+  // 一个新赛道不该让整行看起来像坏了。
+  // 字符来自解密后的包，可能是任意字节，所以只放进 innerHTML 的**文本位**，
+  // 且先过大写化 + 白名单，绝不直接拼接。
   const sf = L.surface;
   if (typeof sf !== 'string' || sf.length !== 4) {
     $('surfRow').style.display = 'none';
@@ -11591,12 +11597,17 @@ function render(s) {
     const box = $('surfChars');
     if (box.dataset.v !== sf) {
       box.dataset.v = sf;
-      box.innerHTML = sf.split('').map(c =>
-        '<i class="' + (c === 'C' ? 'c' : (c === 'G' ? 'g' : 't')) + '">' +
-        (/^[TCG]$/.test(c) ? c : '?') + '</i>').join('');
+      const cls = {T: 't', C: 'c', G: 'g'};
+      box.innerHTML = sf.split('').map(c => {
+        const k = c.toUpperCase();
+        const ch = /^[A-Z0-9]$/.test(k) ? k : '?';
+        return '<i class="' + (cls[ch] || 'o') + '">' + ch + '</i>';
+      }).join('');
     }
-    $('oSurf').textContent = sf.indexOf('G') >= 0 ? '出界'
-      : (sf.indexOf('C') >= 0 ? '路肩' : '铺装');
+    const up = sf.toUpperCase();
+    $('oSurf').textContent = up.indexOf('G') >= 0 ? '出界'
+      : (up.indexOf('C') >= 0 ? '路肩'
+      : (/[^T]/.test(up) ? '非铺装' : '铺装'));
   }
 
   // 四轮温度：按**所选胎种**的工作窗口三色着色（到位绿 / 不足黄 / 超出红）。

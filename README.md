@@ -7,7 +7,7 @@
 ![GHCR](https://img.shields.io/badge/镜像-ghcr.io-blue)
 ![License](https://img.shields.io/badge/许可-MIT-green)
 
-> **当前版本：v1.10.0**（以 `gt7_version.py` 为唯一版本源）—— **路面材质 + 直接测得的 G 力 + 压路肩事件**。
+> **当前版本：v1.10.1**（以 `gt7_version.py` 为唯一版本源）—— **路面材质 + 直接测得的 G 力 + 压路肩事件**。
 >
 > 一次真机抓包（21175 帧 C + 11436 帧 B）把两个悬了很久的问题一起解决了：
 >
