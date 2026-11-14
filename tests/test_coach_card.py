@@ -387,3 +387,53 @@ class TestRuleSubToggles:
         # 按 dataset 值匹配（不是把值拼进选择器字符串）
         assert ".cp-sub" in blk
         assert "dataset.sub === String(s.id)" in blk
+
+
+class TestVoicePackWiring:
+    """离线预设语音包（Web Audio API 词素拼接）在实时页里的接线守卫。"""
+
+    def test_voicepack_functions_present(self, page):
+        for fn in (
+            "function coachVpEnsureCtx()",
+            "function coachVpStop()",
+            "function coachVpReset()",
+            "function coachVpLoadManifest()",
+            "function coachVpLoadClip(tok)",
+            "function coachVpPrewarm()",
+            "function coachPlayVoiceTokens(",
+            "function coachPlayAudioUrl(",
+        ):
+            assert fn in page, f"缺语音包函数 {fn}"
+
+    def test_manifest_endpoint_and_webaudio(self, page):
+        assert "/api/v1/coach/voicepack" in page
+        assert "decodeAudioData" in page
+        assert "createBufferSource" in page
+
+    def test_three_tier_fallback_and_preemption(self, page):
+        blk = page[page.index("function renderCoach("):][:3200]
+        assert "say.voice_tokens" in blk
+        assert "coachPlayVoiceTokens(say.voice_tokens, say.priority, fallback)" in blk
+        assert "coachPlayAudioUrl(say.tts_url" in blk
+        assert "coachSay(spoken, say.priority)" in blk
+        assert "coachVpStop();" in blk
+
+    def test_mute_button_unlocks_and_plays_voice_on(self, page):
+        blk = page[page.index("(function initCoachCard(){"):]
+        assert "coachVpEnsureCtx();" in blk
+        assert "coachVpPrewarm();" in blk
+        assert "coachPlayVoiceTokens(['clip/voice_on']" in blk
+
+    def test_ask_url_resets_voicepack_cache(self, page):
+        blk = page[page.index("function askCoachUrl()"):][:900]
+        assert "coachVpReset();" in blk
+
+    def test_no_single_arg_catch_in_voicepack(self, page):
+        start = page.index("function coachVpEnsureCtx()")
+        end = page.index("function coachSay(")
+        code = "\n".join(
+            ln for ln in page[start:end].split("\n")
+            if not ln.strip().startswith("//")
+        )
+        assert ".catch(" not in code, code
+

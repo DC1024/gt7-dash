@@ -12589,6 +12589,161 @@ function coachFetch(path, opts){
 let coachSpeakOn = false;
 let coachRetry = COACH_POLL_MS;
 let coachSig = '';        // 已播报过的内容指纹（去重）
+let coachTtsWait = null;  // R3 云 TTS 异步等待状态
+
+// —— 离线预设语音包（Web Audio API 词素无缝拼接）——
+// 优先使用 coach 服务端下发的 `say.voice_tokens`（零外网、全档位 <10ms）；
+// 未命中词条（如云 LLM 自由润色句）或加载失败时依次回落 tts_url → 浏览器 TTS。
+let coachVpCtx = null;
+let coachVpManifest = null;
+let coachVpManifestUrl = '';
+let coachVpManifestTried = false;
+let coachVpBuffers = {};
+let coachVpLoading = {};
+let coachVpSources = [];
+let coachVpQueue = Promise.resolve();
+let coachVpSeq = 0;
+let coachAudioEl = null;
+
+function coachVpEnsureCtx(){
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!coachVpCtx) coachVpCtx = new AC();
+  if (coachVpCtx.state === 'suspended' && coachVpCtx.resume) {
+    coachVpCtx.resume().then(null, function(){});
+  }
+  return coachVpCtx;
+}
+
+function coachVpStop(){
+  coachVpSeq++;
+  coachVpSources.forEach(function(src){ try { src.stop(); } catch (e) {} });
+  coachVpSources = [];
+  if (coachAudioEl) {
+    try { coachAudioEl.pause(); coachAudioEl.currentTime = 0; } catch (e) {}
+    coachAudioEl = null;
+  }
+}
+
+function coachVpReset(){
+  coachVpStop();
+  coachVpManifest = null;
+  coachVpManifestUrl = '';
+  coachVpManifestTried = false;
+  coachVpBuffers = {};
+  coachVpLoading = {};
+}
+
+function coachVpLoadManifest(){
+  if (coachVpManifest && coachVpManifestUrl === coachUrl) {
+    return Promise.resolve(coachVpManifest);
+  }
+  const targetUrl = coachUrl;
+  coachVpManifestTried = true;
+  return coachFetch('/api/v1/coach/voicepack')
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(m){
+      if (targetUrl !== coachUrl) return null;
+      if (m && m.enabled && m.clips) {
+        coachVpManifest = m;
+        coachVpManifestUrl = targetUrl;
+        const btn = $('coachMute');
+        if (btn && m.name) {
+          btn.title = '预设语音包：' + m.name + '（离线拼接，未命中时回落云/浏览器 TTS）';
+        }
+      }
+      return coachVpManifest;
+    }, function(){ return null; });
+}
+
+function coachVpLoadClip(tok){
+  if (coachVpBuffers[tok]) return Promise.resolve(coachVpBuffers[tok]);
+  if (coachVpLoading[tok]) return coachVpLoading[tok];
+  const ctx = coachVpEnsureCtx();
+  if (!ctx || !coachVpManifest || !coachVpManifest.clips || !coachVpManifest.clips[tok]) {
+    return Promise.resolve(null);
+  }
+  const file = coachVpManifest.clips[tok].file;
+  const base = coachVpManifest.clips_base_url || '/api/v1/coach/voicepack/clips';
+  const targetUrl = coachUrl;
+  const p = fetch(targetUrl + base + '/' + encodeURIComponent(file))
+    .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+    .then(function(buf){ return ctx.decodeAudioData(buf); })
+    .then(function(decoded){
+      if (targetUrl === coachUrl) coachVpBuffers[tok] = decoded;
+      delete coachVpLoading[tok];
+      return decoded;
+    })
+    .then(null, function(){ delete coachVpLoading[tok]; return null; });
+  coachVpLoading[tok] = p;
+  return p;
+}
+
+function coachVpPrewarm(){
+  if (!coachVpManifest || !coachVpManifest.enabled) return;
+  const hot = ['clip/voice_on', 'clip/off_track', 'clip/off_track_short',
+    'clip/slip_all', 'clip/slip_front', 'clip/slip_rear', 'clip/slip_short',
+    'clip/brake_warn_short', 'clip/shift', 'd/0', 'd/1', 'd/2', 'd/3', 'd/4',
+    'd/5', 'd/6', 'd/7', 'd/8', 'd/9', 'd/dot', 'd/minus', 'd/plus'];
+  hot.forEach(function(tok){
+    if (coachVpManifest.clips[tok]) coachVpLoadClip(tok);
+  });
+}
+
+function coachPlayVoiceTokens(tokens, priority, fallbackFn){
+  if (!coachSpeakOn || !tokens || !tokens.length) return false;
+  const ctx = coachVpEnsureCtx();
+  if (!ctx || !coachVpManifest || !coachVpManifest.enabled) return false;
+  if (priority <= 0) coachVpStop();
+  const seq = coachVpSeq;
+  const run = function(){
+    if (!coachSpeakOn || seq !== coachVpSeq) return;
+    return Promise.all(tokens.map(coachVpLoadClip)).then(function(bufs){
+      if (!coachSpeakOn || seq !== coachVpSeq) return;
+      if (bufs.some(function(b){ return !b; })) {
+        if (fallbackFn) fallbackFn();
+        return;
+      }
+      let t = ctx.currentTime + 0.015;
+      const overlap = 0.008;
+      bufs.forEach(function(b, idx){
+        const src = ctx.createBufferSource();
+        src.buffer = b;
+        src.connect(ctx.destination);
+        src.onended = function(){
+          const i = coachVpSources.indexOf(src);
+          if (i >= 0) coachVpSources.splice(i, 1);
+        };
+        src.start(t);
+        coachVpSources.push(src);
+        t += Math.max(0.02, b.duration - (idx + 1 < bufs.length ? overlap : 0));
+      });
+    }, function(){ if (fallbackFn) fallbackFn(); });
+  };
+  if (priority <= 0) coachVpQueue = run();
+  else coachVpQueue = coachVpQueue.then(run, run);
+  return true;
+}
+
+function coachPlayAudioUrl(url, fallbackFn){
+  if (!coachSpeakOn || !url) return false;
+  try {
+    const full = /^https?:\/\//i.test(url) ? url
+      : (coachUrl + (url.charAt(0) === '/' ? url : '/' + url));
+    if (coachAudioEl) {
+      try { coachAudioEl.pause(); coachAudioEl.currentTime = 0; } catch (e) {}
+    }
+    const a = new Audio(full);
+    coachAudioEl = a;
+    a.onended = function(){ if (coachAudioEl === a) coachAudioEl = null; };
+    const p = a.play();
+    if (p && p.then) p.then(null, function(){ if (fallbackFn) fallbackFn(); });
+    return true;
+  } catch (e) {
+    if (fallbackFn) fallbackFn();
+    return false;
+  }
+}
 
 function coachSay(text, priority){
   if (!coachSpeakOn || !text || !window.speechSynthesis) return;
@@ -13273,6 +13428,9 @@ function renderCoach(d){
   coachRetry = COACH_POLL_MS;
   $('coachDot').className = 'on';
   const s = d.stats || {};
+  if (s.voicepack && s.voicepack.enabled && (!coachVpManifest || coachVpManifestUrl !== coachUrl) && !coachVpManifestTried) {
+    coachVpLoadManifest();
+  }
   // —— 参考圈**来自哪一场 / 哪一圈** ——
   // 🔴 来源不能只看 ref_source（profile/self/history）：本地缓存命中的那份
   //    source 也是 profile，但它其实来自**另一个场次**。所以比对场次文件：
@@ -13300,7 +13458,33 @@ function renderCoach(d){
     //    speech 时退回 say.text，向后兼容。
     const spoken = say.speech || say.text;
     const sig = say.key + '|' + spoken + '|' + d.lap;
-    if (sig !== coachSig) { coachSig = sig; coachSay(spoken, say.priority); }
+    if (sig !== coachSig) {
+      coachSig = sig;
+      coachTtsWait = null;
+      if (say.priority <= 0) {
+        coachVpStop();
+        if (window.speechSynthesis && speechSynthesis.speaking) speechSynthesis.cancel();
+      }
+      const fallback = function(){
+        if (say.tts_url) coachPlayAudioUrl(say.tts_url, function(){ coachSay(spoken, say.priority); });
+        else coachSay(spoken, say.priority);
+      };
+      if (say.voice_tokens && say.voice_tokens.length && coachVpManifest && coachVpManifest.enabled) {
+        if (!coachPlayVoiceTokens(say.voice_tokens, say.priority, fallback)) fallback();
+      } else if (say.priority >= 2 && s.tts && s.tts.enabled && !say.tts_url) {
+        coachTtsWait = { sig: sig, at: Date.now() };
+      } else {
+        fallback();
+      }
+    } else if (coachTtsWait && coachTtsWait.sig === sig) {
+      if (say.tts_url) {
+        coachTtsWait = null;
+        coachPlayAudioUrl(say.tts_url, function(){ coachSay(spoken, say.priority); });
+      } else if (Date.now() - coachTtsWait.at > 900) {
+        coachTtsWait = null;
+        coachSay(spoken, say.priority);
+      }
+    }
   } else if (!d.ref_ready) {
     box.className = 'idle';
     box.textContent = d.connected
@@ -13349,6 +13533,7 @@ function renderCoachOff(){
   // 教练没了 → 播报面板也没得改（真值在服务端），顺手收起来
   if (coachPanelOpen) { coachPanelOpen = false; $('coPanel').hidden = true; }
   $('coachPanelBtn').className = '';
+  coachVpManifestTried = false;
   // 指数退避：没装/没起的时候别每 200ms 打一个空端口
   coachRetry = Math.min(coachRetry * 2, 15000);
 }
@@ -13367,6 +13552,7 @@ function askCoachUrl(){
   const url = coachAcceptUrl(v);
   if (!url) { alert('地址不可用'); return; }
   coachUrl = url;
+  coachVpReset();
   try { localStorage.setItem(COACH_KEY, url); } catch (e) { /* 忽略 */ }
   coachRetry = COACH_POLL_MS;
   $('coSay').style.cursor = '';
@@ -13390,7 +13576,8 @@ function pollCoach(){
 
 (function initCoachCard(){
   const btn = $('coachMute');
-  if (!window.speechSynthesis) {
+  const hasAudioCtx = !!(window.AudioContext || window.webkitAudioContext);
+  if (!window.speechSynthesis && !hasAudioCtx) {
     btn.textContent = '语音不可用';
     btn.disabled = true;
   } else {
@@ -13398,8 +13585,22 @@ function pollCoach(){
         coachSpeakOn = !coachSpeakOn;
         btn.textContent = coachSpeakOn ? '🔊 语音：开' : '🔇 点我开语音';
         btn.className = coachSpeakOn ? 'on' : '';
-        // 顺便给个即时反馈（也确认音色/音量是通的）
-        if (coachSpeakOn) coachSay('语音已开启');
+        if (!coachSpeakOn) {
+          coachVpStop();
+          if (window.speechSynthesis && speechSynthesis.speaking) speechSynthesis.cancel();
+          return;
+        }
+        coachVpEnsureCtx();
+        coachVpLoadManifest().then(function(m){
+          if (m && m.clips && m.clips['clip/voice_on']) {
+            coachVpPrewarm();
+            if (!coachPlayVoiceTokens(['clip/voice_on'], 2, function(){ coachSay('语音已开启'); })) {
+              coachSay('语音已开启');
+            }
+          } else {
+            coachSay('语音已开启');
+          }
+        });
       };
   }
   $('coSay').onclick = askCoachUrl;
