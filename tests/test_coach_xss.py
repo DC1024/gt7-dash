@@ -30,10 +30,15 @@ SRC = (ROOT / "gt7-dashboard.py").read_text(encoding="utf-8")
 # ------------------------------------------------------------------ node 环境
 
 def _node() -> str | None:
-    return shutil.which("node") or (
-        r"C:\Users\15657.DC-PC\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
-        if Path(r"C:\Users\15657.DC-PC\.workbuddy\binaries\node\versions\22.22.2-6\node.exe").exists()
-        else None)
+    path = shutil.which("node")
+    if path:
+        return path
+    versions_dir = Path.home() / ".workbuddy" / "binaries" / "node" / "versions"
+    if versions_dir.is_dir():
+        for exe in sorted(versions_dir.glob("*/node.exe"), reverse=True):
+            if exe.is_file():
+                return str(exe)
+    return None
 
 
 NODE = _node()
