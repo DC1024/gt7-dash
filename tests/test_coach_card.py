@@ -417,6 +417,14 @@ class TestVoicePackWiring:
         assert "coachPlayAudioUrl(say.tts_url" in blk
         assert "coachSay(spoken, say.priority)" in blk
         assert "coachVpStop();" in blk
+        assert "s.tts.has_key" in blk
+        assert "say.priority >= 2" in blk
+
+    def test_l3_semantic_pause_replaces_fixed_overlap(self, page):
+        assert "function coachVpPauseSec(" in page
+        blk = page[page.index("function coachPlayVoiceTokens("):][:1500]
+        assert "coachVpPauseSec(tokens[idx], tokens[idx + 1])" in blk
+        assert "overlap = 0.008" not in blk
 
     def test_mute_button_unlocks_and_plays_voice_on(self, page):
         blk = page[page.index("(function initCoachCard(){"):]
@@ -436,4 +444,28 @@ class TestVoicePackWiring:
             if not ln.strip().startswith("//")
         )
         assert ".catch(" not in code, code
+
+
+class TestTtsSettingsPageWiring:
+    """语音 / TTS 独立设置页（/tts）与主仪表盘入口守卫。"""
+
+    def test_dashboard_has_entries_to_tts_page(self, page):
+        assert '<a href="/tts">语音TTS</a>' in page
+        assert 'id="coachTtsLink" href="/tts"' in page
+
+    def test_tts_page_markup_and_endpoints(self, dash):
+        html = dash.build_tts_page()
+        assert "<html" in html.lower()
+        assert "语音 / TTS 设置" in html
+        for eid in ("coachAddrInp", "vpEnabled", "ttsEnabled", "ttsProvider",
+                    "ttsWorkspace", "ttsApiBase", "ttsKeyEnv", "ttsModel",
+                    "ttsVoice", "ttsInstructions", "ttsSpeed", "ttsMaxChars",
+                    "ttsTimeout", "clearCacheBtn", "testCloudBtn"):
+            assert f'id="{eid}"' in html, f"缺少控件 {eid}"
+        for ep in ("/api/v1/coach/tts/config", "/api/v1/coach/tts/cache/clear",
+                   "/api/v1/coach/tts", "/api/v1/coach/voicepack"):
+            assert ep in html, f"缺少端点 {ep}"
+        assert "api_key:" not in html
+        assert ".catch(" not in html
+
 

@@ -5646,6 +5646,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hist = Path(self.server.history_dir).resolve()  # type: ignore[attr-defined]
                 self._send_html(build_tracks_page(hist))
 
+            elif path in ("/tts", "/tts-settings"):
+                # 语音 / TTS 独立设置页（读写教练服务端的 /api/v1/coach/tts/config）
+                self._send_html(build_tts_page())
+
             elif path == "/trash-view":
                 # 回收站场次的轻量查看页（判断要不要删除，不必先恢复）
                 name = query.get("file", [""])[0]
@@ -9770,6 +9774,692 @@ def _logo_for_track(t: dict) -> str:
     return ""
 
 
+_TTS_PAGE_CSS = """
+<style>
+.tts-wrap { max-width:960px; }
+.tts-sub { color:var(--muted); font-size:12px; line-height:1.6; margin-bottom:12px; }
+.tts-ctl { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:8px 0; font-size:13px; }
+.tts-ctl label { color:var(--muted); font-size:12px; min-width:118px; }
+.tts-ctl input[type=text], .tts-ctl input[type=number], .tts-ctl select, .tts-ctl textarea {
+  background:var(--bg); color:var(--text); border:1px solid var(--line);
+  border-radius:7px; padding:6px 10px; font-size:13px; font-family:inherit;
+  flex:1; min-width:210px; max-width:460px; }
+.tts-ctl textarea { min-height:62px; resize:vertical; }
+.tts-ctl input:focus, .tts-ctl select:focus, .tts-ctl textarea:focus {
+  outline:none; border-color:rgba(var(--accent-rgb),.6); }
+.tts-ctl input[type=range] { flex:1; min-width:160px; max-width:280px; accent-color:var(--accent); }
+.tts-ctl input[type=checkbox] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
+.tts-hint { color:var(--muted); font-size:11.5px; flex-basis:100%; margin-left:128px; margin-top:-4px; }
+.tts-btn { border:1px solid var(--line); background:var(--card); color:var(--text);
+  border-radius:7px; padding:6px 13px; cursor:pointer; font-size:12.5px; font-family:inherit;
+  text-decoration:none; display:inline-flex; align-items:center; gap:4px; }
+.tts-btn:hover { border-color:rgba(var(--accent-rgb),.55); }
+.tts-btn.primary { background:rgba(var(--accent-rgb),.14); border-color:rgba(var(--accent-rgb),.55);
+  color:var(--accent); font-weight:500; }
+.tts-btn.danger { border-color:rgba(248,113,113,.45); color:var(--bad); }
+.tts-btn:disabled { opacity:.5; cursor:not-allowed; }
+.tts-badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
+  border:1px solid var(--line); color:var(--muted); background:rgba(128,128,128,.08); }
+.tts-badge.ok { border-color:rgba(74,222,128,.45); color:var(--ok); background:rgba(74,222,128,.08); }
+.tts-badge.warn { border-color:rgba(250,204,21,.45); color:var(--warn); background:rgba(250,204,21,.08); }
+.tts-badge.err { border-color:rgba(248,113,113,.45); color:var(--bad); background:rgba(248,113,113,.08); }
+.tts-msg { font-size:12px; color:var(--muted); }
+.tts-msg.ok { color:var(--ok); }
+.tts-msg.warn { color:var(--warn); }
+.tts-msg.err { color:var(--bad); }
+.tts-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; }
+.tts-dot.ok { background:var(--ok); }
+.tts-dot.err { background:var(--bad); }
+@media (max-width:640px) {
+  .tts-hint { margin-left:0; }
+  .tts-ctl label { min-width:100%; }
+}
+</style>
+"""
+
+_TTS_PAGE_BODY = """
+<div class="tts-wrap">
+  <div class="tts-sub">
+    L3 混排策略：A 档告警（出界 / 打滑 / 刹车 / 换挡）始终走本地极速播报、绝不等待云端；
+    B 档长句（圈后小结 / 分段 / 胎温 / 油耗）在云 TTS 就绪时整句合成并缓存，未就绪或无 Key 时自动回落离线语音包 → 浏览器 TTS。
+  </div>
+
+  <div class="card">
+    <h2>赛道工程师服务连接 <span class="tts-dot" id="ttsConnDot"></span></h2>
+    <div class="tts-ctl">
+      <label for="coachAddrInp">教练服务地址</label>
+      <input type="text" id="coachAddrInp" spellcheck="false" placeholder="http://127.0.0.1:8788">
+      <button type="button" class="tts-btn" id="coachAddrSave">切换地址</button>
+      <button type="button" class="tts-btn" id="coachAddrReset">恢复默认</button>
+      <a class="tts-btn" id="coachNativeLink" href="#" target="_blank" rel="noopener">打开教练原生页 ↗</a>
+    </div>
+    <div class="tts-msg" id="coachConnMsg">正在连接赛道工程师…</div>
+  </div>
+
+  <div class="card">
+    <h2>当前生效总览</h2>
+    <div class="kv" id="ttsSummaryKv">
+      <div><span>离线语音包</span><b>加载中…</b></div>
+      <div><span>云 TTS 状态</span><b>—</b></div>
+      <div><span>生效模型 / 音色</span><b>—</b></div>
+      <div><span>密钥环境变量</span><b>—</b></div>
+      <div><span>今日字符 / 费用</span><b>—</b></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>1. 离线预设语音包</h2>
+    <div class="tts-ctl">
+      <label for="vpEnabled">启用离线语音包</label>
+      <input type="checkbox" id="vpEnabled">
+      <span class="tts-badge" id="vpBadge">加载中…</span>
+    </div>
+    <div class="tts-sub" id="vpDetail" style="margin:6px 0 8px">正在读取语音包清单…</div>
+    <div class="tts-ctl">
+      <button type="button" class="tts-btn" id="vpTestBtn">试听离线语音包拼接</button>
+      <span class="tts-msg" id="vpTestMsg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. 云 TTS 参数设置（B 档长句整句合成）</h2>
+    <div class="tts-ctl">
+      <label for="ttsEnabled">启用云 TTS</label>
+      <input type="checkbox" id="ttsEnabled">
+      <span class="tts-badge" id="ttsKeyBadge">加载中…</span>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsProvider">服务商</label>
+      <select id="ttsProvider"></select>
+      <button type="button" class="tts-btn" id="ttsFillDefault">填入该服务商默认模型/音色</button>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsWorkspace">业务空间 ID</label>
+      <input type="text" id="ttsWorkspace" spellcheck="false" placeholder="百炼必填 ws-xxx；BreezeBlue 留空">
+      <div class="tts-hint" id="wsHint">阿里云百炼必填（ws- 开头）；BreezeBlue 不需要。</div>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsApiBase">API Base URL</label>
+      <input type="text" id="ttsApiBase" spellcheck="false" placeholder="留空 = 使用服务商默认端点">
+      <div class="tts-hint">非空时必须以 http:// 或 https:// 开头。</div>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsKeyEnv">Key 环境变量名</label>
+      <input type="text" id="ttsKeyEnv" spellcheck="false" placeholder="例如 BREEZE_API_KEY 或 GT7_COACH_LLM_KEY">
+      <div class="tts-hint">🔴 明文 API Key 绝不落盘，这里只填教练服务所在机器上的环境变量名（粘入 sk-... 会被拒绝）。</div>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsModel">模型名</label>
+      <input type="text" id="ttsModel" spellcheck="false" placeholder="留空 = 使用服务商默认模型">
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsVoice">音色 / Voice ID</label>
+      <input type="text" id="ttsVoice" spellcheck="false" placeholder="留空 = 使用服务商默认音色">
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsInstructions">播报风格提示词</label>
+      <textarea id="ttsInstructions" spellcheck="false" placeholder="可选：例如 BreezeBlue 无线电风格提示词（留空用服务商默认）"></textarea>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsSpeed">语速倍率</label>
+      <input type="range" id="ttsSpeed" min="0.50" max="2.00" step="0.02" value="1.08">
+      <b id="ttsSpeedVal" style="min-width:44px;font-family:var(--mono)">1.08</b>
+      <div class="tts-hint">范围 0.50 ~ 2.00；调整语速或提示词会自动切换缓存哈希，不会误命中旧音频。</div>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsMaxChars">单句上限字符</label>
+      <input type="number" id="ttsMaxChars" min="10" max="300" step="1" value="60">
+      <div class="tts-hint">10 ~ 300 字符；超过上限的句子跳过云合成以控成本。</div>
+    </div>
+    <div class="tts-ctl">
+      <label for="ttsTimeout">合成超时（秒）</label>
+      <input type="number" id="ttsTimeout" min="1.0" max="30.0" step="0.5" value="8.0">
+    </div>
+    <div class="tts-ctl" style="margin-top:12px">
+      <button type="button" class="tts-btn primary" id="ttsSaveBtn">保存并热生效</button>
+      <button type="button" class="tts-btn" id="ttsReloadBtn">重读服务端配置</button>
+      <span class="tts-msg" id="saveMsg">加载中…</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. 运行指标、配额与磁盘缓存</h2>
+    <div class="kv" id="metricsKv"></div>
+    <div class="tts-msg" id="lastErrLine" style="margin:8px 0 10px">最近错误：无</div>
+    <div class="tts-ctl">
+      <button type="button" class="tts-btn danger" id="clearCacheBtn">清空云 TTS 磁盘缓存</button>
+      <button type="button" class="tts-btn" id="refreshBtn">刷新状态</button>
+      <span class="tts-msg" id="cacheMsg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>4. 在线试听（验证当前服务端生效配置）</h2>
+    <div class="tts-ctl">
+      <label for="testText">试听文本</label>
+      <input type="text" id="testText" value="上一圈一分四十二秒八，比参考圈快零点三四秒，刹车点很稳。">
+    </div>
+    <div class="tts-ctl">
+      <button type="button" class="tts-btn primary" id="testCloudBtn">云 TTS 实时合成试听</button>
+      <button type="button" class="tts-btn" id="testBrowserBtn">浏览器本地 TTS 试听</button>
+      <button type="button" class="tts-btn" id="testStopBtn">停止播放</button>
+      <span class="tts-msg" id="testMsg"></span>
+    </div>
+  </div>
+</div>
+"""
+
+_TTS_PAGE_JS = r"""
+<script>
+(function(){
+  const COACH_KEY = 'gt7_coach_url';
+  const COACH_TIMEOUT_MS = 8000;
+  function $(id){ return document.getElementById(id); }
+  function esc(s){
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function ttsIsSameHost(url){
+    let u;
+    try { u = new URL(url); } catch (e) { return false; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    if (u.protocol !== location.protocol) return false;
+    return u.hostname === location.hostname;
+  }
+  function ttsAcceptUrl(raw){
+    const url = String(raw || '').trim().replace(/\/+$/, '');
+    if (!url || !/^https?:\/\//i.test(url)) return null;
+    if (!ttsIsSameHost(url)) {
+      const ok = window.confirm(
+        '这页被要求连接另一台机器上的赛道工程师：\n\n' + url +
+        '\n\n只在你确认这是自己的机器时才继续。');
+      if (!ok) return null;
+    }
+    return url;
+  }
+  function defaultCoachUrl(){
+    if (!location.hostname) return 'http://127.0.0.1:8788';
+    return location.protocol + '//' + location.hostname + ':8788';
+  }
+  let activeCoachUrl = (function(){
+    const q = new URLSearchParams(location.search).get('coach');
+    if (q) {
+      const ok = ttsAcceptUrl(q);
+      if (ok) {
+        try { localStorage.setItem(COACH_KEY, ok); } catch (e) {}
+        return ok;
+      }
+    }
+    try {
+      const v = localStorage.getItem(COACH_KEY);
+      if (v) { const ok = ttsAcceptUrl(v); if (ok) return ok; }
+    } catch (e) {}
+    return defaultCoachUrl();
+  })();
+
+  function ttsFetch(path, opts){
+    opts = opts || {};
+    const ac = new AbortController();
+    const t = setTimeout(function(){ ac.abort(); }, COACH_TIMEOUT_MS);
+    opts.signal = ac.signal;
+    return fetch(activeCoachUrl + path, opts).then(function(r){
+      clearTimeout(t); return r;
+    }, function(e){ clearTimeout(t); throw e; });
+  }
+
+  let providersMeta = {};
+  let formDirty = false;
+  let curTestAudio = null;
+  let curTestUrl = null;
+  let vpCtx = null, vpBuffers = {}, vpSources = [];
+
+  function syncAddrUi(){
+    $('coachAddrInp').value = activeCoachUrl;
+    const nativeLink = $('coachNativeLink');
+    nativeLink.href = activeCoachUrl + '/tts';
+  }
+
+  function stopTestPlayback(){
+    vpSources.forEach(function(s){ try { s.stop(); } catch (e) {} });
+    vpSources = [];
+    if (curTestAudio) {
+      try { curTestAudio.pause(); curTestAudio.currentTime = 0; } catch (e) {}
+      curTestAudio = null;
+    }
+    if (curTestUrl) {
+      try { URL.revokeObjectURL(curTestUrl); } catch (e) {}
+      curTestUrl = null;
+    }
+    if (window.speechSynthesis && speechSynthesis.speaking) {
+      speechSynthesis.cancel();
+    }
+  }
+
+  function updateProviderHints(){
+    const prov = $('ttsProvider').value;
+    const p = providersMeta[prov] || {};
+    $('ttsWorkspace').placeholder = p.needs_workspace
+      ? '百炼必填：ws- 开头业务空间 ID' : '当前服务商无需填写（可留空）';
+    $('wsHint').textContent = p.needs_workspace
+      ? '阿里云百炼必填（ws- 开头）；未填时云 TTS 会静默禁用。'
+      : '当前服务商（' + (p.label || prov) + '）无需业务空间 ID，留空即可。';
+    $('ttsApiBase').placeholder = p.api_base
+      ? ('留空 = 默认 ' + p.api_base) : '留空 = 使用服务商默认端点';
+    $('ttsKeyEnv').placeholder = '留空 = 默认 ' + (p.default_api_key_env || 'GT7_COACH_LLM_KEY');
+    $('ttsModel').placeholder = p.model ? ('留空 = 默认 ' + p.model) : '留空 = 默认模型';
+    $('ttsVoice').placeholder = p.voice ? ('留空 = 默认 ' + p.voice) : '留空 = 默认音色';
+    $('ttsInstructions').placeholder = p.instructions
+      ? ('留空 = 默认风格：' + p.instructions) : '可选：播报风格提示词（留空用服务商默认）';
+  }
+
+  function populateProviders(meta, current){
+    providersMeta = meta || {};
+    const sel = $('ttsProvider');
+    const keys = Object.keys(providersMeta);
+    if (sel.options.length !== keys.length) {
+      sel.innerHTML = '';
+      keys.forEach(function(k){
+        const o = document.createElement('option');
+        o.value = k;
+        o.textContent = (providersMeta[k].label || k) + ' (' + k + ')';
+        sel.appendChild(o);
+      });
+    }
+    if (current && providersMeta[current]) sel.value = current;
+    updateProviderHints();
+  }
+
+  function fillForm(cfg){
+    if (!cfg) return;
+    $('vpEnabled').checked = !!cfg.voicepack_enabled;
+    $('ttsEnabled').checked = !!cfg.enabled;
+    if (cfg.provider && providersMeta[cfg.provider]) $('ttsProvider').value = cfg.provider;
+    $('ttsWorkspace').value = cfg.workspace_id || '';
+    $('ttsApiBase').value = cfg.api_base || '';
+    $('ttsKeyEnv').value = cfg.api_key_env || '';
+    $('ttsModel').value = cfg.model || '';
+    $('ttsVoice').value = cfg.voice || '';
+    $('ttsInstructions').value = cfg.instructions || '';
+    const sp = (typeof cfg.speed === 'number') ? cfg.speed : 1.08;
+    $('ttsSpeed').value = sp.toFixed(2);
+    $('ttsSpeedVal').textContent = sp.toFixed(2);
+    $('ttsMaxChars').value = (cfg.max_chars != null) ? cfg.max_chars : 60;
+    $('ttsTimeout').value = (cfg.timeout_s != null) ? cfg.timeout_s : 8.0;
+    updateProviderHints();
+    formDirty = false;
+  }
+
+  function renderStatus(d){
+    const st = d.status || {};
+    const vp = d.voicepack || {};
+    const cfg = d.config || {};
+
+    $('ttsConnDot').className = 'tts-dot ok';
+    $('coachConnMsg').textContent = '已连接赛道工程师（' + activeCoachUrl + '）';
+    $('coachConnMsg').className = 'tts-msg ok';
+
+    const vpOn = !!vp.enabled;
+    const vpBadge = $('vpBadge');
+    vpBadge.textContent = vpOn ? ('已启用 · ' + (vp.clip_count || 0) + ' 片段') : '已禁用';
+    vpBadge.className = 'tts-badge ' + (vpOn ? 'ok' : 'warn');
+    $('vpDetail').textContent = vpOn
+      ? ('语音包：' + (vp.name || vp.pack_id || 'local') + ' · 音色 ' + (vp.voice_id || 'local')
+         + ' · 版本 ' + (vp.version || '1') + ' · 共 ' + (vp.clip_count || 0) + ' 个词素片段')
+      : ('未启用原因：' + (vp.disabled_reason || '已关闭'));
+
+    const keyBadge = $('ttsKeyBadge');
+    const envName = st.api_key_env || cfg.api_key_env || '—';
+    if (st.has_key) {
+      keyBadge.textContent = '密钥已就绪（$' + envName + '）';
+      keyBadge.className = 'tts-badge ok';
+    } else {
+      keyBadge.textContent = '未检测到环境变量 $' + envName;
+      keyBadge.className = 'tts-badge warn';
+    }
+
+    const summary = [
+      ['离线语音包', vpOn ? ('开 · ' + (vp.clip_count || 0) + ' 片段') : '关'],
+      ['云 TTS 状态', st.enabled ? '就绪' : ('未激活：' + (st.disabled_reason || '关'))],
+      ['生效模型 / 音色', (st.model || '—') + ' / ' + (st.voice || '—')],
+      ['密钥环境变量', envName + (st.has_key ? ' ✓' : ' ✗')],
+      ['今日字符 / 费用', (st.chars_today || 0) + ' 字 · ¥' + Number(st.est_cost_yuan || 0).toFixed(4)]
+    ];
+    $('ttsSummaryKv').innerHTML = summary.map(function(c){
+      return '<div><span>' + esc(c[0]) + '</span><b>' + esc(c[1]) + '</b></div>';
+    }).join('');
+
+    const metrics = [
+      ['服务商', st.provider || cfg.provider || '—'],
+      ['API 端点', st.api_base || '服务商默认'],
+      ['合成次数', String(st.calls || 0)],
+      ['缓存命中 / 未中', (st.cache_hits || 0) + ' / ' + (st.cache_misses || 0)],
+      ['队列 / 在途', (st.queue || 0) + ' / ' + (st.inflight || 0)],
+      ['本圈 / 本场字符', (st.chars_lap || 0) + ' / ' + (st.chars || 0)],
+      ['预算丢弃', String(st.budget_drops || 0)],
+      ['累计错误', String(st.errors || 0)]
+    ];
+    $('metricsKv').innerHTML = metrics.map(function(m){
+      return '<div><span>' + esc(m[0]) + '</span><b>' + esc(m[1]) + '</b></div>';
+    }).join('');
+
+    const errEl = $('lastErrLine');
+    if (st.last_error) {
+      errEl.textContent = '最近错误：' + st.last_error;
+      errEl.className = 'tts-msg err';
+    } else {
+      errEl.textContent = '最近错误：无';
+      errEl.className = 'tts-msg';
+    }
+  }
+
+  function renderOffline(err){
+    $('ttsConnDot').className = 'tts-dot err';
+    $('coachConnMsg').textContent = '赛道工程师未连接（' + activeCoachUrl + '）：' + err;
+    $('coachConnMsg').className = 'tts-msg err';
+    $('saveMsg').textContent = '无法读取配置（教练服务离线或版本过旧不支持 /tts/config）';
+    $('saveMsg').className = 'tts-msg err';
+  }
+
+  function loadTtsPage(overwriteForm){
+    return ttsFetch('/api/v1/coach/tts/config')
+      .then(function(r){
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function(d){
+        populateProviders(d.providers, d.config && d.config.provider);
+        if (overwriteForm || !formDirty) {
+          fillForm(d.config);
+        }
+        renderStatus(d);
+        if ($('saveMsg').textContent === '加载中…' || $('saveMsg').className.indexOf('err') >= 0) {
+          $('saveMsg').textContent = d.persist_configured
+            ? '已开启持久化（保存将写入 ui.json，重启不丢失）。'
+            : '当前未配置持久化路径（仅内存中热生效）。';
+          $('saveMsg').className = 'tts-msg';
+        }
+      }, function(e){
+        renderErr('loadTtsPage', e);
+        renderOffline(e && e.message ? e.message : e);
+      });
+  }
+
+  function collectPayload(){
+    return {
+      voicepack_enabled: $('vpEnabled').checked,
+      enabled: $('ttsEnabled').checked,
+      provider: $('ttsProvider').value,
+      workspace_id: $('ttsWorkspace').value.trim(),
+      api_base: $('ttsApiBase').value.trim(),
+      api_key_env: $('ttsKeyEnv').value.trim(),
+      model: $('ttsModel').value.trim(),
+      voice: $('ttsVoice').value.trim(),
+      instructions: $('ttsInstructions').value.trim(),
+      speed: parseFloat($('ttsSpeed').value),
+      max_chars: parseInt($('ttsMaxChars').value, 10),
+      timeout_s: parseFloat($('ttsTimeout').value)
+    };
+  }
+
+  function saveTtsConfig(){
+    const msg = $('saveMsg');
+    const payload = collectPayload();
+    if (isNaN(payload.max_chars)) {
+      msg.textContent = '保存失败：单句上限必须是整数';
+      msg.className = 'tts-msg err';
+      return;
+    }
+    if (isNaN(payload.timeout_s)) {
+      msg.textContent = '保存失败：超时必须是数字';
+      msg.className = 'tts-msg err';
+      return;
+    }
+    msg.textContent = '保存并热重建中…';
+    msg.className = 'tts-msg';
+    ttsFetch('/api/v1/coach/tts/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    }).then(function(r){
+      return r.json().then(function(d){ return {ok: r.ok, data: d}; });
+    }).then(function(res){
+      const d = res.data || {};
+      if (!res.ok || !d.ok) {
+        msg.textContent = '保存失败：' + (d.error || '未知错误');
+        msg.className = 'tts-msg err';
+        return;
+      }
+      populateProviders(d.providers, d.config && d.config.provider);
+      fillForm(d.config);
+      renderStatus(d);
+      msg.textContent = '已保存并热生效'
+        + (d.persisted ? '（已写入 ui.json）' : '（未配置持久化文件，仅当前进程生效）')
+        + (d.status && !d.status.has_key && d.config && d.config.enabled
+           ? '；注意：尚未检测到环境变量 $' + (d.status.api_key_env || '') : '。');
+      msg.className = 'tts-msg ' + (d.status && !d.status.has_key && d.config && d.config.enabled ? 'warn' : 'ok');
+    }, function(e){
+      renderErr('saveTtsConfig', e);
+      msg.textContent = '保存失败：' + e;
+      msg.className = 'tts-msg err';
+    });
+  }
+
+  $('coachAddrSave').onclick = function(){
+    const ok = ttsAcceptUrl($('coachAddrInp').value);
+    if (!ok) {
+      $('coachConnMsg').textContent = '地址格式无效或未确认跨源地址（需 http:// 或 https:// 开头）';
+      $('coachConnMsg').className = 'tts-msg err';
+      return;
+    }
+    activeCoachUrl = ok;
+    try { localStorage.setItem(COACH_KEY, ok); } catch (e) {}
+    vpBuffers = {};
+    formDirty = false;
+    syncAddrUi();
+    loadTtsPage(true);
+  };
+  $('coachAddrReset').onclick = function(){
+    activeCoachUrl = defaultCoachUrl();
+    try { localStorage.removeItem(COACH_KEY); } catch (e) {}
+    vpBuffers = {};
+    formDirty = false;
+    syncAddrUi();
+    loadTtsPage(true);
+  };
+
+  $('ttsProvider').onchange = function(){
+    formDirty = true;
+    updateProviderHints();
+  };
+  $('ttsSpeed').oninput = function(){
+    formDirty = true;
+    $('ttsSpeedVal').textContent = parseFloat(this.value).toFixed(2);
+  };
+  ['vpEnabled', 'ttsEnabled', 'ttsWorkspace', 'ttsApiBase', 'ttsKeyEnv',
+   'ttsModel', 'ttsVoice', 'ttsInstructions', 'ttsMaxChars', 'ttsTimeout'].forEach(function(id){
+    $(id).addEventListener('input', function(){ formDirty = true; });
+    $(id).addEventListener('change', function(){ formDirty = true; });
+  });
+
+  $('ttsFillDefault').onclick = function(){
+    const p = providersMeta[$('ttsProvider').value] || {};
+    $('ttsApiBase').value = p.api_base || '';
+    $('ttsKeyEnv').value = p.default_api_key_env || '';
+    $('ttsModel').value = p.model || '';
+    $('ttsVoice').value = p.voice || '';
+    $('ttsInstructions').value = p.instructions || '';
+    if (!p.needs_workspace) $('ttsWorkspace').value = '';
+    formDirty = true;
+    $('saveMsg').textContent = '已填入该服务商默认参数，点「保存并热生效」后应用。';
+    $('saveMsg').className = 'tts-msg';
+  };
+
+  $('ttsSaveBtn').onclick = saveTtsConfig;
+  $('ttsReloadBtn').onclick = function(){
+    formDirty = false;
+    loadTtsPage(true);
+  };
+  $('refreshBtn').onclick = function(){ loadTtsPage(false); };
+
+  $('clearCacheBtn').onclick = function(){
+    const msg = $('cacheMsg');
+    msg.textContent = '清理中…';
+    msg.className = 'tts-msg';
+    ttsFetch('/api/v1/coach/tts/cache/clear', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if (d.ok) {
+        msg.textContent = '已清理 ' + (d.removed || 0) + ' 个缓存音频文件。';
+        msg.className = 'tts-msg ok';
+        loadTtsPage(false);
+      } else {
+        msg.textContent = '清理失败：' + (d.error || '未知错误');
+        msg.className = 'tts-msg err';
+      }
+    }, function(e){
+      renderErr('clearCache', e);
+      msg.textContent = '清理失败：' + e;
+      msg.className = 'tts-msg err';
+    });
+  };
+
+  $('vpTestBtn').onclick = function(){
+    const msg = $('vpTestMsg');
+    stopTestPlayback();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { msg.textContent = '浏览器不支持 Web Audio API'; msg.className = 'tts-msg err'; return; }
+    if (!vpCtx) vpCtx = new AC();
+    if (vpCtx.state === 'suspended' && vpCtx.resume) vpCtx.resume().then(null, function(){});
+    msg.textContent = '加载离线语音包片段…';
+    msg.className = 'tts-msg';
+    const target = activeCoachUrl;
+    ttsFetch('/api/v1/coach/voicepack').then(function(r){ return r.json(); }).then(function(m){
+      if (!m || !m.enabled || !m.clips) {
+        msg.textContent = '离线语音包未启用或无片段（请先勾选启用并保存）';
+        msg.className = 'tts-msg warn';
+        return;
+      }
+      let sample = ['clip/voice_on'];
+      if (m.clips['p/off_track'] && m.clips['p/watch_brake']) {
+        sample = ['p/off_track', 'p/watch_brake'];
+      }
+      const baseRaw = m.clips_base_url || '/api/v1/coach/voicepack/clips';
+      const base = /^https?:\/\//i.test(baseRaw) ? baseRaw : (target + baseRaw);
+      return Promise.all(sample.map(function(tok){
+        if (vpBuffers[tok]) return vpBuffers[tok];
+        const info = m.clips[tok];
+        if (!info) return null;
+        return fetch(base + '/' + encodeURIComponent(info.file))
+          .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+          .then(function(ab){ return vpCtx.decodeAudioData(ab); })
+          .then(function(dec){ vpBuffers[tok] = dec; return dec; });
+      })).then(function(bufs){
+        if (!bufs || bufs.some(function(b){ return !b; })) {
+          msg.textContent = '部分片段缺失或解码失败';
+          msg.className = 'tts-msg err';
+          return;
+        }
+        let t = vpCtx.currentTime + 0.02;
+        bufs.forEach(function(b){
+          const src = vpCtx.createBufferSource();
+          src.buffer = b;
+          src.connect(vpCtx.destination);
+          src.start(t);
+          vpSources.push(src);
+          t += Math.max(0.02, b.duration + 0.06);
+        });
+        msg.textContent = '已播放离线语音包示例（' + sample.join(' + ') + '）';
+        msg.className = 'tts-msg ok';
+      });
+    }, function(e){
+      renderErr('vpTest', e);
+      msg.textContent = '试听失败：' + e;
+      msg.className = 'tts-msg err';
+    });
+  };
+
+  $('testCloudBtn').onclick = function(){
+    const msg = $('testMsg');
+    const text = $('testText').value.trim();
+    if (!text) { msg.textContent = '请输入试听文本'; msg.className = 'tts-msg warn'; return; }
+    stopTestPlayback();
+    msg.textContent = (formDirty ? '（注意：有未保存修改，试听用服务端已生效配置）' : '')
+      + '正在调用云 TTS 合成…';
+    msg.className = 'tts-msg';
+    ttsFetch('/api/v1/coach/tts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: text})
+    }).then(function(r){
+      if (!r.ok) {
+        return r.json().then(function(d){
+          throw new Error((d && d.error) ? d.error : ('HTTP ' + r.status));
+        }, function(){ throw new Error('HTTP ' + r.status); });
+      }
+      return r.blob();
+    }).then(function(blob){
+      curTestUrl = URL.createObjectURL(blob);
+      const a = new Audio(curTestUrl);
+      curTestAudio = a;
+      a.onended = function(){ stopTestPlayback(); };
+      a.onerror = function(){ msg.textContent = '音频播放失败'; msg.className = 'tts-msg err'; stopTestPlayback(); };
+      const p = a.play();
+      if (p && p.then) p.then(function(){
+        msg.textContent = '云 TTS 试听播放中（' + blob.size + ' 字节）';
+        msg.className = 'tts-msg ok';
+      }, function(e){
+        msg.textContent = '浏览器阻止播放：' + e;
+        msg.className = 'tts-msg err';
+      });
+      loadTtsPage(false);
+    }, function(e){
+      renderErr('testCloud', e);
+      msg.textContent = '云合成失败：' + (e && e.message ? e.message : e);
+      msg.className = 'tts-msg err';
+      loadTtsPage(false);
+    });
+  };
+
+  $('testBrowserBtn').onclick = function(){
+    const msg = $('testMsg');
+    const text = $('testText').value.trim();
+    if (!text) { msg.textContent = '请输入试听文本'; msg.className = 'tts-msg warn'; return; }
+    if (!window.speechSynthesis) {
+      msg.textContent = '当前浏览器不支持 Web Speech API';
+      msg.className = 'tts-msg err';
+      return;
+    }
+    stopTestPlayback();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'zh-CN';
+    u.rate = Math.max(0.5, Math.min(2.0, parseFloat($('ttsSpeed').value) || 1.08));
+    speechSynthesis.speak(u);
+    msg.textContent = '已调用浏览器本地 TTS 播报';
+    msg.className = 'tts-msg ok';
+  };
+
+  $('testStopBtn').onclick = function(){
+    stopTestPlayback();
+    $('testMsg').textContent = '已停止播放';
+    $('testMsg').className = 'tts-msg';
+  };
+
+  syncAddrUi();
+  loadTtsPage(true);
+  setInterval(function(){ loadTtsPage(false); }, 3000);
+})();
+</script>
+"""
+
+
+def build_tts_page() -> str:
+    """语音 / TTS 独立设置页：复用仪表盘主题外壳，直连教练服务端的 /tts/config。"""
+    return _page_shell("语音 / TTS 设置", _TTS_PAGE_CSS + _TTS_PAGE_BODY + _TTS_PAGE_JS)
+
+
 def build_tracks_page(hist: Path) -> str:
     """赛道库管理页：查看系统识别的赛道形状 + 名称，可修改保存、标记已记录。
 
@@ -10405,11 +11095,11 @@ b, output, td.num { font-variant-numeric:tabular-nums; }
    "**哪些内容**出声"。两者是「与」关系：语音关着时，勾选多少都不会出声。
    #coachHistBtn（播报历史开关）与它同一档样式 —— 头部这几个小按钮必须长一样，
    否则会出现一个"浏览器默认方框按钮"混在里面。 */
-#coachPanelBtn, #coachHistBtn { border:1px solid var(--line); background:transparent;
+#coachPanelBtn, #coachHistBtn, #coachTtsLink { border:1px solid var(--line); background:transparent;
   color:var(--muted); border-radius:6px; padding:2px 8px; cursor:pointer;
   font-family:inherit; font-size:11px; letter-spacing:.3px;
-  text-transform:none; font-weight:400; }
-#coachPanelBtn:hover, #coachHistBtn:hover { color:var(--text); }
+  text-transform:none; font-weight:400; text-decoration:none; }
+#coachPanelBtn:hover, #coachHistBtn:hover, #coachTtsLink:hover { color:var(--text); }
 #coachPanelBtn.on, #coachHistBtn.on { border-color:rgba(var(--accent-rgb),.5); color:var(--accent); }
 #coPanel { margin-top:9px; border-top:1px solid var(--line); padding-top:6px; }
 #coPanel .cp-row { display:flex; align-items:center; gap:8px; font-size:12.5px;
@@ -10586,6 +11276,7 @@ th { color:var(--muted); font-weight:500; }
   <span class="nav">
     <a href="/sessions">历史场次</a>
     <a href="/tracks">赛道地图</a>
+    <a href="/tts">语音TTS</a>
     <a href="#" id="prefLink" onclick="event.preventDefault(); togglePrefPanel(true)">个性化</a>
     <a href="#" id="layoutLink" onclick="event.preventDefault(); toggleLayoutPanel(true)">布局</a>
     <a href="#" id="glossLink" onclick="event.preventDefault(); toggleGlossary(true)">术语说明</a>
@@ -11025,6 +11716,7 @@ th { color:var(--muted); font-weight:500; }
       <h2>赛道工程师
         <span id="coachDot" title="连接状态"></span>
         <span class="cspacer"></span>
+        <a id="coachTtsLink" href="/tts" title="打开独立语音与 TTS 设置页（服务商 · 音色 · 语速 · 试听）">TTS设置</a>
         <button id="coachPanelBtn" title="播报内容开关 + 云措辞模型（用哪个模型润色）">播报设置</button>
         <button id="coachHistBtn" title="展开/收起播报历史（默认收起：历史会撑高卡片，把下面的「圈速与油量」顶出屏幕）">历史</button>
         <button id="coachMute" title="点击开启语音播报（浏览器要求先有一次点击）">🔇 点我开语音</button>
@@ -12690,6 +13382,32 @@ function coachVpPrewarm(){
   });
 }
 
+function coachVpPauseSec(prevTok, nextTok){
+  const pCat = prevTok.split('/')[0], nCat = nextTok.split('/')[0];
+  if (pCat === 'd' && nCat === 'd') {
+    return (prevTok === 'd/min' || prevTok === 'd/sec') ? 0.085 : 0.018;
+  }
+  if (pCat === 'd' && (nextTok === 'p/meter' || nextTok === 'p/kph' || nextTok === 'p/lap' ||
+      nextTok === 'p/places' || nextTok === 'p/cars_end' || nextTok === 'p/pos_suf' ||
+      nextTok === 'p/sec_suf' || nextTok === 'p/turn_suf')) {
+    return 0.030;
+  }
+  if (prevTok === 'p/deg_cold_target' || prevTok === 'p/kph_prep_brake' ||
+      prevTok === 'p/laps_pit' || prevTok === 'p/enough_fin_rem') {
+    return 0.095;
+  }
+  if (pCat === 'lbl' && nCat === 'p') return 0.075;
+  if (prevTok.indexOf('p/tyre_') === 0 && nCat === 'd') return 0.050;
+  if (pCat === 'p' && nCat === 'clip') return 0.120;
+  if (prevTok === 'd/sec' && (nextTok === 'p/slow' || nextTok === 'p/kuai' ||
+      nextTok === 'p/watch_brake' || nextTok === 'p/unit_fuel' ||
+      nextTok === 'p/unit_elec' || nCat === 'lbl')) {
+    return 0.135;
+  }
+  if (pCat === 'd' && (nextTok === 'p/slow' || nextTok === 'p/kuai')) return 0.120;
+  return 0.048;
+}
+
 function coachPlayVoiceTokens(tokens, priority, fallbackFn){
   if (!coachSpeakOn || !tokens || !tokens.length) return false;
   const ctx = coachVpEnsureCtx();
@@ -12705,7 +13423,6 @@ function coachPlayVoiceTokens(tokens, priority, fallbackFn){
         return;
       }
       let t = ctx.currentTime + 0.015;
-      const overlap = 0.008;
       bufs.forEach(function(b, idx){
         const src = ctx.createBufferSource();
         src.buffer = b;
@@ -12716,7 +13433,8 @@ function coachPlayVoiceTokens(tokens, priority, fallbackFn){
         };
         src.start(t);
         coachVpSources.push(src);
-        t += Math.max(0.02, b.duration - (idx + 1 < bufs.length ? overlap : 0));
+        const gap = (idx + 1 < tokens.length) ? coachVpPauseSec(tokens[idx], tokens[idx + 1]) : 0;
+        t += Math.max(0.02, b.duration + gap);
       });
     }, function(){ if (fallbackFn) fallbackFn(); });
   };
@@ -12727,6 +13445,12 @@ function coachPlayVoiceTokens(tokens, priority, fallbackFn){
 
 function coachPlayAudioUrl(url, fallbackFn){
   if (!coachSpeakOn || !url) return false;
+  let fellBack = false;
+  const fail = function(){
+    if (fellBack) return;
+    fellBack = true;
+    if (fallbackFn) fallbackFn();
+  };
   try {
     const full = /^https?:\/\//i.test(url) ? url
       : (coachUrl + (url.charAt(0) === '/' ? url : '/' + url));
@@ -12736,11 +13460,12 @@ function coachPlayAudioUrl(url, fallbackFn){
     const a = new Audio(full);
     coachAudioEl = a;
     a.onended = function(){ if (coachAudioEl === a) coachAudioEl = null; };
+    a.onerror = function(){ if (coachAudioEl === a) coachAudioEl = null; fail(); };
     const p = a.play();
-    if (p && p.then) p.then(null, function(){ if (fallbackFn) fallbackFn(); });
+    if (p && p.then) p.then(null, fail);
     return true;
   } catch (e) {
-    if (fallbackFn) fallbackFn();
+    fail();
     return false;
   }
 }
@@ -13465,24 +14190,49 @@ function renderCoach(d){
         coachVpStop();
         if (window.speechSynthesis && speechSynthesis.speaking) speechSynthesis.cancel();
       }
-      const fallback = function(){
-        if (say.tts_url) coachPlayAudioUrl(say.tts_url, function(){ coachSay(spoken, say.priority); });
-        else coachSay(spoken, say.priority);
-      };
-      if (say.voice_tokens && say.voice_tokens.length && coachVpManifest && coachVpManifest.enabled) {
+      const browserFallback = function(){ coachSay(spoken, say.priority); };
+      const fallback = (say.priority >= 2)
+        ? function(){
+            if (say.voice_tokens && say.voice_tokens.length && coachVpManifest && coachVpManifest.enabled) {
+              if (!coachPlayVoiceTokens(say.voice_tokens, say.priority, browserFallback)) browserFallback();
+            } else {
+              browserFallback();
+            }
+          }
+        : function(){
+            if (say.tts_url) coachPlayAudioUrl(say.tts_url, browserFallback);
+            else browserFallback();
+          };
+      // L3 混排：A 档走离线语音包极速播报，B 档在云 TTS 可用且有 key 时优先整句合成，
+      // 未就绪则短暂等待，超时/无 key/失败依次回落离线语音包和浏览器 TTS。
+      if (say.priority >= 2) {
+        if (say.tts_url) {
+          coachPlayAudioUrl(say.tts_url, fallback);
+        } else if (s.tts && s.tts.enabled && s.tts.has_key) {
+          coachTtsWait = { sig: sig, at: Date.now() };
+        } else {
+          fallback();
+        }
+      } else if (say.voice_tokens && say.voice_tokens.length && coachVpManifest && coachVpManifest.enabled) {
         if (!coachPlayVoiceTokens(say.voice_tokens, say.priority, fallback)) fallback();
-      } else if (say.priority >= 2 && s.tts && s.tts.enabled && !say.tts_url) {
-        coachTtsWait = { sig: sig, at: Date.now() };
       } else {
         fallback();
       }
     } else if (coachTtsWait && coachTtsWait.sig === sig) {
+      const browserFallback = function(){ coachSay(spoken, say.priority); };
+      const vpOrBrowser = function(){
+        if (say.voice_tokens && say.voice_tokens.length && coachVpManifest && coachVpManifest.enabled) {
+          if (!coachPlayVoiceTokens(say.voice_tokens, say.priority, browserFallback)) browserFallback();
+        } else {
+          browserFallback();
+        }
+      };
       if (say.tts_url) {
         coachTtsWait = null;
-        coachPlayAudioUrl(say.tts_url, function(){ coachSay(spoken, say.priority); });
+        coachPlayAudioUrl(say.tts_url, vpOrBrowser);
       } else if (Date.now() - coachTtsWait.at > 900) {
         coachTtsWait = null;
-        coachSay(spoken, say.priority);
+        vpOrBrowser();
       }
     }
   } else if (!d.ref_ready) {

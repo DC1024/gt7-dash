@@ -128,6 +128,7 @@ def _pages(name: str) -> list[tuple[str, str]]:
         ("/sessions", "场次列表"),
         (f"/session?file={f}", "场次详情"),
         ("/tracks", "赛道列表"),
+        ("/tts", "语音TTS设置"),
         (f"/trash-view?file={f}", "回收站查看"),
     ]
 
